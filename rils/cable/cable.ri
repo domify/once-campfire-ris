@@ -1,0 +1,445 @@
+# Action Cable's server side: `ActionCable::Connection::Base` with its
+# `Subscriptions`, `Channel::Base` and the server's remote connections,
+# over a `PubSub`. Nothing here knows about sockets: a connection is given
+# the function that writes a frame and the one that closes, so the
+# WebSocket glue (`campfire/cable_socket`) and the tests drive it alike.
+#
+# Commands are handled one at a time, in arrival order. A broadcast that
+# reaches a connection while one of its commands runs waits until the
+# command's own frames (transmissions, the confirmation) are out, as the
+# Rust port's connection reads its new streams only after them.
+module rils/cable/cable
+
+import std/text
+import std/json::{JSON, Any}
+import rils/rails_compat/json::{encode, encode_string}
+import rils/rails_compat/turbo::{verified_stream_name}
+import rils/rails_compat/key_generator::{Secrets}
+import rils/cable/protocol::{welcome, ping, disconnect, confirmation, rejection, message, DisconnectReason}
+import rils/cable/naming::{channel_name, broadcasting_for}
+import rils/cable/pubsub::{PubSub, Listening}
+
+# `identified_by :current_user`: who the connection is for.
+pub class Identity
+  getter user_id : Int64
+  getter name : String
+  # `connection_identifier`: what `remote_connections.where(...)` matches.
+  getter identifier : String
+
+  def initialize(@user_id : Int64, @name : String, @identifier : String)
+  end
+end
+
+# An exception escaping a channel callback: Rails logs it and sends
+# nothing, and the subscription stays registered.
+pub class ChannelError
+  getter message : String
+
+  def initialize(@message : String)
+  end
+end
+
+# A channel class: one instance per subscription.
+pub abstract class Channel
+  pub def subscribed(sub : Subscription) : ChannelError?
+    nil
+  end
+
+  # Also runs for a rejected subscription, as in Rails.
+  pub def unsubscribed(sub : Subscription) : ChannelError?
+    nil
+  end
+
+  # A `perform` from the client: false when *action* isn't one of the
+  # channel's public methods ("Unable to process").
+  pub def perform(action : String, data : Hash(String, Any), sub : Subscription) : Bool | ChannelError
+    false
+  end
+end
+
+# `ApplicationCable::Channel` and `HeartbeatChannel`: subscribe, confirm,
+# nothing else.
+pub class EmptyChannel < Channel
+end
+
+pub alias ChannelFactory = Proc(Channel)
+
+# What a channel works with: params, the connection's identity, streams,
+# rejection and transmissions.
+pub class Subscription
+  getter connection : Connection
+  getter class_name : String
+  getter identifier : String
+  getter encoded_identifier : String
+  getter rejected : Bool
+  property unsubscribed : Bool
+  getter listening : Array(Listening)
+
+  def initialize(@connection : Connection, @class_name : String, @identifier : String)
+    @encoded_identifier = encode_string(@identifier)
+    @rejected = false
+    @unsubscribed = false
+    @listening = [] of Listening
+  end
+
+  # The decoded identifier, `channel` included.
+  pub def params : Hash(String, Any)
+    parsed = JSON.parse?(@identifier)
+    hash = parsed ? parsed.as_h? : nil
+    hash || {} of String => Any
+  end
+
+  pub def param(key : String) : Any?
+    params[key]?
+  end
+
+  pub def identity : Identity
+    @connection.identity || raise "a subscription without a user"
+  end
+
+  pub def server : CableServer
+    @connection.server
+  end
+
+  pub def broadcasting_for(broadcastables : Array(String)) : String
+    broadcasting_for(@class_name, broadcastables)
+  end
+
+  # `broadcast_to` for this channel's class.
+  pub def broadcast_to(broadcastables : Array(String), payload : Any) : Nil
+    server.pubsub.broadcast(broadcasting_for(broadcastables), encode(payload))
+  end
+
+  pub def stream_from(broadcasting : String) : Nil
+    return if @unsubscribed
+    connection = @connection
+    identifier = @encoded_identifier
+    @listening << server.pubsub.subscribe(broadcasting, ->(payload : String) { connection.deliver(message(identifier, payload)); nil })
+  end
+
+  pub def stream_for(broadcastables : Array(String)) : Nil
+    stream_from(broadcasting_for(broadcastables))
+  end
+
+  pub def stop_all_streams : Nil
+    @listening.each { |listening| server.pubsub.unsubscribe(listening) }
+    @listening = [] of Listening
+  end
+
+  pub def reject : Nil
+    @rejected = true
+  end
+
+  # Sends `{"identifier":...,"message":...}` to this subscriber only.
+  pub def transmit(payload : Any) : Nil
+    @connection.queue(message(@encoded_identifier, encode(payload)))
+  end
+end
+
+class Entry
+  getter channel : Channel
+  getter sub : Subscription
+
+  def initialize(@channel : Channel, @sub : Subscription)
+  end
+end
+
+# The most subscriptions one connection may hold, and the longest
+# identifier it may subscribe with (Rails has no bounds).
+MAX_SUBSCRIPTIONS     =   64
+MAX_IDENTIFIER_BYTES  = 4096
+
+pub alias Write = Proc(String, Bool)
+pub alias Close = Proc(Nil)
+
+pub class Connection
+  getter server : CableServer
+  getter identity : Identity?
+  getter closed : Bool
+  @entries : Array(Entry)
+  @pending : Array(String)
+  @deferred : Array(String)
+  @busy : Bool
+  @internal : Listening?
+  getter id : Int64
+
+  def initialize(@server : CableServer, @write : Write, @close : Close)
+    @id = @server.next_id
+    @identity = nil
+    @closed = false
+    @entries = [] of Entry
+    @pending = [] of String
+    @deferred = [] of String
+    @busy = false
+    @internal = nil
+  end
+
+  # `handle_open`: connect (*identity* nil is `reject_unauthorized_connection`),
+  # listen on the internal channel, welcome.
+  pub def open(identity : Identity?) : Nil
+    unless identity
+      STDERR.puts "An unauthorized connection attempt was rejected"
+      send_and_close(disconnect(DisconnectReason::Unauthorized, Any.new(false)))
+      return
+    end
+    @identity = identity
+    connection = self
+    @internal = @server.pubsub.subscribe(internal_channel(identity.identifier), ->(payload : String) { connection.internal_message(payload); nil })
+    @server.register(self)
+    @write.call(welcome)
+  end
+
+  # `InternalChannel#process_internal_message`: a remote disconnect.
+  def internal_message(payload : String) : Nil
+    parsed = JSON.parse?(payload) || return
+    hash = parsed.as_h? || return
+    kind = hash["type"]?
+    return unless kind && kind.as_s? == "disconnect"
+    reconnect = hash["reconnect"]? || Any.new(true)
+    send_and_close(disconnect(DisconnectReason::Remote, reconnect))
+  end
+
+  # A frame for this connection from a stream: now, or once the command
+  # running has sent its own.
+  def deliver(frame : String) : Nil
+    return if @closed
+    if @busy
+      @deferred << frame
+    else
+      @write.call(frame)
+    end
+  end
+
+  # A frame from the command running.
+  def queue(frame : String) : Nil
+    @pending << frame
+  end
+
+  # The heartbeat: `{"type":"ping","message":<unix seconds>}`.
+  pub def beat(unix_seconds : Int64) : Nil
+    deliver(ping(unix_seconds)) unless @identity.nil?
+  end
+
+  def send_and_close(frame : String) : Nil
+    return if @closed
+    @write.call(frame)
+    handle_close
+    @close.call
+  end
+
+  # `Subscriptions#execute_command`: anything malformed is logged and
+  # ignored; the connection stays open.
+  pub def receive(text : String) : Nil
+    return if @closed || @identity.nil?
+    @busy = true
+    dispatch(text)
+    @busy = false
+    flush
+  end
+
+  def flush : Nil
+    frames = @pending + @deferred
+    @pending = [] of String
+    @deferred = [] of String
+    frames.each do |frame|
+      break if @closed
+      @write.call(frame)
+    end
+  end
+
+  def dispatch(text : String) : Nil
+    parsed = JSON.parse?(text)
+    data = parsed ? parsed.as_h? : nil
+    return log("Could not execute command: #{text}") unless data
+    command = data["command"]?
+    case command ? command.as_s? : nil
+    when "subscribe"   then add(data)
+    when "unsubscribe" then remove(data)
+    when "message"     then perform_action(data)
+    else                    log("Received unrecognized command: #{text}")
+    end
+  end
+
+  def log(text : String) : Nil
+    STDERR.puts text
+  end
+
+  def identifier_of(data : Hash(String, Any)) : String?
+    (value = data["identifier"]?) ? value.as_s? : nil
+  end
+
+  def position(identifier : String) : Int32?
+    @entries.index { |entry| entry.sub.identifier == identifier }
+  end
+
+  # `Subscriptions#add`: a repeated identifier is ignored without a reply.
+  def add(data : Hash(String, Any)) : Nil
+    identifier = identifier_of(data) || return log("Could not execute command: missing identifier")
+    parsed = JSON.parse?(identifier)
+    params = parsed ? parsed.as_h? : nil
+    return log("Could not execute command: invalid identifier") unless params
+    return if position(identifier)
+    if @entries.size >= MAX_SUBSCRIPTIONS || identifier.bytesize > MAX_IDENTIFIER_BYTES
+      return log("Could not execute command: subscription limit reached")
+    end
+    requested = (value = params["channel"]?) ? (value.as_s? || "") : ""
+    found = @server.channel(requested) || return log("Subscription class not found: #{requested}")
+    class_name, factory = found
+    entry = Entry.new(factory.call, Subscription.new(self, class_name, identifier))
+    @entries << entry
+    # `Channel::Base#subscribe_to_channel`
+    failed = entry.channel.subscribed(entry.sub)
+    return log("Could not execute command: #{failed.message}") if failed
+    if entry.sub.rejected
+      remove_entry(entry)
+      queue(rejection(identifier))
+    else
+      queue(confirmation(identifier))
+    end
+  end
+
+  # `Subscriptions#remove`: no reply either way.
+  def remove(data : Hash(String, Any)) : Nil
+    identifier = identifier_of(data)
+    at = identifier ? position(identifier) : nil
+    return log("Unable to find subscription with identifier") unless at
+    remove_entry(@entries[at])
+  end
+
+  # `remove_subscription` -> `unsubscribe_from_channel`.
+  def remove_entry(entry : Entry) : Nil
+    @entries = @entries.reject { |other| other.sub.identifier == entry.sub.identifier }
+    entry.sub.unsubscribed = true
+    if failed = entry.channel.unsubscribed(entry.sub)
+      log("Could not execute command: #{failed.message}")
+    end
+    entry.sub.stop_all_streams
+  end
+
+  # `Subscriptions#perform_action` -> `Channel::Base#perform_action`.
+  def perform_action(data : Hash(String, Any)) : Nil
+    identifier = identifier_of(data)
+    at = identifier ? position(identifier) : nil
+    return log("Unable to find subscription with identifier") unless at
+    raw = (value = data["data"]?) ? value.as_s? : nil
+    parsed = raw ? JSON.parse?(raw) : nil
+    payload = parsed ? parsed.as_h? : nil
+    return log("Could not execute command: invalid data") unless payload
+    given = payload["action"]?
+    action = if given.nil? || given.raw.nil?
+               "receive"
+             elsif text = given.as_s?
+               text.strip.empty? ? "receive" : text
+             else
+               return log("Could not execute command: invalid action")
+             end
+    entry = @entries[at]
+    result = entry.channel.perform(action, payload, entry.sub)
+    if result.is_a?(ChannelError)
+      log("Could not execute command: #{result.message}")
+    elsif !result
+      log("Unable to process #{action}")
+    end
+  end
+
+  # `handle_close`: everything unsubscribed, the internal channel left.
+  pub def handle_close : Nil
+    return if @closed
+    @closed = true
+    @busy = true
+    while entry = @entries.first?
+      remove_entry(entry)
+    end
+    @busy = false
+    @pending = [] of String
+    @deferred = [] of String
+    if internal = @internal
+      @server.pubsub.unsubscribe(internal)
+    end
+    @server.unregister(self)
+  end
+end
+
+# `ActionCable::Server::Base#internal_channel`'s name for an identifier.
+pub def internal_channel(identifier : String) : String
+  "action_cable/#{identifier}"
+end
+
+pub class CableServer
+  getter pubsub : PubSub
+  getter connections : Array(Connection)
+  @channels : Hash(String, ChannelFactory)
+
+  @ids : Int64
+
+  def initialize(@pubsub : PubSub)
+    @channels = {} of String => ChannelFactory
+    @connections = [] of Connection
+    @ids = 0_i64
+  end
+
+  def next_id : Int64
+    @ids += 1
+  end
+
+  pub def register_channel(class_name : String, factory : ChannelFactory) : Nil
+    @channels[class_name] = factory
+  end
+
+  # The class a client names, as `safe_constantize` resolves it (a
+  # leading `::` too), with its registered name.
+  pub def channel(requested : String) : Tuple(String, ChannelFactory)?
+    name = requested.starts_with?("::") ? requested[2, requested.bytesize - 2] : requested
+    factory = @channels[name]? || return nil
+    {name, factory}
+  end
+
+  def register(connection : Connection) : Nil
+    @connections << connection
+  end
+
+  def unregister(connection : Connection) : Nil
+    @connections = @connections.reject { |other| other.id == connection.id }
+  end
+
+  # `ActionCable.server.remote_connections.where(...).disconnect(reconnect:)`:
+  # every connection with the identifier, on any thread, is told and
+  # closed.
+  pub def disconnect(identifier : String, reconnect : Bool) : Int32
+    @pubsub.broadcast(internal_channel(identifier), encode(Any.new({"type" => Any.new("disconnect"), "reconnect" => Any.new(reconnect)})))
+  end
+
+  # A heartbeat to every connection here.
+  pub def beat(unix_seconds : Int64) : Nil
+    @connections.dup.each(&.beat(unix_seconds))
+  end
+end
+
+# `Turbo::StreamsChannel`: streams from a signed stream name. With a
+# *guard*, a name it holds is rejected (`RoomStreamsAreAuthorized`).
+pub class StreamsChannel < Channel
+  def initialize(@secrets : Secrets, @guard : Proc(String, Bool)? = nil)
+  end
+
+  pub def subscribed(sub : Subscription) : ChannelError?
+    name = verified_stream_name_from_params(@secrets, sub.params)
+    return name if name.is_a?(ChannelError)
+    if guard = @guard
+      if guard.call(name || "")
+        sub.reject
+        return nil
+      end
+    end
+    name ? sub.stream_from(name) : sub.reject
+    nil
+  end
+end
+
+# `params[:signed_stream_name]` verified. Missing or `null` is unverified;
+# another non-string makes `MessageVerifier#verified` raise.
+pub def verified_stream_name_from_params(secrets : Secrets, params : Hash(String, Any)) : String? | ChannelError
+  value = params["signed_stream_name"]? || return nil
+  return nil if value.raw.nil?
+  signed = value.as_s? || return ChannelError.new("undefined method 'valid_encoding?' for #{value.to_json}")
+  verified_stream_name(secrets, signed)
+end

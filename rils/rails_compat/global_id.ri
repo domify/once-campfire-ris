@@ -1,0 +1,130 @@
+# GlobalID / SignedGlobalID (`gid://campfire/User/1`, `user.attachable_sgid`).
+#
+# SGIDs are signed by `GlobalID::Verifier` (key
+# `generate_key("signed_global_ids")`, HMAC-SHA1, URL-safe Base64 *with*
+# padding, the app's `:json_allow_marshal` serializer, and the
+# `{"_rails":{"data":..,"exp":..,"pur":..}}` envelope). Rails 7.0 SGIDs used
+# the legacy envelope with a Marshal-dumped string, which Rails still reads.
+module rils/rails_compat/global_id
+
+import std/time::{Time}
+import std/json::{Any}
+import std/text
+import rils/rails_compat/json::{Value}
+import rils/rails_compat/crypto::{Digest}
+import rils/rails_compat/encoding::{urlsafe_encode_unpadded, urlsafe_decode}
+import rils/rails_compat/clock::{parse_timestamp}
+import rils/rails_compat/key_generator::{Secrets}
+import rils/rails_compat/metadata::{Failure, Serializer, ruby_to_s}
+import rils/rails_compat/message_verifier::{MessageVerifier, Encoding}
+
+pub SGID_SALT = "signed_global_ids"
+# `GlobalID.app`, from the application name (`Campfire::Application`).
+pub GID_APP = "campfire"
+# `ActionText::Attachable::LOCATOR_NAME`.
+pub ATTACHABLE_PURPOSE = "attachable"
+# `SignedGlobalID::DEFAULT_PURPOSE`.
+pub DEFAULT_PURPOSE = "default"
+
+# A parsed `gid://app/Model/id`. Query params (Rails puts `?expires_in` into
+# attachable SGIDs) are dropped: the locator ignores them.
+pub struct GlobalId
+  getter app : String
+  getter model_name : String
+  getter id : String
+
+  def initialize(@app : String, @model_name : String, @id : String)
+  end
+
+  pub def self.new(model_name : String, id : String | Int64 | Int32) : GlobalId
+    GlobalId.new(GID_APP, model_name, id.to_s)
+  end
+
+  # `GlobalID.parse` for the URI form (`URI::GID`):
+  # `gid://<app>/<Model>/<id>[?params]`.
+  pub def self.parse(gid : String) : GlobalId?
+    return nil unless gid.starts_with?("gid://")
+    rest = gid[6, gid.bytesize - 6]
+    if query = rest.byte_index("?")
+      rest = rest[0, query]
+    end
+    app, slash, path = rest.partition('/')
+    return nil if slash.empty?
+    model_name, slash, id = path.partition('/')
+    return nil if slash.empty? || app.empty? || model_name.empty? || id.empty?
+    GlobalId.new(app, model_name, id)
+  end
+
+  # `GlobalID#to_param`: URL-safe Base64 without padding, as used in Turbo
+  # stream names.
+  pub def to_param : String
+    urlsafe_encode_unpadded(to_s)
+  end
+
+  pub def self.from_param(param : String) : GlobalId?
+    decoded = urlsafe_decode(param)
+    decoded ? GlobalId.parse(decoded) : nil
+  end
+
+  pub def to_s : String
+    "gid://#{@app}/#{@model_name}/#{@id}"
+  end
+
+  pub def ==(other : GlobalId) : Bool
+    @app == other.app && @model_name == other.model_name && @id == other.id
+  end
+end
+
+# `record.attachable_sgid`, i.e. `to_sgid(expires_in: nil, for: "attachable")`.
+# GlobalID turns the leftover `expires_in: nil` option into a query param, so
+# the signed data is `gid://campfire/User/1?expires_in`, with no expiry in
+# the envelope.
+pub def attachable_sgid(secrets : Secrets, gid : GlobalId) : String
+  sgid_verifier(secrets).generate(Any.new("#{gid}?expires_in"), ATTACHABLE_PURPOSE, nil)
+end
+
+# `SignedGlobalID.new(gid_uri, for: purpose, expires_at:)` for a bare GID URI
+# (no params).
+pub def sgid(secrets : Secrets, gid : GlobalId, purpose : String, expires_at : Time? = nil) : String
+  sgid_verifier(secrets).generate(Any.new(gid.to_s), purpose, expires_at)
+end
+
+# `SignedGlobalID.parse(sgid, for: purpose)`: the GID if the signature,
+# purpose and expiry check out. Looking the record up (and `only:`
+# restrictions) is the caller's job.
+pub def locate_signed(secrets : Secrets, sgid : String, purpose : String, now : Time) : GlobalId?
+  verifier = sgid_verifier(secrets)
+  data = verifier.verify(sgid, purpose, now)
+  if data.is_a?(Failure)
+    legacy = verify_with_legacy_self_validated_metadata(verifier, sgid, purpose, now)
+    return nil unless legacy
+    data = legacy
+  end
+  uri = data.as_s?
+  return nil unless uri
+  GlobalId.parse(uri) || GlobalId.from_param(uri)
+end
+
+# globalid < 1.0 signed `{"gid":..,"purpose":..,"expires_at":..}` without a
+# Rails envelope.
+def verify_with_legacy_self_validated_metadata(verifier : MessageVerifier, sgid : String, purpose : String, now : Time) : Value?
+  metadata = verifier.verify(sgid, nil, now)
+  return nil if metadata.is_a?(Failure)
+  fields = metadata.as_h?
+  return nil unless fields
+  expires_at = fields["expires_at"]?
+  if expires_at && !expires_at.raw.nil?
+    text = expires_at.as_s?
+    return nil unless text
+    expires = parse_timestamp(text)
+    return nil unless expires
+    return nil if now > expires
+  end
+  return nil unless ruby_to_s(fields["purpose"]?) == purpose
+  fields["gid"]? || Any.new(nil)
+end
+
+pub def sgid_verifier(secrets : Secrets) : MessageVerifier
+  secret = secrets.key_generator.generate_key(SGID_SALT, 64)
+  MessageVerifier.new(secret, Digest::Sha1, Encoding::UrlSafePadded, Serializer::JsonMarshalFallback)
+end

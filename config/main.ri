@@ -1,0 +1,93 @@
+# Campfire on the web package: `campfire/main DB SECRET_KEY_BASE PORT
+# [THREADS | shared]`. With THREADS, a kernel thread each, every one with
+# its own server, database connection and caches, on the port they share
+# (`reuse_port`); nothing mutable crosses threads. `shared` is one thread on
+# a shared port, for running a process per core: each has its own heap and
+# collector, where threads share the runtime's.
+module config/main
+
+import web/web/server::{Server}
+import web/web/config::{Config}
+import web/web/handler::{chain, Handler}
+import rils/kit/server::{KitHandler}
+import rils/kit/request::{RequestFields}
+import config/app::{App}
+import config/routes::{campfire_router}
+import channels/channels::{cable_server, user_identifier}
+import channels/cable_socket::{cable_socket}
+import jobs/jobs::{Job}
+import jobs/perform::{perform}
+import rils/cable/protocol::{BEAT_INTERVAL}
+import std/time::{Time}
+import rils/cable/cable_relay::{CableRelay}
+
+# *relay*: other threads or processes serve the same database, so
+# broadcasts go between them.
+def serve(db_path : String, secret : String, port : Int32, reuse_port : Bool, relay : Bool = false) : Nil
+  app = App.open(db_path, secret)
+  cable = cable_server(app)
+  cable_relay = relay ? CableRelay.new("#{db_path}-cable.sqlite3", app.pubsub) : nil
+  app.jobs.disconnect = ->(user_id : Int64, reconnect : Bool) { cable.disconnect(user_identifier(user_id), reconnect); nil }
+  app.jobs.performer = ->(job : Job) { perform(app, job) }
+  handler = KitHandler.new(app.stack, campfire_router(app))
+  db = app.db
+  handler.on_enter = -> { db.enter }
+  handler.on_leave = -> { db.leave }
+  handler.socket("/cable") { |web| cable_socket(app, cable, web) }
+  public_files = app.public_files
+  handler.public_files = ->(
+    method : String, path : Str, headers : RequestFields,
+  ) { public_files.serve(method, path, headers) }
+  server = Server.new(chain([handler.as(Handler)]), Config.new, handler.error_pages)
+  server.bind("127.0.0.1", port, reuse_port: reuse_port)
+  # The server, the job queue's worker and the cable's heartbeat, on this
+  # thread.
+  group do |g|
+    g.spawn do
+      server.listen
+      0
+    end
+    g.spawn do
+      app.jobs.work
+      0
+    end
+    if cable_relay
+      g.spawn do
+        cable_relay.run
+        0
+      end
+    end
+    g.spawn do
+      loop do
+        sleep(BEAT_INTERVAL * 1000)
+        cable.beat(Time.utc.to_unix)
+      end
+      0
+    end
+    0
+  end
+end
+
+db_path = Program.args[0]
+secret = Program.args[1]
+port = Program.args[2].to_i
+shared = Program.args.size > 3 && Program.args[3] == "shared"
+# `db:prepare`, before any thread opens the database.
+App.prepare(db_path, secret)
+CableRelay.prepare("#{db_path}-cable.sqlite3") if Program.args.size > 3
+if Program.args.size > 3 && !shared
+  count = Program.args[3].to_i
+  threads = (0...count).map do
+    IyiThread.start do
+      serve(db_path, secret, port, true, relay: true)
+      nil
+    end
+  end
+  puts "campfire: #{count} threads listening #{port}"
+  STDOUT.flush
+  threads.each(&.join)
+else
+  puts "campfire listening #{port}#{shared ? " (shared)" : ""}"
+  STDOUT.flush
+  serve(db_path, secret, port, shared, relay: shared)
+end

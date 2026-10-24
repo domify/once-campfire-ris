@@ -1,0 +1,208 @@
+# Ruby's `IPAddr`: parsing an address (with a `/prefix`, masked, or an IPv6
+# address in brackets), the predicates Rails asks of one, and the text form.
+module rils/ruby/ipaddr
+
+import std/int
+import std/text
+
+# An address as Ruby's `IPAddr` holds it: IPv4 in *low*'s bottom 32 bits, or
+# IPv6 as two 64-bit halves.
+pub struct IpAddr
+  getter v6 : Bool
+  getter high : UInt64
+  getter low : UInt64
+
+  def initialize(@v6 : Bool, @high : UInt64, @low : UInt64)
+  end
+
+  pub def v4 : UInt64
+    @low & 0xffffffff_u64
+  end
+
+  # Ruby's IPAddr predicates, including their IPv4-mapped IPv6 handling,
+  # which only checks the `ffff` bits
+  # (`@addr & 0xffff_0000_0000 == 0xffff_0000_0000`).
+  pub def mapped_v4 : UInt64?
+    return nil unless @v6
+    @low & 0xffff00000000_u64 == 0xffff00000000_u64 ? v4 : nil
+  end
+
+  pub def loopback? : Bool
+    return v4 & 0xff000000_u64 == 0x7f000000_u64 unless @v6
+    mapped = mapped_v4
+    (@high == 0 && @low == 1) || (!mapped.nil? && mapped & 0xff000000_u64 == 0x7f000000_u64)
+  end
+
+  pub def private? : Bool
+    return private_v4?(v4) unless @v6
+    mapped = mapped_v4
+    @high >> 57 == 0x7e_u64 || (!mapped.nil? && private_v4?(mapped))
+  end
+
+  pub def link_local? : Bool
+    return v4 & 0xffff0000_u64 == 0xa9fe0000_u64 unless @v6
+    mapped = mapped_v4
+    @high >> 54 == 0x3fa_u64 || (!mapped.nil? && mapped & 0xffff0000_u64 == 0xa9fe0000_u64)
+  end
+end
+
+def private_v4?(a : UInt64) : Bool
+  a & 0xff000000_u64 == 0x0a000000_u64 || a & 0xfff00000_u64 == 0xac100000_u64 || a & 0xffff0000_u64 == 0xc0a80000_u64
+end
+
+# `IPAddr.new`: an address, optionally with a `/prefix` (masked), or an IPv6
+# in brackets.
+pub def parse_ipaddr(text : String) : IpAddr?
+  address, slash, prefix_text = text.partition('/')
+  prefix = slash.empty? ? nil : prefix_text.to_i?
+  return nil if !slash.empty? && (prefix.nil? || prefix < 0)
+  address = address[1, address.bytesize - 2] if address.starts_with?("[") && address.ends_with?("]") && address.bytesize >= 2
+  ip = parse_v4(address) || parse_v6(address)
+  return nil unless ip
+  return ip unless prefix
+  if ip.v6
+    return nil if prefix > 128
+    high_mask = prefix >= 64 ? 0xffffffffffffffff_u64 : (prefix == 0 ? 0_u64 : 0xffffffffffffffff_u64 << (64 - prefix))
+    low_mask = prefix <= 64 ? 0_u64 : 0xffffffffffffffff_u64 << (128 - prefix)
+    low_mask = 0xffffffffffffffff_u64 if prefix == 128
+    IpAddr.new(true, ip.high & high_mask, ip.low & low_mask)
+  else
+    return nil if prefix > 32
+    mask = prefix == 0 ? 0_u64 : (0xffffffff_u64 << (32 - prefix)) & 0xffffffff_u64
+    IpAddr.new(false, 0_u64, ip.low & mask)
+  end
+end
+
+# Dotted-quad IPv4: four decimal octets, no leading zeros.
+def parse_v4(text : String) : IpAddr?
+  value = v4_value(text)
+  value ? IpAddr.new(false, 0_u64, value) : nil
+end
+
+def v4_value(text : String) : UInt64?
+  parts = text.split('.')
+  return nil unless parts.size == 4
+  value = 0_u64
+  parts.each do |part|
+    return nil if part.empty? || part.bytesize > 3
+    return nil if part.bytesize > 1 && part.as_tape[0] == '0'.ord
+    return nil unless part.chars.all? { |c| c >= '0' && c <= '9' }
+    octet = part.to_i
+    return nil if octet > 255
+    value = (value << 8) | octet.to_u64
+  end
+  value
+end
+
+def hex_group(text : String) : UInt64?
+  return nil if text.empty? || text.bytesize > 4
+  value = 0_u64
+  text.each_byte do |byte|
+    digit = if byte >= 48 && byte <= 57
+              byte - 48
+            elsif byte >= 97 && byte <= 102
+              byte - 87
+            elsif byte >= 65 && byte <= 70
+              byte - 55
+            else
+              return nil
+            end
+    value = value * 16 + digit.to_u64
+  end
+  value
+end
+
+# RFC 4291 text: eight groups, `::` for a run of zeros, and a dotted IPv4
+# tail.
+def parse_v6(text : String) : IpAddr?
+  return nil unless text.includes?(":")
+  head_text, gap, tail_text = text.partition("::")
+  return nil if !gap.empty? && tail_text.includes?("::")
+  head = head_text.empty? ? [] of String : head_text.split(':')
+  tail = tail_text.empty? ? [] of String : tail_text.split(':')
+  groups = [] of UInt64
+  pieces = gap.empty? ? head : head + tail
+  pieces.each_with_index do |piece, i|
+    if i == pieces.size - 1 && piece.includes?(".")
+      v4 = v4_value(piece)
+      return nil unless v4
+      groups << (v4 >> 16)
+      groups << (v4 & 0xffff_u64)
+    else
+      group = hex_group(piece)
+      return nil unless group
+      groups << group
+    end
+  end
+  if gap.empty?
+    return nil unless groups.size == 8
+  else
+    return nil if groups.size > 7
+    head_count = head.size
+    filled = groups.first(head_count)
+    (8 - groups.size).times { filled << 0_u64 }
+    (groups.size - head_count).times { |i| filled << groups[head_count + i] }
+    groups = filled
+  end
+  high = 0_u64
+  low = 0_u64
+  4.times { |i| high = (high << 16) | groups[i] }
+  4.times { |i| low = (low << 16) | groups[i + 4] }
+  IpAddr.new(true, high, low)
+end
+
+# The 16-bit groups of an IPv6 address, most significant first.
+def groups(ip : IpAddr) : Array(UInt64)
+  groups = [] of UInt64
+  4.times { |i| groups << ((ip.high >> (48 - 16 * i)) & 0xffff_u64) }
+  4.times { |i| groups << ((ip.low >> (48 - 16 * i)) & 0xffff_u64) }
+  groups
+end
+
+# The address as text: dotted quad, or RFC 5952's IPv6 form (lowercase hex,
+# the longest run of two or more zero groups as `::`).
+pub def ipaddr_to_s(ip : IpAddr) : String
+  unless ip.v6
+    v4 = ip.v4
+    return "#{v4 >> 24}.#{(v4 >> 16) & 255}.#{(v4 >> 8) & 255}.#{v4 & 255}"
+  end
+  parts = groups(ip)
+  best_start = -1
+  best_size = 0
+  i = 0
+  while i < 8
+    if parts[i] == 0
+      j = i
+      while j < 8 && parts[j] == 0
+        j += 1
+      end
+      if j - i > best_size && j - i >= 2
+        best_start = i
+        best_size = j - i
+      end
+      i = j
+    else
+      i += 1
+    end
+  end
+  hex = parts.map { |group| group.to_s(16) }
+  return hex.join(":") if best_start < 0
+  head = hex.first(best_start).join(":")
+  tail_count = 8 - best_start - best_size
+  tail = (0...tail_count).map { |n| hex[8 - tail_count + n] }.join(":")
+  "#{head}::#{tail}"
+end
+
+# Whether *ip* falls inside *network* (`IPAddr#include?`), comparing the
+# first *prefix* bits.
+pub def ipaddr_include?(network : IpAddr, prefix : Int32, ip : IpAddr) : Bool
+  return false unless network.v6 == ip.v6
+  if network.v6
+    high_mask = prefix >= 64 ? 0xffffffffffffffff_u64 : (prefix == 0 ? 0_u64 : 0xffffffffffffffff_u64 << (64 - prefix))
+    low_mask = prefix <= 64 ? 0_u64 : (prefix == 128 ? 0xffffffffffffffff_u64 : 0xffffffffffffffff_u64 << (128 - prefix))
+    (network.high & high_mask) == (ip.high & high_mask) && (network.low & low_mask) == (ip.low & low_mask)
+  else
+    mask = prefix == 0 ? 0_u64 : (0xffffffff_u64 << (32 - prefix)) & 0xffffffff_u64
+    (network.v4 & mask) == (ip.v4 & mask)
+  end
+end

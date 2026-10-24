@@ -1,0 +1,43 @@
+# `Turbo::StreamsChannel.signed_stream_name` / `verified_stream_name`
+# (turbo-rails `app/channels/turbo/streams/stream_name.rb`). The verifier is
+# `MessageVerifier.new(generate_key("turbo/signed_stream_verifier_key"),
+# digest: "SHA256", serializer: JSON)`: strict Base64 of the JSON-dumped
+# stream name, no metadata envelope.
+module rils/rails_compat/turbo
+
+import std/time::{Time}
+import std/json::{Any}
+import rils/rails_compat/json::{generate}
+import rils/rails_compat/crypto::{Digest}
+import rils/rails_compat/key_generator::{Secrets}
+import rils/rails_compat/metadata::{Failure, Serializer}
+import rils/rails_compat/message_verifier::{MessageVerifier, Encoding}
+
+pub TURBO_SALT = "turbo/signed_stream_verifier_key"
+
+# *streamables* are already-resolved stream name parts, joined with `:` like
+# `stream_name_from`: a record becomes its GID param (`GlobalId#to_param`), a
+# symbol or string itself. So `turbo_stream_from @room, :messages` is
+# `[room_gid.to_param, "messages"]`.
+pub def signed_stream_name(secrets : Secrets, streamables : Array(String)) : String
+  turbo_verifier(secrets).generate(Any.new(streamables.join(":")), nil, nil)
+end
+
+# The stream name, or nil if the signature doesn't check out. (A validly
+# signed non-string can't come from `signed_stream_name`; numbers are
+# returned as their `to_s` like Rails would.)
+pub def verified_stream_name(secrets : Secrets, signed : String) : String?
+  value = turbo_verifier(secrets).verify(signed, nil, Time.unix(0))
+  return nil if value.is_a?(Failure)
+  raw = value.raw
+  case raw
+  when String  then raw
+  when Int64   then raw.to_s
+  when Float64 then generate(value)
+  else              nil
+  end
+end
+
+pub def turbo_verifier(secrets : Secrets) : MessageVerifier
+  MessageVerifier.new(secrets.key_generator.generate_key(TURBO_SALT, 64), Digest::Sha256, Encoding::Strict, Serializer::Json)
+end

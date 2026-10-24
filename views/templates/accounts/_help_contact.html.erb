@@ -1,0 +1,9 @@
+<%# reference/app/views/accounts/_help_contact.html.erb -%>
+<% if owner = help_contact %>  <div class="txt-align-center margin-block-double full-width">
+    <%= link_to("mailto:\"#{owner.name}\" <#{owner.email_address}>", attrs.class("btn center").title("Email #{owner.name}")) do %>
+      <%= image_tag(ctx, "lifebuoy.svg", attrs.aria_hidden) %>
+      <span><%= owner.email_address %></span>
+<% end %>
+    <div class="txt-align-center center margin-block txt-subtle">Campfire&trade; version <%= version_badge(ctx) %></div>
+  </div>
+<% end %>

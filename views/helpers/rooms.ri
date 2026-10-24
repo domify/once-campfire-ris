@@ -1,0 +1,77 @@
+# The parts of `RoomsHelper` and `Rooms::InvolvementsHelper` the sidebar and
+# the profile's memberships use; the rest of the rooms helpers are in
+# `views/rooms`.
+module views/helpers/rooms
+
+import rils/routes/paths::{room_path, room_involvement_path, autocompletable_users_path}
+import rils/template/html::{Html}
+import views/context::{ViewContext}
+import views/helpers/tag::*
+import views/helpers/assets::{image_tag}
+import views/helpers/forms::{button_to}
+import views/helpers/links::{link_options}
+import views/helpers/turbo::{dom_id}
+import views/helpers/url::{Param, with_query}
+
+# `link_to_room(room, **attributes) { content }`. *options* is the
+# attribute hash in Ruby order, `data-*` entries included where the `data:`
+# key was.
+pub def link_to_room(room_id : Int64, options : Attrs, content : Html) : Html
+  defaults = [
+    {"data-rooms-list-target", "room"},
+    {"data-room-id", room_id.to_s},
+    {"data-badge-dot-target", "unread"},
+    {"data-sorted-list-target", "item"},
+  ] of Tuple(String, AttrValue)
+  content_tag("a", link_options(room_path(room_id), options.with_default_data(defaults)), content)
+end
+
+pub def link_to_room(room_id : Int64, options : Attrs, & : -> Html) : Html
+  link_to_room(room_id, options, yield)
+end
+
+# `HUMANIZE_INVOLVEMENT`.
+pub def humanize_involvement(involvement : String) : String
+  case involvement
+  when "mentions"   then "Notifying about @ mentions"
+  when "everything" then "Notifying about all messages"
+  when "nothing"    then "Notifications are off"
+  when "invisible"  then "Notifications are off and room invisible in sidebar"
+  else                   ""
+  end
+end
+
+# `next_involvement_for(room, involvement:)`.
+pub def next_involvement(direct : Bool, involvement : String) : String
+  order = direct ? ["everything", "nothing"] : ["mentions", "everything", "nothing", "invisible"]
+  index = order.index(involvement)
+  return order[0] unless index
+  order[index + 1]? || order[0]
+end
+
+# A room as the involvement helpers see it.
+pub class InvolvementRoom
+  getter id : Int64
+  # `model_name.param_key` of the room's class: "rooms_open", "rooms_closed"
+  # or "rooms_direct".
+  getter param_key : String
+  getter direct : Bool
+
+  def initialize(@id : Int64, @param_key : String, @direct : Bool)
+  end
+end
+
+# `button_to_change_involvement(room, involvement)`.
+pub def button_to_change_involvement(ctx : ViewContext, room : InvolvementRoom, involvement : String) : Html
+  label_id = dom_id(room.param_key, room.id, "involvement_label")
+  url = with_query(room_involvement_path(room.id), [{"involvement", next_involvement(room.direct, involvement)}] of Tuple(String, Param))
+  content = image_tag(ctx, "notification-bell-#{involvement}.svg", attrs.aria_hidden.size(20)) +
+            content_tag_text("span", attrs.class("for-screen-reader").id(label_id), humanize_involvement(involvement))
+  options = attrs.method("put").role("checkbox").aria("checked", true).aria("labelledby", label_id).tabindex(0).class("btn #{involvement}")
+  button_to(url, options, content)
+end
+
+# `mention_prompt_tag(room)`'s `src`: `autocompletable_users_path(room_id: room.id)`.
+pub def mention_prompt_src(room_id : Int64) : String
+  "#{autocompletable_users_path}?room_id=#{room_id}"
+end

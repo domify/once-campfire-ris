@@ -1,0 +1,5 @@
+<%# reference/app/views/accounts/users/index.turbo_stream.erb -%>
+<turbo-stream action="replace" target="next_page_container"><template><% users.each do |user| %><% include "accounts/users/_user.html.erb" %><% end %></template></turbo-stream>
+
+<% if page = next_page %>  <turbo-stream action="append" target="account_users"><template><% include "accounts/users/_next_page_container.html.erb" %></template></turbo-stream>
+<% end %>

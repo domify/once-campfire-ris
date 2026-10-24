@@ -1,0 +1,322 @@
+# Private, authenticated whole responses, versioned by the database, as the
+# Rust port keeps them (its `response_cache.rs`, after the C port's).
+#
+# A connection of its own watches `PRAGMA data_version`, which moves with
+# every commit any other connection makes; each move is a new generation.
+# A response is looked up only after the action has authenticated the
+# request and checked its access, in the generation read then, once, under
+# a key that names the generation, the endpoint, the user,
+# the session, the URL and every request header but validators and request
+# ids. It is kept only if the generation is still the one it was rendered
+# in, so a commit during authentication or rendering cannot leave an old
+# page under the new version. Entries live 15 seconds, for the links and
+# dates that change without a commit. Cookies, flash, HEAD and conditional
+# GET still go through the kit on a hit.
+module rils/kit/response_cache
+
+import std/text
+import std/http::{HTTP}
+import std/time::{Time, Span}
+import rils/record/sqlite::{Connection, SqlValue}
+import rils/kit/ctx::{Ctx}
+import rils/kit/request::{RequestFields, same_name?}
+import rils/kit/response::{Response, HeaderList, Body, Parts}
+
+TTL           = Span.seconds(15)
+MAX_BODY      = 1024 * 1024
+MAX_KEY_INPUT = 8192
+# Request headers that do not change the representation.
+UNKEYED = ["if-none-match", "if-modified-since", "x-request-id", "x-request-start"]
+
+# A finished response as it is kept: no cookies, date or per-request ids.
+class Cached
+  # The request key it was kept under, against which a key with the same
+  # digest is checked.
+  getter key : String
+  getter status : Int32
+  getter headers : Array(Tuple(String, String))
+  getter body : Body
+  getter bytesize : Int32
+  getter expires : Span
+
+  def initialize(@key : String, @status : Int32, @headers : Array(Tuple(String, String)), @body : Body, @bytesize : Int32, @expires : Span)
+  end
+
+  def response : Response
+    response = Response.new(@status)
+    @headers.each { |(name, value)| response.headers.append(name, value) }
+    response.body = @body
+    response
+  end
+end
+
+# What a request carries from before authentication to admission.
+pub class Ticket
+  # Read at lookup, after authentication and its commits.
+  property generation : Int64
+  getter endpoint : String
+  # The request key, copied off the tape only on a miss, for `admit`.
+  property key : String?
+  property digest : UInt64
+
+  def initialize(@endpoint : String)
+    @generation = 0_i64
+    @key = nil
+    @digest = 0_u64
+  end
+end
+
+pub class ResponseCache
+  @observer : Connection?
+  @data_version : Int64
+  @generation : Int64
+  # Insertion order is age: the oldest entries go first when it is full.
+  # By the digest of the request key.
+  @entries : Hash(UInt64, Cached)
+  @bytes : Int64
+  @capacity : Int64
+
+  # Responses served from here, for tests.
+  getter hits : Int64
+
+  # *capacity* bytes of bodies; 0 turns the cache off. So does an
+  # in-memory database: a second connection to `:memory:` is another
+  # database, whose version never moves.
+  def initialize(db_path : String, @capacity : Int64 = 64_i64 * 1024 * 1024)
+    @capacity = 0_i64 if db_path == ":memory:" || db_path.starts_with?("file::memory:") || db_path.includes?("mode=memory")
+    @observer = @capacity > 0 ? Connection.open(db_path) : nil
+    @hits = 0_i64
+    @data_version = 0_i64
+    @generation = 0_i64
+    @entries = {} of UInt64 => Cached
+    @bytes = 0_i64
+    observe
+  end
+
+  # The current generation, nil when the observer can't say.
+  def generation : Int64?
+    observe
+  end
+
+  # Before authentication: a ticket for a GET or HEAD that may be served
+  # from here.
+  pub def begin(c : Ctx, endpoint : String) : Ticket?
+    return nil unless @observer && eligible?(c)
+    Ticket.new(endpoint)
+  end
+
+  # After the action's authentication and access checks: the kept response
+  # for this request, or nil, the ticket then waiting for `admit`.
+  pub def lookup(c : Ctx, ticket : Ticket?, user_id : Int64, session_id : Int64) : Response?
+    return nil unless ticket
+    return nil unless c.flash.empty?
+    ticket.generation = observe || return nil
+    found = nil.as(Cached?)
+    tape do
+      if key = request_key(c, ticket, user_id, session_id)
+        digest = fnv1a(key)
+        ticket.digest = digest
+        if (cached = @entries[digest]?) && key == cached.key
+          found = cached
+        else
+          keep_key(ticket, key)
+        end
+      end
+    end
+    cached = found || return nil
+    if cached.expires < Time.monotonic
+      forget(ticket.digest)
+      ticket.key = cached.key
+      return nil
+    end
+    @hits += 1
+    cached.response
+  end
+
+  # Keeps the response the action finishes, if it is a whole 200 of the
+  # generation the ticket began in.
+  pub def admit(c : Ctx, ticket : Ticket?) : Nil
+    return unless ticket
+    key = ticket.key || return
+    cache = self
+    # The context is handed back rather than kept: it lives on the tape.
+    c.after_finish do |response, finished|
+      cache.put(key, ticket, response, finished)
+      nil
+    end
+  end
+
+  def put(key : String, ticket : Ticket, response : Response, c : Ctx) : Nil
+    return unless response.status == 200 && c.flash.empty?
+    return if directive?(response.headers, ["no-store", "no-transform"])
+    body = response.body
+    size = case body
+           when String then body.bytesize
+           when Parts  then body.bytesize
+           else             return
+           end
+    return if size > MAX_BODY
+    # Admission and the version check together: a page rendered under an
+    # older generation never lands in the next.
+    return if observe != ticket.generation
+    headers = [] of Tuple(String, String)
+    response.headers.each do |name, value|
+      headers << {name, value} unless name == "set-cookie" || name == "date"
+    end
+    forget(ticket.digest)
+    while @bytes + size > @capacity && !@entries.empty?
+      forget(@entries.first_key)
+    end
+    @entries[ticket.digest] = Cached.new(key, response.status, headers, body, size, Time.monotonic + TTL)
+    @bytes += size
+  end
+
+  def forget(digest : UInt64) : Nil
+    if old = @entries.delete(digest)
+      @bytes -= old.bytesize
+    end
+  end
+
+  # A new generation when `data_version` moved; the entries of the old one
+  # can no longer be named, and go.
+  def observe : Int64?
+    observer = @observer || return nil
+    version = observer.query_one("PRAGMA data_version", [] of SqlValue) { |row| row.int(0) } || return nil
+    if version != @data_version
+      @data_version = version
+      @generation += 1
+      @entries = {} of UInt64 => Cached
+      @bytes = 0_i64
+    end
+    @generation
+  end
+
+  def eligible?(c : Ctx) : Bool
+    request = c.request
+    return false unless request.method == "GET" || request.method == "HEAD"
+    return false unless request.original_method == request.method
+    return false unless request.body_view.empty?
+    headers = request.headers
+    return false if headers.has_key?("range") || headers.has_key?("upgrade")
+    return false if directive?(headers, ["no-cache", "no-store"])
+    pragma = headers["pragma"]
+    !(pragma && same_name?(pragma, "no-cache"))
+  end
+
+  def directive?(headers : HeaderList | RequestFields, rejected : Array(String)) : Bool
+    headers.all("cache-control").any? do |value|
+      value.split(',').any? { |directive| rejected.includes?(directive.strip.split('=').first.downcase) }
+    end
+  end
+
+  # The key leaves the tape with the ticket: `admit` files the response
+  # under it after the request.
+  def keep_key(ticket : Ticket, key : Str) : Nil
+    ticket.key = key.to_heap
+  end
+
+  # Every field with its length before it, so no two requests spell the
+  # same key, written on the request's tape: the header names lowercase and
+  # in order, each with all its values.
+  def request_key(
+    c : Ctx,
+    ticket : Ticket,
+    user_id : Int64,
+    session_id : Int64,
+  ) : Str?
+    request = c.request
+    headers = request.headers
+    names = Ary(Int32).new(headers.size)
+    headers.size.times do |i|
+      name = headers.name_at(i)
+      next if UNKEYED.any? { |unkeyed| same_name?(name, unkeyed) }
+      next if named_before?(headers, i)
+      names.push(i)
+      at = names.size - 1
+      while at > 0 && lowercase_before?(name, headers.name_at(names[at - 1]))
+        names[at] = names[at - 1]
+        at -= 1
+      end
+      names[at] = i
+    end
+    io = Str::Builder.new(512)
+    int_field(io, ticket.generation)
+    field(io, ticket.endpoint)
+    int_field(io, user_id)
+    int_field(io, session_id)
+    query = request.query_view
+    path = request.path_view
+    io.append_int(path.bytesize + (query.empty? ? 0 : 1 + query.bytesize))
+    io.push(':'.ord.to_u8)
+    io.append(path)
+    unless query.empty?
+      io.push('?'.ord.to_u8)
+      io.append(query)
+    end
+    field(io, c.url_for(""))
+    names.each do |index|
+      name = headers.name_at(index)
+      io.append_int(name.bytesize)
+      io.push(':'.ord.to_u8)
+      name.each_byte { |byte| io.push(byte >= 65 && byte <= 90 ? byte + 32 : byte) }
+      headers.size.times do |j|
+        field(io, headers.value_at(j)) if same_name?(headers.name_at(j), name)
+      end
+      field(io, "")
+    end
+    io.length > MAX_KEY_INPUT ? nil : io.finish
+  end
+
+  def field(io : Str::Builder, value : String | Str) : Nil
+    io.append_int(value.bytesize)
+    io.push(':'.ord.to_u8)
+    io.append(value)
+  end
+
+  def int_field(io : Str::Builder, value : Int64) : Nil
+    digits = value < 0 ? 2 : 1
+    rest = value.abs // 10
+    while rest > 0
+      digits += 1
+      rest //= 10
+    end
+    io.append_int(digits)
+    io.push(':'.ord.to_u8)
+    io.append_int(value)
+  end
+end
+
+# Whether a field before the *index*th has its name.
+def named_before?(headers : RequestFields, index : Int32) : Bool
+  name = headers.name_at(index)
+  j = 0
+  while j < index
+    return true if same_name?(headers.name_at(j), name)
+    j += 1
+  end
+  false
+end
+
+# Whether *a* sorts before *b*, both read lowercase.
+def lowercase_before?(a : Str, b : Str) : Bool
+  i = 0
+  while i < a.bytesize && i < b.bytesize
+    x = a[i]
+    y = b[i]
+    x += 32 if x >= 65 && x <= 90
+    y += 32 if y >= 65 && y <= 90
+    return x < y if x != y
+    i += 1
+  end
+  a.bytesize < b.bytesize
+end
+
+# FNV-1a, 64 bits: the request key's digest the cache files it under.
+def fnv1a(text : Str) : UInt64
+  hash = 0xcbf29ce484222325_u64
+  text.each_byte do |byte|
+    hash ^= byte.to_u64
+    hash = hash &* 0x100000001b3_u64
+  end
+  hash
+end

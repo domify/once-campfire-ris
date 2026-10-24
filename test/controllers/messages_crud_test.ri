@@ -1,0 +1,167 @@
+# `test/controllers/messages_controller_test.rb`'s create, show, update and
+# destroy tests, through the drawn routes.
+module test/controllers/messages_crud_test
+
+import std/text
+import std/uri::{URI}
+import std/file::{File}
+import std/dir::{Dir}
+import rils/kit/params::{RawPair, UploadedFile}
+import rils/storage/blob::{Blob}
+import rils/rails_compat/global_id::{GlobalId, attachable_sgid}
+import test/models/testing::{id}
+import models/message::{Message}
+import models/room::{Room}
+import models/user::{User}
+import rils/record/sqlite::{SqlValue}
+import rils/record/events::{DeliverWebhook}
+import channels/broadcasts::{room_gid_param, unread_rooms_stream}
+import test/testing::*
+import web/web/spec::*
+
+def watercooler(client : Client) : Room
+  client.t.read { |conn| Room.find_by_id(conn, id("watercooler")) } || raise "no watercooler"
+end
+
+def message_by(client : Client, room : Room, label : String) : Message
+  client.t.read { |conn| Message.for_room(conn, room.id).find { |m| m.creator_id == id(label) } } || raise "no message by #{label}"
+end
+
+def message_count(client : Client) : Int64
+  client.t.read { |conn| Message.count(conn) }
+end
+
+describe "messages#create" do
+  it "broadcasts the message to the room and renders the stream" do
+    client = Client.new
+    room = watercooler(client)
+    response = client.submit("POST", "/rooms/#{room.id}/messages.turbo_stream", "message[body]=New+one&message[client_message_id]=999", client.cookie("david@37signals.com"))
+    assert response.status == 200
+    assert response.status == 200
+    assert body(response).includes?("New one")
+    appended = client.broadcasts.find { |stream, _| stream == "#{room_gid_param(room)}:messages" } || raise "no broadcast"
+    appended = client.broadcasts.find { |stream, _| stream == "#{room_gid_param(room)}:messages" } || raise "no broadcast"
+    last = client.t.read { |conn| Message.last(conn) } || raise "no message"
+    assert appended[1].includes?("data-copy-to-clipboard-url-value=\\\"/rooms/#{room.id}/@#{last.id}\\\"")
+  end
+
+  it "broadcasts unread room to each member and nobody else" do
+    client = Client.new
+    room = watercooler(client)
+    client.submit("POST", "/rooms/#{room.id}/messages.turbo_stream", "message[body]=New+one&message[client_message_id]=999", client.cookie("david@37signals.com"))
+    members = client.t.read { |conn| room.user_ids(conn) }
+    everyone = client.t.read { |conn| User.all(conn).map(&.id) }
+    everyone.each do |user_id|
+      sent = client.broadcasts.count { |stream, _| stream == unread_rooms_stream(user_id) }
+      assert sent == (members.includes?(user_id) ? 1 : 0)
+    end
+  end
+
+  it "queues a webhook for a mentioned bot" do
+    client = Client.new
+    room = watercooler(client)
+    sgid = attachable_sgid(client.app.secrets, GlobalId.new("User", id("bender")))
+    body = "<div>Hey <action-text-attachment sgid=\"#{sgid}\" content-type=\"application/vnd.campfire.mention\"></action-text-attachment></div>"
+    form = "message[body]=#{URI.encode_www_form(body)}&message[client_message_id]=999"
+    client.submit("POST", "/rooms/#{room.id}/messages.turbo_stream", form, client.cookie("david@37signals.com"))
+    assert client.app.jobs.pending.count(&.is_a?(DeliverWebhook)) == 1
+  end
+end
+
+describe "messages#show" do
+  it "renders a single message belonging to the user" do
+    client = Client.new
+    room = watercooler(client)
+    message = message_by(client, room, "david")
+    response = client.get("/rooms/#{room.id}/messages/#{message.id}", cookie: client.cookie("david@37signals.com"))
+    assert response.status == 200
+    assert body(response).includes?("data-message-id=\"#{message.id}\"")
+  end
+end
+
+describe "messages#update" do
+  it "updates a message of the user's, and of another user's for an admin" do
+    ["david", "jason"].each do |author|
+      client = Client.new
+      room = watercooler(client)
+      message = message_by(client, room, author)
+      response = client.submit("PUT", "/rooms/#{room.id}/messages/#{message.id}", "message[body]=Updated+body", client.cookie("david@37signals.com"))
+      assert response.status == 302
+      assert response["location"] == "http://once.campfire.test/rooms/#{room.id}/messages/#{message.id}"
+      plain = client.t.read { |conn| (Message.find_by_id(conn, message.id) || raise "gone").plain_text_body(conn, client.app.db.env.rich_text) }
+      assert plain == "Updated body"
+      assert client.broadcasts.count { |_, m| m.includes?("action=\\\"replace\\\"") } == 1
+    end
+  end
+
+  it "forbids a non-admin from updating another user's message" do
+    client = Client.new
+    room = client.t.read { |conn| Room.find_by_id(conn, id("designers")) } || raise "no designers"
+    message = message_by(client, room, "jason")
+    response = client.submit("PUT", "/rooms/#{room.id}/messages/#{message.id}", "message[body]=Updated+body", client.cookie("jz@37signals.com"))
+    assert response.status == 403
+  end
+end
+
+describe "messages#destroy" do
+  it "destroys a message of the user's, and of another user's for an admin" do
+    ["david", "jason"].each do |author|
+      client = Client.new
+      room = watercooler(client)
+      message = message_by(client, room, author)
+      before = message_count(client)
+      response = client.submit("DELETE", "/rooms/#{room.id}/messages/#{message.id}.turbo_stream", "", client.cookie("david@37signals.com"))
+      assert response.status == 200
+      assert message_count(client) == before - 1
+      assert client.broadcasts.count { |_, m| m.includes?("action=\\\"remove\\\"") } == 1
+    end
+  end
+
+  it "forbids a non-admin from destroying another user's message" do
+    client = Client.new
+    room = client.t.read { |conn| Room.find_by_id(conn, id("designers")) } || raise "no designers"
+    message = message_by(client, room, "jason")
+    response = client.submit("DELETE", "/rooms/#{room.id}/messages/#{message.id}.turbo_stream", "", client.cookie("jz@37signals.com"))
+    assert response.status == 403
+  end
+end
+
+describe "messages#create with an attachment" do
+  it "keeps the upload, analyzed, with its thumbnail" do
+    client = Client.new
+    room = watercooler(client)
+    upload = "#{Dir.tempdir}/message_attachment.png"
+    File.write(upload, File.read("#{__DIR__}/../../reference/app/assets/images/campfire-icon.png"))
+    pairs = [RawPair.new("message[client_message_id]", "abc"), RawPair.new("message[attachment]", UploadedFile.new("icon.png", "image/png", "", File.size(upload), upload))]
+    response = client.submit_pairs("POST", "/rooms/#{room.id}/messages.turbo_stream", pairs, client.cookie("david@37signals.com"))
+    assert response.status == 200
+    client.t.read do |conn|
+      message = Message.last(conn) || raise "no message"
+      blob = Blob.attached(conn, "Message", message.id, "attachment") || raise "no attachment"
+      assert blob.analyzed?
+      variants = conn.query_all(%(SELECT COUNT(*) FROM "active_storage_variant_records" WHERE "blob_id" = ?), [blob.id] of SqlValue) { |row| row.int(0) }
+      assert variants == [1_i64]
+    end
+    assert body(response).includes?("icon.png")
+  end
+end
+
+describe "messages#edit" do
+  it "shows the editor for the user's message" do
+    client = Client.new
+    room = watercooler(client)
+    message = message_by(client, room, "david")
+    response = client.get("/rooms/#{room.id}/messages/#{message.id}/edit", cookie: client.cookie("david@37signals.com"))
+    assert response.status == 200
+    assert body(response).includes?("<turbo-frame id=\"edit_message_#{message.client_message_id}\"")
+  end
+end
+
+describe "messages#create in a room that's gone" do
+  it "renders room_not_found" do
+    client = Client.new
+    response = client.submit("POST", "/rooms/1/messages", "message[body]=x", client.cookie("david@37signals.com"))
+    assert response.status == 200
+    assert body(response).includes?("This room was deleted.")
+  end
+end

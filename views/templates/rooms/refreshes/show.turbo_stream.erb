@@ -1,0 +1,6 @@
+<%# reference/app/views/rooms/refreshes/show.turbo_stream.erb, byte for byte as Erubi renders it: the append (when there are new messages), then the blank line between the two blocks (so an empty refresh is "\n", which Rack::ETag digests), then one indented line per replace. -%>
+<% unless new_messages.empty? %><turbo-stream action="append" target="messages_rooms_<%= room_kind %>_<%= room_id %>"><template>
+  <% new_messages.each do |message| %><%= message_fragment(ctx, message) %><% end %>
+</template></turbo-stream><% end %>
+<% updated_messages.each do |message| %>  <turbo-stream action="replace" target="<%= message.dom_id("") %>"><template><%= message_fragment(ctx, message) %></template></turbo-stream>
+<% end %>

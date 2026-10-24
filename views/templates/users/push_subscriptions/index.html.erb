@@ -1,0 +1,17 @@
+<%# reference/app/views/users/push_subscriptions/index.html.erb -%>
+<%- content_for "nav" do %>  <div class="flex-item-justify-start">
+    <%= link_back_to_last_room_visited(ctx) %>
+  </div>
+<% end %>
+
+<section class="panel panel--wide flex flex-column gap">
+  <h1 class="txt-align-center txt-large margin-none">Push Notification Subscriptions</h1>
+  <div class="pad-inline fill-shade border-radius" id="push_subscriptions">
+    <menu class="pad flex flex-column gap">
+      <%- push_subscriptions.each do |push_subscription| %>
+      <% include "users/push_subscriptions/_push_subscription.html.erb" %>
+<% end %>
+    </menu>
+  </div>
+</section>
+

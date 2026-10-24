@@ -1,0 +1,14 @@
+<%# reference/app/views/rooms/layouts/_new.html.erb and _edit.html.erb: the page around a room's form -%>
+<% content_for "nav" do %>  <div class="flex-item-justify-start">
+    <%= link_back_to_last_room_visited(ctx) %>
+  </div>
+<% end %><% if room_id = room.id %><section class="panel txt-align-center" style="view-transition-name: edit-room-<%= room_id %>">
+  <%= form %>
+</section>
+<% if can_administer %>  <section class="panel txt-align-center">
+    <%= button_to_delete_room(ctx, room_id, room.display_name) %>
+  </section>
+<% end %><% else %><section class="panel txt-align-center" style="view-transition-name: new-room">
+  <%= form %>
+</section>
+<% end %>

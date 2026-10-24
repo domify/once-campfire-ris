@@ -1,0 +1,24 @@
+# The Rust port's libvips test.
+module rils/storage/vips_test
+
+import std/file
+import rils/storage/vips::*
+import rils/storage/disk::{remove_tree, make_tempdir}
+import web/web/spec::*
+
+describe "vips" do
+  it "gives page only to loaders that take it" do
+    moon = "#{__DIR__}/../../reference/test/fixtures/files/moon.jpg"
+    loaded = Image.load_for_processing(moon)
+    raise loaded.message if loaded.is_a?(Error)
+    image = loaded.resize_to_limit(8, 8)
+    raise image.message if image.is_a?(Error)
+    dir = make_tempdir("vips")
+    [{"jpg", false}, {"png", false}, {"gif", true}, {"webp", true}].each do |c|
+      path = "#{dir}/moon.#{c[0]}"
+      assert image.write_to_file(path).nil?
+      assert loader_accepts_page?(path + "\u0000") == c[1]
+    end
+    remove_tree(dir)
+  end
+end

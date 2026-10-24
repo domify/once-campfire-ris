@@ -1,0 +1,139 @@
+# Campfire's routes, drawn as resources from `reference/config/routes.rb`,
+# then the routes the framework adds (`/up`, Turbo Native navigation,
+# Action Mailbox, Active Storage). The table equals `bin/rails routes`
+# (routes/draw_test.ri checks it against `vectors/campfire_routes.json`).
+module rils/routes/draw
+
+import rils/kit/resources::{Mapper}
+
+pub def campfire_routes : Mapper
+  Mapper.draw do |r|
+    r.root "welcome#show"
+
+    r.resource "first_run"
+
+    r.resource "session" do |session|
+      session.scope(module: "sessions") do |s|
+        s.resources "transfers", only: ["show", "update"]
+      end
+    end
+
+    r.resource "account" do |account|
+      account.scope(module: "accounts") do |a|
+        a.resources "users"
+        a.resources "bots" do |bot|
+          bot.scope(module: "bots") { |b| b.resource "key", only: ["update"] }
+        end
+        a.resource "join_code", only: ["create"]
+        a.resource "logo", only: ["show", "destroy"]
+        a.resource "custom_styles", only: ["edit", "update"]
+      end
+    end
+
+    r.get "join/:join_code", to: "users#new"
+    r.post "join/:join_code", to: "users#create"
+
+    r.resources "qr_code", only: ["show"]
+
+    r.resources "users", only: ["show"] do |user|
+      user.scope(module: "users") do |u|
+        u.resource "avatar", only: ["show", "destroy"]
+        u.resource "ban", only: ["create", "destroy"]
+        u.scope(defaults: [{"user_id", "me"}]) do |me|
+          me.resource "sidebar", only: ["show"]
+          me.resource "profile"
+          me.resources "push_subscriptions" do |subscription|
+            subscription.scope(module: "push_subscriptions") do |p|
+              p.resources "test_notifications", only: ["create"]
+            end
+          end
+        end
+      end
+    end
+
+    r.namespace "autocompletable" do |a|
+      a.resources "users", only: ["index"]
+    end
+
+    r.resources "rooms" do |room|
+      room.resources "messages"
+
+      room.scope(path: ":bot_key", defaults: [{"format", "json"}]) do |bot|
+        bot.resources "messages", controller: "messages/by_bots", only: ["index", "create", "update", "destroy"] do |message|
+          message.resources "boosts", controller: "messages/boosts/by_bots", only: ["create", "destroy"]
+        end
+      end
+
+      room.scope(module: "rooms") do |s|
+        s.resource "refresh", only: ["show"]
+        s.resource "settings", only: ["show"]
+        s.resource "involvement", only: ["show", "update"]
+      end
+
+      room.get "@:message_id", to: "rooms#show"
+    end
+
+    r.namespace "rooms" do |rooms|
+      rooms.resources "opens"
+      rooms.resources "closeds"
+      rooms.resources "directs"
+    end
+
+    r.resources "messages" do |message|
+      message.scope(module: "messages") { |m| m.resources "boosts" }
+    end
+
+    r.resources "searches", only: ["index", "create"] do |search|
+      search.collection { |c| c.delete "clear" }
+    end
+
+    r.resource "unfurl_link", only: ["create"]
+
+    r.get "webmanifest", to: "pwa#manifest"
+    r.get "service-worker", to: "pwa#service_worker"
+
+    r.get "up", to: "rails/health#show"
+
+    framework_routes(r)
+  end
+end
+
+# What the engines draw after the app: Turbo Native, Action Mailbox and
+# Active Storage.
+def framework_routes(r : Mapper) : Nil
+  r.get "recede_historical_location", to: "turbo/native/navigation#recede"
+  r.get "resume_historical_location", to: "turbo/native/navigation#resume"
+  r.get "refresh_historical_location", to: "turbo/native/navigation#refresh"
+
+  r.scope(path: "rails/action_mailbox", module: "action_mailbox/ingresses") do |m|
+    m.post "postmark/inbound_emails", to: "postmark/inbound_emails#create"
+    m.post "relay/inbound_emails", to: "relay/inbound_emails#create"
+    m.post "sendgrid/inbound_emails", to: "sendgrid/inbound_emails#create"
+    m.get "mandrill/inbound_emails", to: "mandrill/inbound_emails#health_check"
+    m.post "mandrill/inbound_emails", to: "mandrill/inbound_emails#create"
+    m.post "mailgun/inbound_emails/mime", to: "mailgun/inbound_emails#create"
+  end
+
+  r.scope(path: "rails/conductor/action_mailbox", module: "rails/conductor/action_mailbox") do |c|
+    c.get "inbound_emails", to: "inbound_emails#index"
+    c.post "inbound_emails", to: "inbound_emails#create"
+    c.get "inbound_emails/new", to: "inbound_emails#new"
+    c.get "inbound_emails/:id", to: "inbound_emails#show"
+    c.get "inbound_emails/sources/new", to: "inbound_emails/sources#new"
+    c.post "inbound_emails/sources", to: "inbound_emails/sources#create"
+    c.post ":inbound_email_id/reroute", to: "reroutes#create"
+    c.post ":inbound_email_id/incinerate", to: "incinerates#create"
+  end
+
+  r.scope(path: "rails/active_storage", module: "active_storage") do |s|
+    s.get "blobs/redirect/:signed_id/*filename", to: "blobs/redirect#show"
+    s.get "blobs/proxy/:signed_id/*filename", to: "blobs/proxy#show"
+    s.get "blobs/:signed_id/*filename", to: "blobs/redirect#show"
+    s.get "representations/redirect/:signed_blob_id/:variation_key/*filename", to: "representations/redirect#show"
+    s.get "representations/proxy/:signed_blob_id/:variation_key/*filename", to: "representations/proxy#show"
+    s.get "representations/:signed_blob_id/:variation_key/*filename", to: "representations/redirect#show"
+    s.get "disk/:encoded_key/*filename", to: "disk#show"
+    s.put "disk/:encoded_token", to: "disk#update"
+    s.post "direct_uploads", to: "direct_uploads#create"
+  end
+end

@@ -1,0 +1,169 @@
+# `test/controllers/messages_controller_test.rb`'s `index` tests, through
+# the drawn routes, plus what the page carries: the session cookie, the
+# conditional GET and the digested assets.
+module test/controllers/messages_test
+
+import std/text
+import rils/rails_compat/key_generator::{Secrets}
+import test/models/testing::*
+import models/message::{Message}
+import models/session::{Session}
+import rils/kit/app::{Stack, KitConfig}
+import rils/kit/cookies::{CookieJar, Cookie}
+import rils/kit/ctx::{Ctx}
+import rils/kit/params::{ParamMap, from_query_string}
+import rils/kit/request::{Request, ProxyConfig}
+import rils/kit/response::{Response, HeaderList}
+import config/app::{App}
+import config/routes::{campfire_router}
+import rils/ruby/all_emoji::{all_emoji?}
+import rils/assets/assets::{Digests}
+import web/web/spec::*
+
+class Client
+  getter app : App
+  getter t : TestDb
+
+  def initialize
+    @t = TestDb.new
+    @app = App.new(Stack.new(KitConfig.new, Secrets.new("a" * 128), @t.clock), @t.db)
+  end
+
+  # `sign_in :david`: the `session_token` cookie for one of David's
+  # sessions.
+  def cookie(user : String) : String
+    session = Session.for_user(@t.conn, id(user)).first
+    jar = CookieJar.from_headers([] of String, @app.secrets, @t.clock)
+    jar.set_signed("session_token", Cookie.new(session.token, permanent: true, httponly: true))
+    jar.set_cookie_headers(false, "once.campfire.test").first.split(';').first
+  end
+
+  def get(path : String, query : String = "", cookie : String? = nil, if_none_match : String? = nil) : Response
+    headers = HeaderList.new
+    headers.append("host", "once.campfire.test")
+    headers.append("cookie", cookie) if cookie
+    headers.append("if-none-match", if_none_match) if if_none_match
+    found = campfire_router(@app).find("GET", path) || raise "no route for #{path}"
+    params = from_query_string(query)
+    request = Request.new("GET", "GET", path, query, headers, nil, "", ProxyConfig.new)
+    jar = CookieJar.from_headers(headers.all("cookie"), @app.secrets, @t.clock)
+    c = Ctx.new(@app.stack, request, found[1], params.is_a?(ParamMap) ? params : ParamMap.new, ParamMap.new, jar)
+    c.keep_page(c.finish(found[0].action.call(c)))
+  end
+end
+
+def body(response : Response) : String
+  response.body_text || ""
+end
+
+# `ensure_messages_present`: once each.
+def present?(response : Response, message : Message) : Bool
+  html = body(response)
+  needle = "id=\"message_#{message.client_message_id}\""
+  first = html.index(needle)
+  !first.nil? && html.index(needle, first + 1).nil?
+end
+
+def watercooler(client : Client) : Array(Message)
+  Message.for_room(client.t.conn, id("watercooler")).sorted_by { |m| m.created_at.microseconds }
+end
+
+describe "messages#index" do
+  it "returns the last page by default" do
+    client = Client.new
+    messages = watercooler(client)
+    response = client.get("/rooms/#{id("watercooler")}/messages", cookie: client.cookie("david"))
+    assert response.status == 200
+    assert response["content-type"] == "text/html; charset=utf-8"
+    assert present?(response, messages.last)
+  end
+
+  it "returns a page before the specified message" do
+    client = Client.new
+    messages = watercooler(client)
+    response = client.get("/rooms/#{id("watercooler")}/messages", "before=#{messages[2].id}", client.cookie("david"))
+    assert response.status == 200
+    assert present?(response, messages[0]) && present?(response, messages[1])
+    assert !present?(response, messages[2]) && !present?(response, messages[3]) && !present?(response, messages[4])
+  end
+
+  it "returns a page after the specified message" do
+    client = Client.new
+    messages = watercooler(client)
+    response = client.get("/rooms/#{id("watercooler")}/messages", "after=#{messages[2].id}", client.cookie("david"))
+    assert response.status == 200
+    assert present?(response, messages[3]) && present?(response, messages[4])
+    assert !present?(response, messages[0]) && !present?(response, messages[1]) && !present?(response, messages[2])
+  end
+
+  it "returns no_content when there are no messages" do
+    client = Client.new
+    # `@room.messages.destroy_all`
+    watercooler(client).each { |message| client.t.write { |tx| message.destroy(tx) } }
+    response = client.get("/rooms/#{id("watercooler")}/messages", cookie: client.cookie("david"))
+    assert response.status == 204
+  end
+
+  it "renders the same page from the fragment cache" do
+    client = Client.new
+    cookie = client.cookie("david")
+    first = client.get("/rooms/#{id("watercooler")}/messages", cookie: cookie)
+    assert !client.app.fragments.empty?
+    assert body(client.get("/rooms/#{id("watercooler")}/messages", cookie: cookie)) == body(first)
+  end
+
+  it "answers 304 to its own ETag" do
+    client = Client.new
+    cookie = client.cookie("david")
+    etag = client.get("/rooms/#{id("watercooler")}/messages", cookie: cookie)["etag"] || ""
+    assert etag.starts_with?("W/\"")
+    assert client.get("/rooms/#{id("watercooler")}/messages", cookie: cookie, if_none_match: etag).status == 304
+  end
+
+  it "sends the signed-out to sign in" do
+    client = Client.new
+    response = client.get("/rooms/#{id("watercooler")}/messages")
+    assert response.status == 302
+    assert response.location == "http://once.campfire.test/session/new"
+  end
+
+  it "is a 404 for a room the user isn't in, or a message not in the room" do
+    client = Client.new
+    cookie = client.cookie("david")
+    assert client.get("/rooms/123456/messages", cookie: cookie).status == 404
+    assert client.get("/rooms/#{id("watercooler")}/messages", "before=123456", cookie).status == 404
+  end
+end
+
+describe "all_emoji?" do
+  it "matches Ruby" do
+    assert all_emoji?("👍")
+    assert all_emoji?("❤️")
+    assert !all_emoji?("hi 👍")
+    assert !all_emoji?("")
+  end
+end
+
+describe "asset digests" do
+  it "digest as Propshaft does" do
+    digests = Digests.new
+    assert digests.path("boost.svg") == "/assets/boost-4a7bab66.svg"
+    assert digests.path("menu-dots-horizontal.svg") == "/assets/menu-dots-horizontal-f6a5d793.svg"
+  end
+end
+
+describe "layout pages" do
+  it "send the stylesheets' Link preload header, after one already set" do
+    client = Client.new
+    headers = HeaderList.new
+    request = Request.new("GET", "GET", "/", "", headers, nil, "", ProxyConfig.new)
+    jar = CookieJar.from_headers([] of String, client.app.secrets, client.t.clock)
+    c = Ctx.new(client.app.stack, request, ParamMap.new, ParamMap.new, ParamMap.new, jar)
+    c.set_header("link", "</early.js>; rel=preload")
+    response = c.finish(client.app.render_page(c, 200, "<html></html>"))
+    link = response["link"] || raise "no link header"
+    assert link.starts_with?("</early.js>; rel=preload,</assets/_reset-9c3efd7b.css>; rel=preload; as=style; nopush,")
+    assert link.bytesize <= 1000
+    assert response["content-type"] == "text/html; charset=utf-8"
+  end
+end

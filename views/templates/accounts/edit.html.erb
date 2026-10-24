@@ -1,0 +1,92 @@
+<%# reference/app/views/accounts/edit.html.erb %>
+<% content_for "nav" do %>  <div class="flex-item-justify-start">
+    <%= link_back_to_last_room_visited(ctx) %>
+  </div>
+
+<% if ctx.can_administer? %>    <div class="flex align-center gap flex-item-justify-end">
+      <%= link_to(account_bots_path, attrs.class("btn").style("view-transition-name: chat-bots")) do %>
+        <%= image_tag(ctx, "bot.svg", attrs.aria_hidden.size(20)) %>
+        <span class="for-screen-reader">Set up chat bots</span>
+<% end %>
+      <%= link_to(edit_account_custom_styles_path, attrs.class("btn").style("view-transition-name: custom-styles")) do %>
+        <%= image_tag(ctx, "art.svg", attrs.size(20).aria_hidden) %>
+        <span class="for-screen-reader">Custom styles</span>
+<% end %>    </div>
+<% end %><% end %><% content_for "footer" do %>  <div class="txt-align-center center margin-block-double txt-subtle">Campfire&trade; version <%= version_badge(ctx) %></div>
+<% end %>
+<section class="panel txt-align-center flex flex-column gap" style="view-transition-name: account-settings">
+<% if ctx.can_administer? %>    <div class="align-center center avatar__form gap" data-controller="upload-preview">
+<% form = form_with(account_action).model("account").method("patch").class("txt--medium").data("controller", "form") %>      <%= form.wrap do %>
+        <label class="btn input--file">
+          <%= image_tag(ctx, "camera.svg", attrs.aria_hidden.size(20)) %>
+          <%= form.file_field("logo", attrs.class("input").accept("image/*").data("action", "upload-preview#previewImage change->form#submit")) %>
+          <span class="for-screen-reader">Upload logo</span>
+        </label>
+<% end %>
+<% form = form_with(account_action).model("account").method("patch").data("controller", "form") %>      <%= form.wrap do %>
+        <label class="btn avatar input--file account-logo txt-xx-large">
+          <%= image_tag(ctx, ctx.account.logo_url, attrs.role("presentation").size(48).data("upload_preview_target", "image")) %>
+          <%= form.file_field("logo", attrs.class("input").accept("image/*").data("action", "upload-preview#previewImage change->form#submit")) %>
+          <span class="for-screen-reader">Upload logo</span>
+        </label>
+<% end %>
+<% if ctx.account.has_logo %>        <%= button_to(ctx.account.logo_url, attrs.method("delete").class("btn btn--negative txt-small avatar__delete-btn")) do %>
+          <%= image_tag(ctx, "minus.svg", attrs.aria_hidden.size(20)) %>
+          <span class="for-screen-reader">Delete logo</span>
+<% end %><% end %>    </div>
+
+<% form = form_with(account_action).model("account").method("patch").data("controller", "form").class("flex flex-column gap") %>    <%= form.wrap do %>
+      <div class="flex align-center gap">
+        <%= translation_button(ctx, "account_name") %>
+
+        <label class="flex align-center gap flex-item-grow">
+          <%= form.text_field("name", ctx.account.name, attrs.class("input txt-large").autocomplete("off").placeholder("Name this account").autofocus.data("action", "keydown.enter->form#submit")) %>
+        </label>
+
+        <%= button_tag(attrs.class("btn btn--reversed center").type("submit")) do %>
+          <%= image_tag(ctx, "check.svg", attrs.aria_hidden.size(20)) %>
+          <span class="for-screen-reader">Save changes</span>
+<% end %>      </div>
+<% end %>
+    <div class="margin-block-start pad-block pad-inline-double fill-shade border-radius">
+<% form = form_with(account_action).model("account").method("put").data("controller", "form").class("flex align-center gap center") %>      <%= form.wrap do %>
+        <div class="flex-item-grow flex align-center gap txt-align-start">
+          <%= image_tag(ctx, "crown.svg", attrs.class("colorize--black").aria_hidden.size(18)) %> Must be admin to create new rooms
+        </div>
+        <% settings_form = form.fields_for("settings") %>
+          <%= settings_form.hidden_field("restrict_room_creation_to_administrators", nil, attrs.value((!restrict_room_creation_to_administrators).to_s)) %>
+
+        <label class="switch">
+          <input type="checkbox"
+                class="switch__input"
+                <% if restrict_room_creation_to_administrators %>checked<% end %>
+                data-action="change->form#submit">
+          <span class="switch__btn round"></span>
+          <span class="for-screen-reader">
+            Must be admin to create new rooms
+          </span>
+        </label>
+
+<% end %>    </div>
+<% else %>    <%= account_logo_tag(ctx, "txt-xx-large center") %>
+    <h1 class="flex-item-grow txt-x-large"><%= ctx.account.name %></h1>
+<% end %>
+  <div class="margin-block pad-inline pad-block-start fill-shade border-radius">
+    <% include "accounts/_invite.html.erb" %>
+
+    <hr class="margin-block separator full-width" style="--border-style: solid">
+
+    <menu class="flex flex-column gap margin-none pad">
+      <turbo-frame id="account_users">
+        <% administrators.each do |user| %><% include "accounts/users/_user.html.erb" %><% end %>
+
+<% if !administrators.empty? && !members.empty? %>          <hr class="separator full-width" style="--border-style: solid">
+<% end %>
+        <% members.each do |user| %><% include "accounts/users/_user.html.erb" %><% end %>
+        <% if page = next_page %><% include "accounts/users/_next_page_container.html.erb" %><% end %>
+      </turbo-frame>
+    </menu>
+  </div>
+</section>
+
+

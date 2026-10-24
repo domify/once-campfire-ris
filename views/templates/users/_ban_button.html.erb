@@ -1,0 +1,10 @@
+<%# reference/app/views/users/_ban_button.html.erb -%>
+<%- if user.active %>  <%= button_to(user_ban_path(user.id), attrs.method("post").class("btn full-width").data("turbo_confirm", "Are you sure you want to ban this user? This will log them out, delete their messages, and block their IP addresses.")) do %>
+    <%= image_tag(ctx, "cancel.svg", attrs.aria_hidden.aria("label", "Ban #{user.name}")) %>
+    <span>Ban <%= user.name %></span>
+<% end %>
+<%- else %>  <%= button_to(user_ban_path(user.id), attrs.method("delete").class("btn btn--negative full-width").data("turbo_confirm", "Are you sure you want to remove the ban on this user?")) do %>
+    <%= image_tag(ctx, "cancel.svg", attrs.aria_hidden.aria("label", "Remove Ban #{user.name}")) %>
+    <span>Remove ban</span>
+<% end %>
+<%- end %>

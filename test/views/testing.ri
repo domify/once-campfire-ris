@@ -1,0 +1,21 @@
+# What the views tests share: a byte comparison that says where two
+# renders part, and the goldens.
+module test/views/testing
+
+import std/text
+
+# Panics, naming *label* and showing where *actual* first differs from
+# *expected*, unless they are the same bytes.
+pub def assert_same(label : String, expected : String, actual : String) : Nil
+  return if expected == actual
+  at = 0
+  limit = expected.bytesize < actual.bytesize ? expected.bytesize : actual.bytesize
+  while at < limit && expected.as_tape[at] == actual.as_tape[at]
+    at += 1
+  end
+  from = at > 120 ? at - 120 : 0
+  STDERR.puts "#{label}: differs at byte #{at} (expected #{expected.bytesize} bytes, got #{actual.bytesize})"
+  STDERR.puts "  expected: #{expected[from, (expected.bytesize - from) < 240 ? expected.bytesize - from : 240].inspect}"
+  STDERR.puts "  actual:   #{actual[from, (actual.bytesize - from) < 240 ? actual.bytesize - from : 240].inspect}"
+  raise "#{label}: render differs"
+end

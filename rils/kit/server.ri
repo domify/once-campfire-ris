@@ -1,0 +1,425 @@
+# The HTTP layer on the web package: one handler that does what Rails' middleware
+# stack does before routing (request id, forced SSL, `_method` override),
+# routes, runs the action with a `Ctx`, and writes the finished response.
+module rils/kit/server
+
+import std/time::{Time, Span}
+import std/text
+import std/float
+import std/file::{File}
+import rils/rails_compat/clock::{Clock}
+import rils/rails_compat/crypto::{uuid, write_uuid}
+import web/web/handler::{Handler}
+import web/web/context::{Context}
+import web/web/request::{Arrived}
+import web/web/response
+
+alias WireResponse = Web::Response::Response
+import web/web/file_body::{respond_file}
+import web/web/websocket::{WebSocket}
+import rils/kit/app::{Stack}
+import rils/kit/body::{parse_body, ParsedBody}
+import rils/kit/cookies::{CookieJar}
+import rils/kit/ctx::{Ctx, ActionResult}
+import rils/kit/errors::{HttpError, HttpErrorKind}
+import rils/kit/exceptions::{render_error}
+import rils/kit/format::{NegotiationInput, request_formats, Format}
+import rils/kit/params::{ParamMap, ParamError, from_query_string}
+import rils/kit/request::{Request, RequestFields, scheme_is_https?, media_type_of}
+import rils/kit/response::{Response, HeaderList, FileBody, Parts, Written}
+import rils/kit/router::{Router}
+
+pub alias Action = Proc(Ctx, ActionResult)
+# A WebSocket endpoint: given web's context, it accepts or refuses the
+# upgrade itself.
+pub alias SocketAction = Proc(Context, Nil)
+# `ActionDispatch::Static`: given the method, the raw path and the
+# headers, a public file's response, or nil to route the request.
+pub alias PublicFiles = Proc(String, Str, RequestFields, Response?)
+
+# `Rack::MethodOverride::HTTP_METHODS`
+OVERRIDABLE_METHODS = ["GET", "HEAD", "PUT", "POST", "DELETE", "OPTIONS", "PATCH", "LINK", "UNLINK"]
+FORM_MEDIA_TYPES    = ["application/x-www-form-urlencoded", "multipart/form-data", "multipart/related", "multipart/mixed"]
+
+pub class KitHandler < Handler
+  getter stack : Stack
+  getter router : Router(Action)
+  getter sockets : Hash(String, SocketAction)
+  property public_files : PublicFiles?
+  # Run around each routed request's dispatch, rendering included, and
+  # before its response is written: the app's database scope.
+  property on_enter : Proc(Nil)?
+  property on_leave : Proc(Nil)?
+
+  def initialize(@stack : Stack, @router : Router(Action))
+    super()
+    @sockets = {} of String => SocketAction
+    @public_files = nil
+    @on_enter = nil
+    @on_leave = nil
+  end
+
+  pub def socket(path : String, &action : Context -> Nil) : Nil
+    @sockets[path] = action
+  end
+
+  # A request as web parsed it, read where it lies on the connection's
+  # tape: no `Request` or `Context` of web's is made for it. A WebSocket
+  # upgrade to one of the sockets is left to `call`, which hands web's
+  # context over.
+  pub def answer(arrived : Arrived, wire : WireResponse) : Bool
+    if arrived.field("upgrade")
+      @sockets.each_key { |path| return false if arrived.path == path }
+    end
+    serve(wire, method_name(arrived.method), arrived.path, arrived.query, RequestFields.new(arrived.head.fields), arrived.body, arrived.head?)
+    true
+  end
+
+  # A request web made a `Request` of: a socket's upgrade, or one `answer`
+  # did not take.
+  pub def call(web : Context) : Nil
+    incoming = web.request
+    if WebSocket.upgrade_request?(incoming)
+      if socket = @sockets[incoming.path]?
+        socket.call(web)
+        return
+      end
+    end
+    tape do
+      fields = RequestFields.new(HeaderList.new(incoming.headers.pairs, true))
+      serve(web.response, incoming.method, incoming.path.as_tape, incoming.query_string.as_tape, fields, incoming.body.as_tape, incoming.method == "HEAD")
+    end
+  end
+
+  private def serve(
+    wire : WireResponse,
+    method : String,
+    path : Str,
+    query : Str,
+    fields : RequestFields,
+    body : Str,
+    head : Bool,
+  ) : Nil
+    started = Time.monotonic
+    config = @stack.config
+    ssl = config.proxy.assume_ssl || scheme_is_https?(fields)
+
+    if config.force_ssl && !ssl
+      write(wire, redirect_to_https(method, path.to_heap, query.to_heap, fields), head)
+      return
+    end
+
+    # Static sits after `ActionDispatch::SSL` and before `RequestId` and
+    # `Rack::Runtime`: a public file has HSTS, and no request id or runtime.
+    if public_files = @public_files
+      if response = public_files.call(method, path, fields)
+        response.headers["strict-transport-security"] = config.hsts if config.force_ssl && ssl
+        write(wire, response, head)
+        return
+      end
+    end
+
+    # Where a page rendered as it is sent is written, on this tape.
+    page = Str::Builder.new(32768)
+    if enter = @on_enter
+      enter.call
+    end
+    response = dispatch(method, path, query, fields, body, page)
+    if leave = @on_leave
+      leave.call
+    end
+    if config.force_ssl && ssl
+      response.headers["x-request-id"] = make_request_id(fields["x-request-id"])
+      unless response.headers.has_key?("x-runtime")
+        response.headers["x-runtime"] = format_runtime((Time.monotonic - started).total_seconds)
+      end
+      response.headers["strict-transport-security"] = config.hsts
+      flag_cookies_as_secure(response.headers)
+      write(wire, response, head, page)
+      return
+    end
+    # `RequestId` and `Rack::Runtime` set their headers last, and only the
+    # wire reads them: written where the fields are, as a set would leave
+    # them, at the end.
+    last = Str::Builder.new(96)
+    response.headers.delete("x-request-id")
+    last << "X-Request-Id: "
+    write_request_id(last, fields["x-request-id"])
+    last << "\r\n"
+    unless response.headers.has_key?("x-runtime")
+      last << "X-Runtime: "
+      write_runtime(last, (Time.monotonic - started).total_seconds)
+      last << "\r\n"
+    end
+    write(wire, response, head, page, last.finish)
+  end
+
+  def dispatch(
+    original_method : String,
+    path : Str,
+    query_text : Str,
+    fields : RequestFields,
+    body_view : Str,
+    page : Str::Builder,
+  ) : Response
+    method = original_method
+    content_type = (found_type = fields["content-type"]) && !found_type.empty? ? found_type.to_heap : nil
+    body_params = parse_body(original_method, content_type, body_view)
+
+    # `Rack::MethodOverride`: a form POST's `_method`, else the
+    # `X-HTTP-Method-Override` header.
+    if original_method == "POST"
+      media = media_type_of(content_type)
+      form_data = media.nil? || FORM_MEDIA_TYPES.includes?(media)
+      override = form_data && body_params.is_a?(ParamMap) ? body_params.str("_method") : nil
+      if !override && (header = fields["x-http-method-override"])
+        override = header.to_heap
+      end
+      if override && OVERRIDABLE_METHODS.includes?(override.upcase)
+        method = override.upcase
+      end
+    end
+
+    request = Request.new(method, original_method, path, query_text, fields, nil, body_view, @stack.config.proxy)
+    cookies = CookieJar.from_fields(fields, @stack.secrets, @stack.clock)
+    query = query_text.empty? ? ParamMap.new : from_query_string(query_text)
+    found = @router.find(method, path)
+
+    path_params = found ? found[1] : ParamMap.new
+    ctx = Ctx.new(@stack, request, path_params, query.is_a?(ParamMap) ? query : ParamMap.new, body_params.is_a?(ParamMap) ? body_params : ParamMap.new, cookies)
+
+    failure = nil.as(HttpError?)
+    failure = HttpError.bad_request(query.message) if query.is_a?(ParamError)
+    case body_params
+    when ParamError then failure ||= HttpError.bad_request(body_params.message)
+    when ParamMap   then nil
+    else                 failure ||= HttpError.status(body_params.status, body_params.message)
+    end
+    failure ||= HttpError.not_found unless found
+
+    result = if failure
+               failure
+             elsif found
+               run_action(found[0].action, ctx)
+             else
+               HttpError.not_found
+             end
+    response = ctx.finish(result)
+    ctx.write_page(response, page)
+    response
+  end
+
+  # The action runs in the connection's own task. A panic in it is caught
+  # where web isolates every connection, and answered with `error_pages`'
+  # 500, Rails' `public/500.html` as `ShowExceptions` sends it; the
+  # connection closes after. An action of its own task cost a task on the
+  # runtime's fiber list for every request, and a request scope left open
+  # while it ran: 64 connections wrote 64 tapes, 23 MB, out of cache.
+  def run_action(action : Action, ctx : Ctx) : ActionResult
+    action.call(ctx)
+  end
+
+  # web's `error` pages for a `Server`: a panicking action's 500.
+  pub def error_pages : Hash(Int32, Proc(Context, String))
+    pages = @stack.config.error_pages
+    {500 => ->(web : Context) {
+      page = render_error(pages, 500, nil, false)
+      web.response.content_type = page["content-type"] || "text/html; charset=UTF-8"
+      page.body_text || ""
+    }} of Int32 => Proc(Context, String)
+  end
+
+  # Hand a finished response to web, streaming files and dropping HEAD
+  # bodies (`Rack::Head`) while keeping their `Content-Length`. Anything
+  # but a file leaves in one write from the request's tape: the header
+  # fields written there, and the body from where it lies.
+  def write(
+    wire : WireResponse,
+    response : Response,
+    head : Bool,
+    page : Str::Builder? = nil,
+    last : Str = "".as_tape,
+  ) : Nil
+    wire.status_code = response.status
+    file = response.body
+    if file.is_a?(FileBody)
+      response.headers.each do |name, value|
+        wire.headers.add(header_case(name), value) unless name == "content-length"
+      end
+      content_type = response["content-type"] || "application/octet-stream"
+      # A 206 sends the one range the body names, out of the whole file.
+      if response.status == 206
+        respond_file(wire, file.path, File.size(file.path), [{file.offset, file.offset + file.length - 1}], content_type, head)
+      else
+        respond_file(wire, file.path, file.length, nil, content_type, head)
+      end
+      wire.status_code = response.status
+      return
+    end
+    fields = Str::Builder.new(64 * response.headers.size + 64)
+    response.headers.each do |name, value|
+      # The two web frames the message with, given to it as headers.
+      case name
+      when "content-length" then wire.headers.add("Content-Length", value)
+      when "connection"     then wire.headers.add("Connection", value)
+      else
+        append_header_name(fields, name)
+        fields << ": " << value << "\r\n"
+      end
+    end
+    fields.append(last)
+    # A HEAD response's body is left out by web, which keeps its length. A
+    # body in parts goes as its pieces, where they lie, never joined.
+    typed = response.headers.has_key?("content-type")
+    if file.is_a?(Parts)
+      pieces = Ary(Str).new(2 * file.inserts.size + 1)
+      file.each_piece { |piece| pieces << piece }
+      wire.send(fields.finish, pieces, typed)
+      return
+    end
+    text = case file
+           when String  then file.as_tape
+           when Written then page ? page.finish : "".as_tape
+           else              "".as_tape
+           end
+    wire.send(fields.finish, text, typed)
+  end
+end
+
+# *name* as it goes on the wire, capitalised per dash, written where the
+# fields are: `x-request-id` is `X-Request-Id`.
+def append_header_name(io : Str::Builder, name : String) : Nil
+  start = true
+  name.each_byte do |byte|
+    io.push(start && byte >= 97_u8 && byte <= 122_u8 ? byte - 32_u8 : byte)
+    start = byte == 45_u8
+  end
+end
+
+# `X-Request-Id` spelt the way Rails writes header names on the wire is
+# irrelevant to clients; web writes what it is given, so names go out
+# capitalised per dash.
+def header_case(name : String) : String
+  name.split('-').map { |part| part.empty? ? part : part[0].upcase.to_s + part[1, part.bytesize - 1] }.join("-")
+end
+
+# `ActionDispatch::RequestId#make_request_id`: the client's id, its
+# alphanumerics, `_`, `-` and `@` only, at most 255, else a new one.
+def make_request_id(incoming : Str?) : String
+  if incoming
+    count = 0
+    blank = true
+    ascii = true
+    incoming.each_byte do |byte|
+      count += 1 if request_id_byte?(byte)
+      blank = false unless byte == 32_u8 || (byte >= 9_u8 && byte <= 13_u8)
+      ascii = false if byte >= 128_u8
+    end
+    unless blank
+      # A letter past ASCII counts as Rails counts it: by character.
+      return make_request_id(incoming.to_heap) unless ascii
+      cleaned = Str::Builder.new(count < 255 ? count : 255)
+      incoming.each_byte do |byte|
+        cleaned.push(byte) if cleaned.length < 255 && request_id_byte?(byte)
+      end
+      return cleaned.finish.to_heap
+    end
+  end
+  uuid
+end
+
+# `make_request_id`, written into *io*: the cleaned id, or a new one, with
+# no string made for either.
+def write_request_id(io : Str::Builder, incoming : Str?) : Nil
+  if incoming
+    blank = true
+    ascii = true
+    incoming.each_byte do |byte|
+      blank = false unless byte == 32_u8 || (byte >= 9_u8 && byte <= 13_u8)
+      ascii = false if byte >= 128_u8
+    end
+    unless blank
+      unless ascii
+        io << make_request_id(incoming.to_heap)
+        return
+      end
+      count = 0
+      incoming.each_byte do |byte|
+        if count < 255 && request_id_byte?(byte)
+          io.push(byte)
+          count += 1
+        end
+      end
+      return
+    end
+  end
+  write_uuid(io)
+end
+
+def make_request_id(incoming : String) : String
+  String.build do |io|
+    count = 0
+    incoming.each_char do |c|
+      next unless c.alphanumeric? || c == '_' || c == '-' || c == '@'
+      next if count >= 255
+      io << c
+      count += 1
+    end
+  end
+end
+
+def request_id_byte?(byte : UInt8) : Bool
+  (byte >= 48_u8 && byte <= 57_u8) || (byte >= 65_u8 && byte <= 90_u8) || (byte >= 97_u8 && byte <= 122_u8) || byte == 95_u8 || byte == 45_u8 || byte == 64_u8
+end
+
+# The method's name as a string to keep, the common ones without a copy.
+def method_name(method : Str) : String
+  KNOWN_METHODS.each { |name| return name if method == name }
+  method.to_heap
+end
+
+KNOWN_METHODS = ["GET", "POST", "HEAD", "PATCH", "PUT", "DELETE", "OPTIONS"]
+
+# `Rack::Runtime`'s `X-Runtime`: seconds with six decimals.
+def format_runtime(seconds : Float64) : String
+  text = Str::Builder.new(24)
+  write_runtime(text, seconds)
+  text.finish.to_heap
+end
+
+def write_runtime(io : Str::Builder, seconds : Float64) : Nil
+  micros = (seconds * 1_000_000).to_i64
+  io.append_int(micros // 1_000_000)
+  io.push(46_u8)
+  fraction = micros % 1_000_000
+  place = 100_000_i64
+  while place > 0
+    io.push((48 + fraction // place % 10).to_u8)
+    place //= 10
+  end
+end
+
+# `ActionDispatch::SSL#redirect_to_https`: 301 for GET/HEAD, 308 otherwise.
+def redirect_to_https(method : String, path : String, query : String, headers : RequestFields) : Response
+  named = headers["x-forwarded-host"] || headers["host"]
+  host = named ? named.to_heap : "localhost"
+  host = host.split(',').last.strip
+  colon = host.rindex(':')
+  host = host[0, colon] if colon && host[colon + 1, host.bytesize - colon - 1].chars.all?(&.digit?)
+  full = query.empty? ? path : "#{path}?#{query}"
+  status = method == "GET" || method == "HEAD" ? 301 : 308
+  Response.new(status).content_type("text/html").header("location", "https://#{host}#{full}")
+end
+
+# `ActionDispatch::SSL#flag_cookies_as_secure!`
+def flag_cookies_as_secure(headers : HeaderList) : Nil
+  cookies = headers.all("set-cookie")
+  return if cookies.empty?
+  headers.delete("set-cookie")
+  cookies.each do |cookie|
+    attributes = cookie.split(';')
+    secure = false
+    attributes.each_with_index { |attribute, i| secure = true if i > 0 && attribute.strip.downcase == "secure" }
+    headers.append("set-cookie", secure ? cookie : "#{cookie}; secure")
+  end
+end

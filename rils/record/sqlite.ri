@@ -1,0 +1,313 @@
+# SQLite as the models use it, on the domify/sqlite driver: a connection
+# with a statement cache (Active Record keeps a prepared-statement cache per
+# connection too), positional `?` parameters, and rows read by column
+# position.
+#
+# The driver opens the file, prepares, caches, binds and steps; a `Row`
+# reads the current row's columns by position straight from the driver's
+# statement, which db's `ResultSet` only reads in order.
+#
+# A failed statement panics, as an unexpected `ActiveRecord::StatementInvalid`
+# would end the request; `execute?` answers the error instead for the writes
+# where a constraint is expected to refuse (`RecordNotUnique`).
+@[Ffi]
+module rils/record/sqlite
+
+import std/int
+import std/time::{Time}
+import db/db/errors::{DBError}
+import db/db/value::{DBValue, ExecResult}
+import db/db/core::{ResultSet, Statement}
+import sqlite/sqlite/core::{SQLite3Connection, SQLite3ResultSet}
+import rils/record/timestamp::{Timestamp}
+
+# The driver's binding to libsqlite3, which a `Row` reads columns through.
+alias Driver = ::Sqlite::Core::LibSQLite3
+
+# What the driver's `LibSQLite3` lacks: the extended error code that tells
+# a unique index apart, the row count past 2^31, and the busy handler.
+@[Link("sqlite3")]
+lib LibSQLite
+  fun extended_errcode = sqlite3_extended_errcode(database : Driver::SQLite3) : Int32
+  fun changes = sqlite3_changes64(database : Driver::SQLite3) : Int64
+  fun busy_timeout = sqlite3_busy_timeout(database : Driver::SQLite3, milliseconds : Int32) : Int32
+end
+
+NULL_TYPE = 5
+
+# `SQLITE_CONSTRAINT_UNIQUE` and `SQLITE_CONSTRAINT_PRIMARYKEY`.
+CONSTRAINT_UNIQUE     = 2067
+CONSTRAINT_PRIMARYKEY = 1555
+
+# What a statement binds: Active Record's types as SQLite stores them.
+pub alias SqlValue = Nil | Bool | Int32 | Int64 | Float64 | String | Timestamp
+
+# The NUL-terminated C string at *pointer*.
+private def c_string(pointer : UInt8*) : String
+  size = 0
+  while pointer[size] != 0
+    size += 1
+  end
+  String.new(size) { |output| output.copy_from(pointer, size) }
+end
+
+pub struct SqliteError
+  getter code : Int32
+  getter message : String
+
+  def initialize(@code : Int32, @message : String)
+  end
+
+  # `ActiveRecord::RecordNotUnique`: a unique index refused the write.
+  pub def record_not_unique? : Bool
+    @code == CONSTRAINT_UNIQUE || @code == CONSTRAINT_PRIMARYKEY
+  end
+end
+
+impl Error for SqliteError
+  def message : String
+    @message
+  end
+end
+
+# One row of a result, read by position.
+pub struct Row
+  @statement : Driver::Statement
+
+  def initialize(@statement : Driver::Statement)
+  end
+
+  pub def null?(index : Int32) : Bool
+    Driver.column_type(@statement, index) == NULL_TYPE
+  end
+
+  pub def int(index : Int32) : Int64
+    Driver.column_int64(@statement, index)
+  end
+
+  pub def int?(index : Int32) : Int64?
+    null?(index) ? nil : int(index)
+  end
+
+  pub def int32(index : Int32) : Int32
+    int(index).to_i32
+  end
+
+  pub def float(index : Int32) : Float64
+    Driver.column_double(@statement, index)
+  end
+
+  pub def float?(index : Int32) : Float64?
+    null?(index) ? nil : float(index)
+  end
+
+  pub def bool(index : Int32) : Bool
+    int(index) != 0
+  end
+
+  pub def bool?(index : Int32) : Bool?
+    null?(index) ? nil : bool(index)
+  end
+
+  pub def text(index : Int32) : String
+    pointer = Driver.column_text(@statement, index)
+    size = Driver.column_bytes(@statement, index)
+    return "" if pointer.address == 0
+    String.new(size) { |output| output.copy_from(pointer, size) }
+  end
+
+  pub def text?(index : Int32) : String?
+    null?(index) ? nil : text(index)
+  end
+
+  # Parsed from the column's bytes copied onto the tape: no string is made
+  # unless the value is not a time.
+  pub def time(index : Int32) : Timestamp
+    pointer = Driver.column_text(@statement, index)
+    size = Driver.column_bytes(@statement, index)
+    found = nil.as(Timestamp?)
+    if pointer.address != 0
+      tape do
+        bytes = Str::Builder.new(size)
+        bytes.append(pointer, size)
+        found = Timestamp.parse_db(bytes.finish)
+      end
+    end
+    found || raise "invalid datetime #{text(index).inspect} in column #{index}"
+  end
+
+  pub def time?(index : Int32) : Timestamp?
+    null?(index) ? nil : time(index)
+  end
+
+  pub def column_name(index : Int32) : String
+    c_string(Driver.column_name(@statement, index))
+  end
+
+  pub def column_count : Int32
+    Driver.column_count(@statement)
+  end
+end
+
+# A cached statement found by its SQL string's address. The entry keeps
+# the string alive on the heap, which doesn't move, so while the entry is
+# here the address can't come back as another string's.
+class Prepared
+  getter sql : String
+  getter statement : Statement
+
+  def initialize(@sql : String, @statement : Statement)
+  end
+end
+
+pub class Connection
+  # Most SQL is a literal, the same string on every call: found by address
+  # before db's cache hashes the whole text.
+  PREPARED_LIMIT = 256
+
+  @connection : SQLite3Connection
+  @handle : Driver::SQLite3
+  @prepared : Hash(UInt64, Prepared)
+
+  def initialize(@connection : SQLite3Connection)
+    @handle = @connection.to_unsafe
+    @prepared = {} of UInt64 => Prepared
+  end
+
+  def prepare(sql : String) : Statement | DBError
+    address = sql.object_id
+    if found = @prepared[address]?
+      return found.statement
+    end
+    statement = @connection.fetch_or_build_prepared_statement(sql)
+    return statement if statement.is_a?(DBError)
+    # Built strings would otherwise pile up here.
+    @prepared.clear if @prepared.size >= PREPARED_LIMIT
+    @prepared[address] = Prepared.new(sql, statement)
+    statement
+  end
+
+  pub def self.open(path : String) : Connection
+    opened = SQLite3Connection.open(::Db::Core::Connection::Options.new, SQLite3Connection::Options.new(filename: path))
+    raise "can't open #{path}: #{opened.message}" if opened.is_a?(DBError)
+    Connection.new(opened)
+  end
+
+  pub def busy_timeout(milliseconds : Int32) : Nil
+    LibSQLite.busy_timeout(@handle, milliseconds)
+  end
+
+  pub def close : Nil
+    @connection.close
+  end
+
+  def error_message : String
+    c_string(Driver.errmsg(@handle))
+  end
+
+  def error : SqliteError
+    SqliteError.new(LibSQLite.extended_errcode(@handle), error_message)
+  end
+
+  # Runs one or more statements without parameters (`execute_batch`).
+  pub def execute_batch(sql : String) : Nil
+    failure = execute_batch?(sql)
+    raise failure.message if failure
+  end
+
+  pub def execute_batch?(sql : String) : SqliteError?
+    message = Pointer(UInt8).new(0_u64)
+    code = Driver.exec(@handle, sql.to_unsafe, Pointer(Void).new(0_u64), Pointer(Void).new(0_u64), pointerof(message))
+    code == 0 ? nil : error
+  end
+
+  # *args* as the driver binds them; a `Timestamp` as the text SQLite keeps.
+  def db_args(args : Array(SqlValue)) : Array(DBValue)
+    values = Array(DBValue).new(args.size)
+    args.each do |arg|
+      case arg
+      when Timestamp then values << arg.to_db
+      else                values << arg
+      end
+    end
+    values
+  end
+
+  # The open result of *sql*, the cached statement bound to *args*.
+  def result_set(sql : String, args : Array(SqlValue)) : SQLite3ResultSet | SqliteError
+    statement = prepare(sql)
+    return error if statement.is_a?(DBError)
+    result = statement.query(args: db_args(args))
+    return error if result.is_a?(DBError)
+    result.as(SQLite3ResultSet)
+  end
+
+  # Runs a write; the number of rows it changed.
+  pub def execute(sql : String, args : Array(SqlValue) = [] of SqlValue) : Int64
+    result = execute?(sql, args)
+    raise "#{result.message} in #{sql}" if result.is_a?(SqliteError)
+    result
+  end
+
+  pub def execute?(sql : String, args : Array(SqlValue) = [] of SqlValue) : Int64 | SqliteError
+    statement = prepare(sql)
+    return error if statement.is_a?(DBError)
+    result = statement.exec(args: db_args(args))
+    return error if result.is_a?(DBError)
+    LibSQLite.changes(@handle)
+  end
+
+  # Every row, each mapped by the block.
+  pub def query_all(sql : String, args : Array(SqlValue), & : Row -> T) : Array(T) forall T
+    rs = result_set(sql, args)
+    raise "#{rs.message} in #{sql}" if rs.is_a?(SqliteError)
+    rows = [] of T
+    row = Row.new(rs.to_unsafe)
+    failure = nil.as(SqliteError?)
+    loop do
+      step = rs.move_next
+      if step.is_a?(DBError)
+        failure = error
+        break
+      end
+      break unless step
+      rows << yield row
+    end
+    rs.close
+    raise "#{failure.message} in #{sql}" if failure
+    rows
+  end
+
+  # The first row mapped by the block, or nil.
+  pub def query_one(sql : String, args : Array(SqlValue), & : Row -> T) : T? forall T
+    rs = result_set(sql, args)
+    raise "#{rs.message} in #{sql}" if rs.is_a?(SqliteError)
+    step = rs.move_next
+    failure = step.is_a?(DBError) ? error : nil
+    result = step == true ? (yield Row.new(rs.to_unsafe)) : nil
+    rs.close
+    raise "#{failure.message} in #{sql}" if failure
+    result
+  end
+
+  pub def count(sql : String, args : Array(SqlValue) = [] of SqlValue) : Int64
+    query_one(sql, args) { |row| row.int(0) } || 0_i64
+  end
+
+  pub def exists?(sql : String, args : Array(SqlValue) = [] of SqlValue) : Bool
+    !query_one(sql, args) { |row| true }.nil?
+  end
+
+  pub def last_insert_rowid : Int64
+    Driver.last_insert_rowid(@handle)
+  end
+
+  pub def autocommit? : Bool
+    Driver.get_autocommit(@handle) != 0
+  end
+end
+
+# `?, ?, ?`
+pub def placeholders(count : Int32) : String
+  Array.new(count, "?").join(", ")
+end

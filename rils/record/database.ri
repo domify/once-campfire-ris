@@ -1,0 +1,224 @@
+# The database: one connection, each write in `BEGIN IMMEDIATE`
+# (`default_transaction_mode: immediate` in `reference/config/database.yml`),
+# then its after-commit work in order, outside the transaction, the way
+# Active Record runs `after_commit` callbacks.
+#
+# iyi's tasks share one scheduler thread, and nothing here parks, so a write
+# runs start to finish without another task's statements in between, and
+# reads see committed data. The Rust port's writer and reader threads are a
+# later measurement's business.
+module rils/record/database
+
+import std/time::{Time}
+import rils/rails_compat/clock::{Clock}
+import rils/record/sqlite::{Connection}
+import rils/record/timestamp::{Timestamp}
+import rils/record/events::{Event, EventSink}
+import rils/record/schema::{prepare, configure_connection, Prepared}
+
+# What the models need from Action Text. The real pipeline lives in
+# `richtext/`; the app plugs it in by subclassing. This base reads a body as
+# plain text without attachments.
+pub class RichText
+  # `ActionText::Content#to_plain_text` of a stored body. Mention
+  # attachments render as `attachable_plain_text_representation`, i.e.
+  # `"@#{name}"` (`reference/app/models/user/mentionable.rb`).
+  pub def to_plain_text(conn : Connection, html : String) : String
+    html
+  end
+
+  # `body.attachables.grep(User).uniq`: user ids from mention attachments,
+  # in document order, deduplicated
+  # (`reference/app/models/message/mentionee.rb`).
+  pub def mentioned_user_ids(conn : Connection, html : String) : Array(Int64)
+    [] of Int64
+  end
+end
+
+# Everything models need besides the connection: the clock, where side
+# effects go, and the Action Text adapter.
+pub class Env
+  getter clock : Clock
+  # Set once by the app, to its job queue.
+  property sink : EventSink
+  property rich_text : RichText
+  # BCrypt cost for `has_secure_password`. Rails uses `BCrypt::Engine.cost`
+  # (12), or `MIN_COST` (4) in the test environment.
+  getter bcrypt_cost : Int32
+
+  def initialize(@clock : Clock, @sink : EventSink, @rich_text : RichText, @bcrypt_cost : Int32 = 12)
+  end
+
+  # `Time.current`, at the microseconds a `datetime(6)` column keeps.
+  pub def now : Timestamp
+    Timestamp.from_time(@clock.now)
+  end
+end
+
+alias AfterCommit = Event | Proc(Tx, Nil)
+
+# A write in progress: the connection inside a transaction (or, while
+# after-commit work runs, outside one), the environment, and the queued
+# after-commit work.
+pub class Tx
+  getter conn : Connection
+  getter env : Env
+  getter in_transaction : Bool
+  @after_commit : Array(AfterCommit)
+  @rolled_back : Bool
+
+  def initialize(@conn : Connection, @env : Env, @in_transaction : Bool)
+    @after_commit = [] of AfterCommit
+    @rolled_back = false
+  end
+
+  # `Time.current`
+  pub def now : Timestamp
+    @env.now
+  end
+
+  pub def rich_text : RichText
+    @env.rich_text
+  end
+
+  # Emits an event right away, even though the transaction may still roll
+  # back, for the side effects Rails performs mid-transaction.
+  pub def emit_now(event : Event) : Nil
+    @env.sink.emit(event)
+  end
+
+  # Emits an event once the transaction commits (`after_commit`), or right
+  # away when already running after commit.
+  pub def emit_after_commit(event : Event) : Nil
+    if @in_transaction
+      @after_commit << event
+    else
+      @env.sink.emit(event)
+    end
+  end
+
+  # Queues database work to run after commit, in its own implicit
+  # transaction.
+  pub def after_commit(&hook : Tx -> Nil) : Nil
+    if @in_transaction
+      @after_commit << hook
+    else
+      hook.call(Tx.new(@conn, @env, false))
+    end
+  end
+
+  # Rolls the write back when it returns, as raising
+  # `ActiveRecord::Rollback` (or any error) inside a transaction does.
+  pub def roll_back : Nil
+    @rolled_back = true
+  end
+
+  pub def rolled_back? : Bool
+    @rolled_back
+  end
+
+  def take_after_commit : Array(AfterCommit)
+    queue = @after_commit
+    @after_commit = [] of AfterCommit
+    queue
+  end
+end
+
+# Runs the block in `BEGIN IMMEDIATE`, commits, then runs the after-commit
+# queue. A block that called `roll_back` rolls back and discards the queue.
+# A write that panicked left its transaction open, and the next write rolls
+# it back before it begins.
+pub def run_write(conn : Connection, env : Env, & : Tx -> T) : T forall T
+  conn.execute_batch("ROLLBACK") unless conn.autocommit?
+  conn.execute_batch("BEGIN IMMEDIATE")
+  tx = Tx.new(conn, env, true)
+  value = yield tx
+  if tx.rolled_back?
+    conn.execute_batch("ROLLBACK")
+    return value
+  end
+  conn.execute_batch("COMMIT")
+  after = Tx.new(conn, env, false)
+  tx.take_after_commit.each do |item|
+    case item
+    when Proc(Tx, Nil) then item.call(after)
+    else                    env.sink.emit(item)
+    end
+  end
+  value
+end
+
+pub class Config
+  getter path : String
+  # Load the schema into an empty database (`db:prepare`).
+  getter prepare : Bool
+  # `ar_internal_metadata.environment` when preparing.
+  getter environment : String
+
+  def initialize(@path : String, @prepare : Bool = true, @environment : String = "production")
+  end
+end
+
+pub class Database
+  getter conn : Connection
+  getter env : Env
+  getter path : String
+  # Inside a request: reads share one deferred transaction, begun by the
+  # first of them, so its WAL read lock is taken once, not per read.
+  @scoped : Bool
+  @reading : Bool
+
+  def initialize(@conn : Connection, @env : Env, @path : String)
+    @scoped = false
+    @reading = false
+  end
+
+  pub def self.open(config : Config, env : Env) : Database | String
+    conn = Connection.open(config.path)
+    configure_connection(conn)
+    if config.prepare
+      prepared = prepare(conn, config.environment, env.now)
+      return prepared if prepared.is_a?(String)
+    end
+    Database.new(conn, env, config.path)
+  end
+
+  # Runs the block as one immediate transaction. An open read ends first:
+  # a deferred read upgraded to a write fails with `SQLITE_BUSY_SNAPSHOT`
+  # when another connection committed since it began.
+  pub def write(& : Tx -> T) : T forall T
+    release
+    run_write(@conn, @env) { |tx| yield tx }
+  end
+
+  pub def read(& : Connection -> T) : T forall T
+    if @scoped && !@reading
+      @conn.execute_batch("BEGIN")
+      @reading = true
+    end
+    yield @conn
+  end
+
+  # A request begins: its reads share a transaction from the first one on.
+  # One a panicking request left open is rolled back.
+  pub def enter : Nil
+    @conn.execute_batch("ROLLBACK") unless @conn.autocommit?
+    @reading = false
+    @scoped = true
+  end
+
+  # The request rendered: its read transaction ends before the response
+  # goes out, where the task may park and another use the connection.
+  pub def leave : Nil
+    release
+    @scoped = false
+  end
+
+  # Ends the request's read transaction, if one is open. Call it before
+  # the request parks (outbound HTTP, DNS); the next read begins anew.
+  pub def release : Nil
+    return unless @reading
+    @reading = false
+    @conn.execute_batch("COMMIT") unless @conn.autocommit?
+  end
+end

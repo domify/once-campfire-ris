@@ -1,0 +1,185 @@
+# `ActiveSupport::Messages::Metadata` and `SerializerWithFallback`: how a
+# value and its purpose and expiry are packed into the bytes that get signed
+# or encrypted.
+#
+# Two envelopes exist. When the serializer is one Rails trusts for metadata
+# (JSON, or the `:json_allow_marshal` fallback serializer) it is
+# `{"_rails":{"data":<value>,"exp":..,"pur":..}}` in that serializer. With the
+# cookie jars' `NullSerializer` (and in Rails 7.0) it's the legacy
+# "dual-serialized" one,
+# `{"_rails":{"message":"<base64 of the dumped value>","exp":..,"pur":..}}`,
+# which always carries `exp` and `pur`, as `null` when unset.
+module rils/rails_compat/metadata
+
+import std/json::{Any}
+import std/time::{Time}
+import rils/rails_compat/json::{Value, generate, encode, encode_string, generate_string, parse}
+import rils/rails_compat/encoding::{strict_encode, strict_decode, urlsafe_decode}
+import rils/rails_compat/clock::{iso8601_millis, parse_timestamp}
+import rils/rails_compat/marshal::{marshal_string, MARSHAL_SIGNATURE}
+
+# Why a message couldn't be read.
+pub enum Failure
+  # Malformed message or bad signature (Ruby's `:invalid_message_format`).
+  InvalidSignature
+  # Authentic, but the payload doesn't deserialize
+  # (`:invalid_message_serialization`).
+  InvalidMessage
+  Expired
+  # Wrong purpose, or a purpose was expected and the message carries no
+  # metadata.
+  PurposeMismatch
+
+  # `ActiveSupport::Messages::Rotator` only falls back to the next rotation
+  # on format and serialization errors. An expired or mismatched message
+  # stops at the first verifier.
+  def rotates? : Bool
+    invalid_signature? || invalid_message?
+  end
+end
+
+pub enum Serializer
+  # `ActiveSupport::MessageEncryptor::NullSerializer`: the value is a string
+  # of already serialized bytes (what the cookie jars sign and encrypt).
+  # Uses the legacy envelope.
+  Null
+  # The `::JSON` module (`JSON.dump`/`JSON.load`), as signed ids and Turbo
+  # stream names use.
+  Json
+  # `SerializerWithFallback[:json]` with `ActiveSupport::JSON`.
+  JsonFallback
+  # `SerializerWithFallback[:json_allow_marshal]`: the app's default
+  # `message_serializer` under `load_defaults` 7.1+.
+  JsonMarshalFallback
+
+  def dump(value : Value) : String
+    case self
+    when Serializer::Null
+      text = value.as_s?
+      raise "the null serializer only signs strings" unless text
+      text
+    when Serializer::Json then generate(value)
+    else                       encode(value)
+    end
+  end
+
+  def load(bytes : String) : Value | Failure
+    case self
+    when Serializer::Null then Any.new(bytes)
+    when Serializer::Json
+      # JSON.load("") is nil.
+      return Any.new(nil) if bytes.empty?
+      parse(bytes) || Failure::InvalidMessage
+    else
+      if bytes.starts_with?(MARSHAL_SIGNATURE)
+        return Failure::InvalidMessage unless json_marshal_fallback?
+        text = marshal_string(bytes)
+        text ? Any.new(text) : Failure::InvalidMessage
+      else
+        parse(bytes) || Failure::InvalidMessage
+      end
+    end
+  end
+
+  def encode_json(value : Value) : String
+    json? ? generate(value) : encode(value)
+  end
+
+  def encode_json_string(text : String) : String
+    json? ? generate_string(text) : encode_string(text)
+  end
+
+  def envelope? : Bool
+    !null?
+  end
+end
+
+pub def serialize_with_metadata(serializer : Serializer, value : Value, purpose : String?, expires_at : Time?) : String
+  serialize_dumped_with_metadata(serializer, serializer.dump(value), purpose, expires_at)
+end
+
+# Like `serialize_with_metadata` for a value the caller already dumped with
+# *serializer* (so the caller controls key order and escaping).
+pub def serialize_dumped_with_metadata(serializer : Serializer, dumped : String, purpose : String?, expires_at : Time?) : String
+  return dumped if purpose.nil? && expires_at.nil?
+  if serializer.envelope?
+    String.build do |io|
+      io << %({"_rails":{"data":) << dumped
+      io << %(,"exp":) << serializer.encode_json_string(iso8601_millis(expires_at)) if expires_at
+      io << %(,"pur":) << serializer.encode_json_string(purpose) if purpose
+      io << "}}"
+    end
+  else
+    expiry = expires_at ? encode_string(iso8601_millis(expires_at)) : "null"
+    pur = purpose ? encode_string(purpose) : "null"
+    %({"_rails":{"message":#{encode_string(strict_encode(dumped))},"exp":#{expiry},"pur":#{pur}}})
+  end
+end
+
+pub LEGACY_PREFIX = %({"_rails":{"message":)
+
+# `deserialize_with_metadata`. *legacy_decoder* decodes the base64 inside a
+# legacy envelope: the verifier accepts either alphabet, the encryptor only
+# strict Base64.
+pub def deserialize_with_metadata(serializer : Serializer, bytes : String, purpose : String?, now : Time, urlsafe_legacy : Bool) : Value | Failure
+  if bytes.starts_with?(LEGACY_PREFIX)
+    envelope = parse(bytes)
+    return Failure::InvalidSignature unless envelope
+    rails = extract(envelope, purpose, now)
+    return rails if rails.is_a?(Failure)
+    field = rails["message"]?
+    message = field ? field.as_s? : nil
+    return Failure::InvalidSignature unless message
+    dumped = urlsafe_legacy ? urlsafe_decode(message) : strict_decode(message)
+    return Failure::InvalidSignature unless dumped
+    serializer.load(dumped)
+  else
+    value = serializer.load(bytes)
+    return value if value.is_a?(Failure)
+    if (object = value.as_h?) && object.has_key?("_rails")
+      rails = extract(value, purpose, now)
+      return rails if rails.is_a?(Failure)
+      rails["data"]? || Any.new(nil)
+    elsif purpose.nil?
+      value
+    else
+      Failure::PurposeMismatch
+    end
+  end
+end
+
+# `extract_from_metadata_envelope`: `exp` is expired when `now >= exp`;
+# purposes compare with `to_s`, so a missing `pur` matches no purpose.
+def extract(envelope : Value, purpose : String?, now : Time) : Hash(String, Any) | Failure
+  object = envelope.as_h?
+  field = object ? object["_rails"]? : nil
+  rails = field ? field.as_h? : nil
+  return Failure::InvalidMessage unless rails
+  exp = rails["exp"]?
+  if exp && !exp.raw.nil?
+    text = exp.as_s?
+    return Failure::InvalidMessage unless text
+    expires = parse_timestamp(text)
+    return Failure::InvalidMessage unless expires
+    return Failure::Expired if now >= expires
+  end
+  return Failure::PurposeMismatch unless ruby_to_s(rails["pur"]?) == (purpose || "")
+  rails
+end
+
+# `Object#to_s` for the JSON values a purpose could hold.
+pub def ruby_to_s(value : Value?) : String
+  return "" unless value
+  raw = value.raw
+  case raw
+  when Nil     then ""
+  when String  then raw
+  when Int64   then raw.to_s
+  when Float64 then generate(value)
+  when Bool    then raw ? "true" : "false"
+  else
+    # Arrays and hashes to_s as their #inspect, which no purpose we compare
+    # against looks like.
+    "\0#{generate(value)}"
+  end
+end

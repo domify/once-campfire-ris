@@ -1,0 +1,132 @@
+# The `users` partials for the goldens they were rendered for, byte for byte
+# (vectors/views).
+module test/views/users_test
+
+import views/users::{ProfileShow, ProfileMembership, Show, ShownUser, SidebarUser, SidebarDirect, SidebarRoom, SidebarShared, SidebarShow, New, Mention, MentionUser, BanButton, BanUser, AutocompletableTemplate, AvatarSvg}
+import views/messages/json::{UserJson}
+import views/sessions::{HelpContact}
+import std/json::{Any}
+import test/views/golden::{golden_case, golden_context, golden_page, golden_file}
+import test/views/testing::{assert_same}
+import web/web/spec::*
+
+describe "users partials" do
+  it "render the mention as the reference does" do
+    name = "mention"
+    u = golden_case(name)["user"]
+    user = MentionUser.new(u["id"].as_i64, u["name"].as_s, u["bio"].as_s?, u["attachable_sgid"].as_s, u["avatar_path"].as_s)
+    html = Mention.new(golden_context(name), user).render
+    assert_same(name, golden_page(name), html.to_s)
+  end
+
+  it "render the ban button as the reference does" do
+    name = "ban_button_banned"
+    u = golden_case(name)["user"]
+    user = BanUser.new(u["id"].as_i64, u["name"].as_s, u["status"].as_s)
+    html = BanButton.new(golden_context(name), user).render
+    assert_same(name, golden_page(name), html.to_s)
+  end
+
+  it "render the autocompletable template as the reference does" do
+    name = "autocompletables_template"
+    html = AutocompletableTemplate.new(golden_context(name)).render
+    assert_same(name, golden_page(name), html.to_s)
+  end
+end
+
+describe "users/new" do
+  it "renders the sign-up page in the layout as the reference does" do
+    name = "users_new"
+    c = golden_case(name)
+    contact = c["help_contact"]
+    page = New.new(golden_context(name), c["account"]["join_code"].as_s, HelpContact.new(contact["name"].as_s, contact["email_address"].as_s)).page
+    assert_same(name, golden_page(name), page.to_s)
+  end
+end
+
+def sidebar_user(json : Any) : SidebarUser
+  SidebarUser.new(json["id"].as_i64, json["name"].as_s, json["avatar_path"].as_s)
+end
+
+def sidebar_room(json : Any) : SidebarRoom
+  SidebarRoom.new(json["room_id"].as_i64, json["param_key"].as_s, json["name"].as_s, json["unread"].as_bool)
+end
+
+def sidebar(name : String) : SidebarShow
+  s = golden_case(name)["sidebar"]
+  directs = s["direct"].as_a.map do |d|
+    SidebarDirect.new(d["room_id"].as_i64, d["unread"].as_bool, d["updated_at_epoch"].as_s, d["members"].as_a.map { |m| sidebar_user(m) })
+  end
+  SidebarShow.new(golden_context(name), sidebar_user(s["me"]), s["rooms_stream"].as_s, s["user_rooms_stream"].as_s, directs,
+    s["placeholders"].as_a.map { |u| sidebar_user(u) }, s["shared"].as_a.map { |r| sidebar_room(r) }, s["can_create_rooms"].as_bool)
+end
+
+describe "users/sidebars" do
+  it "renders each user's sidebar as the reference does" do
+    ["sidebar_david", "sidebar_kevin"].each do |name|
+      assert_same(name, golden_page(name), sidebar(name).page.to_s)
+    end
+  end
+
+  it "renders in the frame layout the sidebar frame loads it into" do
+    name = "sidebar_frame"
+    assert_same(name, golden_page(name), sidebar(name).page(frame: true).to_s)
+  end
+
+  it "renders a shared room, read and unread, as the reference does" do
+    ["shared_room", "shared_room_unread"].each do |name|
+      html = SidebarShared.new(golden_context(name), sidebar_room(golden_case(name)["room"])).render
+      assert_same(name, golden_page(name), html.to_s)
+    end
+  end
+end
+
+describe "users/show" do
+  it "renders each kind of profile, to whoever looks, as the reference does" do
+    ["users_show_self", "users_show_member_as_admin", "users_show_member_as_member", "users_show_bot", "users_show_deactivated", "users_show_banned"].each do |name|
+      u = golden_case(name)["user"]
+      user = ShownUser.new(u["id"].as_i64, u["name"].as_s, u["bio"].as_s?, u["email_address"].as_s?, u["role"].as_s, u["status"].as_s, u["avatar_path"].as_s, u["transfer_id"].as_s)
+      assert_same(name, golden_page(name), Show.new(golden_context(name), user).page.to_s)
+    end
+  end
+end
+
+def shown_user(u : Any) : ShownUser
+  ShownUser.new(u["id"].as_i64, u["name"].as_s, u["bio"].as_s?, u["email_address"].as_s?, u["role"].as_s, u["status"].as_s, u["avatar_path"].as_s, u["transfer_id"].as_s)
+end
+
+def profile_memberships(list : Any) : Array(ProfileMembership)
+  list.as_a.map { |m| ProfileMembership.new(m["room_id"].as_i64, m["param_key"].as_s, m["display_name"].as_s, m["involvement"].as_s, m["direct"].as_bool) }
+end
+
+describe "users/profiles/show" do
+  it "renders the profile on every platform, for another user and with an avatar, as the reference does" do
+    ["chrome_mac", "chrome_windows", "safari_mac", "safari_ios", "chrome_android", "firefox_mac", "firefox_android", "edge_windows", "kevin", "with_avatar"].each do |ua|
+      name = "profile_#{ua}"
+      c = golden_case(name)
+      user = c["user"]
+      page = ProfileShow.new(golden_context(name), shown_user(user), user["avatar_attached"].as_bool,
+        profile_memberships(c["profile"]["shared"]), profile_memberships(c["profile"]["direct"])).page
+      assert_same(name, golden_page(name), page.to_s)
+    end
+  end
+end
+
+describe "users/avatars/show" do
+  it "renders the initials avatar as the reference does" do
+    [{"avatar_david", "David"}, {"avatar_three_initials", "Anna Bea Cole"}].each do |name, shown|
+      user = golden_case(name)["users"][shown]
+      svg = AvatarSvg.new(user["id"].as_i64, user["initials"].as_s).render
+      assert_same(name, golden_file(name, "svg"), svg.to_s)
+    end
+  end
+end
+
+describe "users/_user.json" do
+  it "renders a user as the reference does" do
+    name = "user_json"
+    jz = golden_case(name)["users"]["JZ"]
+    json = UserJson.new(jz["id"].as_i64, "JZ", jz["role"].as_s, golden_context(name).url(jz["avatar_path"].as_s)).to_json
+    assert_same(name, golden_file(name, "json"), json)
+  end
+end

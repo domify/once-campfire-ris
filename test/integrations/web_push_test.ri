@@ -1,0 +1,76 @@
+# Web Push: RFC 8291's test vector, the gem's framing, what the gem
+# rejects, and the VAPID header.
+module test/integrations/web_push_test
+
+import std/text
+import rils/rails_compat/encoding::{urlsafe_decode, urlsafe_encode_unpadded}
+import rils/rails_compat/ec::{generate_key, public_key}
+import integrations/web_push::{encrypt_with, encrypt, PushError, encoded_message}
+import integrations/vapid::{Vapid}
+import web/web/spec::*
+
+def b64(text : String) : String
+  urlsafe_decode(text) || raise "bad base64 #{text}"
+end
+
+# RFC 8291, section 5.
+PLAINTEXT  = "V2hlbiBJIGdyb3cgdXAsIEkgd2FudCB0byBiZSBhIHdhdGVybWVsb24"
+AS_PRIVATE = "yfWPiYE-n46HLnH0KqZOF1fJJU3MYrct3AELtAQ-oRw"
+UA_PUBLIC  = "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4"
+SALT       = "DGv6ra1nlYgDCS1FRnbzlw"
+AUTH       = "BTBZMqHH6r4Tts7J_aSIgg"
+MESSAGE    = "DGv6ra1nlYgDCS1FRnbzlwAAEABBBP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A_yl95bQpu6cVPTpK4Mqgkf1CXztLVBSt2Ks3oZwbuwXPXLWyouBWLVWGNWQexSgSxsj_Qulcy4a-fN"
+
+describe "Web Push encryption" do
+  it "matches the RFC 8291 test vector" do
+    body = encrypt_with(b64(PLAINTEXT), UA_PUBLIC, AUTH, b64(AS_PRIVATE), b64(SALT), 4096, "\x02")
+    raise body.message if body.is_a?(PushError)
+    assert urlsafe_encode_unpadded(body) == MESSAGE
+  end
+
+  it "frames a record as the gem does" do
+    _, receiver = generate_key
+    body = encrypt(%({"title":"hi"}), urlsafe_encode_unpadded(receiver), urlsafe_encode_unpadded("0123456789abcdef"))
+    raise body.message if body.is_a?(PushError)
+    # salt, record size, key id length, the 65-byte key, then the
+    # ciphertext: the message, its padding and the tag.
+    assert body.bytesize == 16 + 4 + 1 + 65 + 14 + 2 + 16
+  end
+
+  it "rejects what the gem rejects" do
+    _, receiver = generate_key
+    ok = urlsafe_encode_unpadded(receiver)
+    kind = ->(result : String | PushError) { result.is_a?(PushError) ? result.kind : "" }
+    assert kind.call(encrypt("m", nil, "YXV0aA")) == "ArgumentError"
+    assert kind.call(encrypt("m", ok, "")) == "ArgumentError"
+    assert kind.call(encrypt("m", "not base64!", "YXV0aA")) == "ArgumentError"
+    assert kind.call(encrypt("m", "dGVzdF9rZXk", "YXV0aA")) == "OpenSSL::PKey::EC::Point::Error"
+    assert kind.call(encrypt("x" * 4100, ok, "YXV0aA")) == "ArgumentError"
+  end
+
+  it "lays out the notification" do
+    assert encoded_message("HQ", "Jason: hi", "/rooms/1", 3) == %({"title":"HQ","options":{"body":"Jason: hi","icon":"/account/logo","data":{"path":"/rooms/1","badge":3}}})
+  end
+end
+
+describe "VAPID" do
+  it "signs a JWT for the audience with the configured key" do
+    secret, point = generate_key
+    vapid = Vapid.from(urlsafe_encode_unpadded(point), urlsafe_encode_unpadded(secret)) || raise "no vapid"
+    header = vapid.authorization("https://fcm.googleapis.com", 1_700_000_000_i64)
+    assert header.starts_with?("vapid t=eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzI1NiJ9.")
+    token = header.partition("t=")[2].partition(",k=")[0]
+    claims = b64(token.split('.')[1])
+    assert claims == %({"aud":"https://fcm.googleapis.com","exp":1700043200,"sub":"mailto:support@37signals.com"})
+    assert b64(token.split('.')[2]).bytesize == 64
+    assert header.ends_with?(",k=#{urlsafe_encode_unpadded(point)}")
+  end
+
+  it "turns Web Push off for missing, invalid or mismatched keys" do
+    secret, point = generate_key
+    other, _ = generate_key
+    assert Vapid.from(nil, nil).nil?
+    assert Vapid.from("bad", urlsafe_encode_unpadded(secret)).nil?
+    assert Vapid.from(urlsafe_encode_unpadded(point), urlsafe_encode_unpadded(other)).nil?
+  end
+end

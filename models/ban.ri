@@ -1,0 +1,58 @@
+# `reference/app/models/ban.rb`
+module models/ban
+
+import std/text
+import rils/record/sqlite::{Connection, Row, SqlValue}
+import rils/record/timestamp::{Timestamp}
+import rils/record/database::{Tx}
+import rils/record/errors::{Errors, RecordInvalid}
+import rils/ruby/ipaddr::{parse_ipaddr}
+
+BAN_COLUMNS = %("bans"."id", "bans"."user_id", "bans"."ip_address", "bans"."created_at", "bans"."updated_at")
+
+pub class Ban
+  getter id : Int64
+  getter user_id : Int64
+  getter ip_address : String
+  getter created_at : Timestamp
+  getter updated_at : Timestamp
+
+  def initialize(@id : Int64, @user_id : Int64, @ip_address : String, @created_at : Timestamp, @updated_at : Timestamp)
+  end
+
+  def self.from_row(row : Row) : Ban
+    Ban.new(row.int(0), row.int(1), row.text(2), row.time(3), row.time(4))
+  end
+
+  # `Ban.banned?(ip_address)`
+  pub def self.banned?(conn : Connection, ip_address : String) : Bool
+    conn.exists?(%(SELECT 1 AS one FROM "bans" WHERE "bans"."ip_address" = ? LIMIT 1), [ip_address] of SqlValue)
+  end
+
+  pub def self.for_user(conn : Connection, user_id : Int64) : Array(Ban)
+    conn.query_all(%(SELECT #{BAN_COLUMNS} FROM "bans" WHERE "bans"."user_id" = ?), [user_id] of SqlValue) { |row| Ban.from_row(row) }
+  end
+
+  # `bans.create!(ip_address:)`, validating the address is public.
+  pub def self.create(tx : Tx, user_id : Int64, ip_address : String) : Ban | RecordInvalid
+    errors = validate(ip_address)
+    return RecordInvalid.new(errors) unless errors.empty?
+    now = tx.now
+    id = tx.conn.query_one(%(INSERT INTO "bans" ("created_at", "ip_address", "updated_at", "user_id") VALUES (?, ?, ?, ?) RETURNING "id"), [now, ip_address, now, user_id] of SqlValue) { |row| row.int(0) }
+    raise "insert into bans returned no id" unless id
+    Ban.new(id, user_id, ip_address, now, now)
+  end
+
+  # `ip_address_is_public`
+  pub def self.validate(ip_address : String) : Errors
+    errors = Errors.new
+    ip = parse_ipaddr(ip_address)
+    if ip.nil?
+      errors.add("ip_address", "is not a valid IP address")
+    elsif ip.loopback? || ip.private? || ip.link_local?
+      errors.add("ip_address", "cannot be a private or internal IP address")
+    end
+    errors
+  end
+end
+

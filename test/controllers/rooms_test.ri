@@ -1,0 +1,104 @@
+# `test/controllers/rooms_controller_test.rb`'s `index` and `show`, through
+# the drawn routes.
+module test/controllers/rooms_test
+
+import std/text
+import std/file::{File}
+import rils/record/sqlite::{SqlValue}
+import models/message::{Message, NewMessage}
+import rils/storage/filename::{Filename}
+import models/room::{Room}
+import models/user::{User}
+import test/testing::*
+import web/web/spec::*
+
+def david(client : Client) : User
+  client.t.read { |conn| User.find_by_email_address(conn, "david@37signals.com") } || raise "no david"
+end
+
+# A room of David's with text messages only: the attachment and sound
+# presentations aren't ported yet.
+def text_room(client : Client) : Room
+  client.t.read do |conn|
+    Room.for_user(conn, david(client).id).find do |room|
+      types = conn.query_all(%(SELECT COUNT(*) FROM "messages" LEFT JOIN "action_text_rich_texts" ON "action_text_rich_texts"."record_type" = 'Message' AND "action_text_rich_texts"."record_id" = "messages"."id" WHERE "messages"."room_id" = ? AND ("action_text_rich_texts"."id" IS NULL OR "action_text_rich_texts"."body" LIKE '%action-text-attachment%')), [room.id] of SqlValue) { |row| row.int(0) }
+      types[0] == 0 && !Message.last_page(conn, room.id).empty?
+    end
+  end || raise "no text room"
+end
+
+describe "rooms#show" do
+  it "shows the room, and remembers it as the last one visited" do
+    client = Client.new
+    room = text_room(client)
+    response = client.get("/rooms/#{room.id}", cookie: client.cookie("david@37signals.com"))
+    assert response.status == 200
+    html = body(response)
+    assert html.includes?("<meta name=\"current-room-id\" content=\"#{room.id}\">")
+    assert html.includes?("<body class=\"sidebar admin\"")
+    assert html.includes?("id=\"messages_rooms_")
+    assert html.includes?("<form id=\"composer\"")
+    count = client.t.read { |conn| Message.last_page(conn, room.id).size }
+    assert html.split("data-controller=\"reply\"").size - 1 == count
+    assert set_cookies(response).any?(&.starts_with?("last_room=#{room.id};"))
+    assert !response["link"].nil?
+  end
+
+  it "shows the page around a message" do
+    client = Client.new
+    room = text_room(client)
+    message = client.t.read { |conn| Message.last_page(conn, room.id).first }
+    response = client.get("/rooms/#{room.id}/@#{message.id}", cookie: client.cookie("david@37signals.com"))
+    assert response.status == 200
+    assert body(response).includes?("data-message-id=\"#{message.id}\"")
+  end
+
+  it "sends a room the user isn't in back to the root" do
+    client = Client.new
+    response = client.get("/rooms/1", cookie: client.cookie("david@37signals.com"))
+    assert response.status == 302
+    assert response["location"] == "http://once.campfire.test/"
+  end
+
+  it "sends a signed-out visitor to sign in" do
+    response = Client.new.get("/rooms/1")
+    assert response["location"] == "http://once.campfire.test/session/new"
+  end
+end
+
+describe "rooms#show with attachments and sounds" do
+  it "presents an image, a file and a sound" do
+    client = Client.new
+    room = text_room(client)
+    user_id = david(client).id
+    storage = client.app.storage
+    icon = File.read("#{__DIR__}/../../reference/app/assets/images/campfire-icon.png")
+    image = storage.stage_bytes(icon, Filename.new("icon.png"), "image/png")
+    file = storage.stage_bytes("notes", Filename.new("notes & more.txt"), "text/plain")
+    client.t.write do |tx|
+      [image, file].each do |staged|
+        blob = staged.insert(tx.conn, tx.now)
+        storage.analyze(tx.conn, blob)
+        Message.create(tx, NewMessage.new(room.id, user_id, attachment_blob_id: blob.id))
+      end
+      Message.create(tx, NewMessage.new(room.id, user_id, body: "<p>/play bell</p>"))
+    end
+    image.keep
+    file.keep
+    html = body(client.get("/rooms/#{room.id}", cookie: client.cookie("david@37signals.com")))
+    assert html.includes?(%(<div class="max-inline-size center flex overflow-clip" style="width: 142px; aspect-ratio: 0.9102564102564102;"><a class="flex" data-lightbox-target="image"))
+    assert html.includes?(%(<img width="284" height="312" class="message__attachment" loading="lazy" src="/rails/active_storage/representations/redirect/))
+    assert html.includes?(%(<span>notes &amp; more.txt</span>))
+    assert html.includes?(%(title="Download" aria-label="Download" href="/rails/active_storage/blobs/redirect/))
+    assert html.includes?(%(<div class="sound" data-controller="sound" data-action="messages:play-&gt;sound#play" data-sound-url-value="/assets/bell-4dd04376.mp3"><button class="btn btn--plain" data-action="sound#play">🔊</button>🔔</div>))
+  end
+end
+
+describe "rooms#index" do
+  it "goes to the user's last room" do
+    client = Client.new
+    last = client.t.read { |conn| Room.last_for_user(conn, david(client).id) } || raise "no room"
+    response = client.get("/rooms", cookie: client.cookie("david@37signals.com"))
+    assert response["location"] == "http://once.campfire.test/rooms/#{last.id}"
+  end
+end

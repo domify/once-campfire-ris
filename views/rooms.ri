@@ -1,0 +1,121 @@
+# Views for `reference/app/views/rooms`, with `RoomsHelper` and the
+# `MessagesHelper` tags the room screen uses.
+module views/rooms
+
+import std/text
+import std/time::{Time}
+import rils/routes/paths::{user_sidebar_path, room_messages_path, room_refresh_path, edit_rooms_open_path, edit_rooms_closed_path, edit_rooms_direct_path, searches_path, autocompletable_users_path, user_push_subscriptions_path, room_involvement_path, join_path, account_join_code_path}
+import rils/template/html::{Html}
+import rils/template/recorded::{Fragment, RecordedPage}
+import rils/template/template::{Template, Buffer}
+import views/context::{ViewContext}
+import views/layouts::{render_in_layout}
+import views/helpers/tag::*
+import views/helpers/assets::{image_tag}
+import views/helpers/forms::{button_to}
+import views/helpers/rooms::{InvolvementRoom, button_to_change_involvement, mention_prompt_src}
+import views/helpers/users::{account_logo_tag, sidebar_turbo_frame_tag}
+import views/helpers/translations::{translation_button}
+import views/helpers/application::{capitalize, to_sentence, link_to_zoom_qr_code, button_to_copy_to_clipboard, web_share_session_button}
+import views/messages/messages::{UserView}
+import views/messages/support::{epoch_ms}
+
+# `room_display_name(room, for_user:)`: a direct room is named after its
+# other members (`room.users.without(for_user).pluck(:name).to_sentence`),
+# or the user's own name when alone in it.
+pub def room_display_name(name : String?, direct : Bool, other_member_names : Array(String), for_user_name : String?) : String
+  return name || "" unless direct
+  sentence = to_sentence(other_member_names, " and ")
+  sentence.strip.empty? ? for_user_name || "" : sentence
+end
+
+# A room as the room views show it; *kind* is "open", "closed" or "direct".
+pub class RoomView
+  getter id : Int64
+  getter kind : String
+  getter name : String?
+  # `room_display_name(room)` for `Current.user`.
+  getter display_name : String
+
+  def initialize(@id : Int64, @kind : String, @name : String?, @display_name : String)
+  end
+
+  def direct? : Bool
+    @kind == "direct"
+  end
+
+  # `dom_id(room, prefix)`: by the room's STI class, `rooms_open_1`.
+  def dom_id(prefix : String) : String
+    prefix.empty? ? "rooms_#{@kind}_#{@id}" : "#{prefix}_rooms_#{@kind}_#{@id}"
+  end
+
+  # `edit_polymorphic_path(room)`.
+  def edit_path : String
+    case @kind
+    when "open"   then edit_rooms_open_path(@id)
+    when "closed" then edit_rooms_closed_path(@id)
+    else               edit_rooms_direct_path(@id)
+    end
+  end
+
+  # "Ping" for a direct room, "room" otherwise.
+  def noun : String
+    direct? ? "Ping" : "room"
+  end
+end
+
+# What `rooms/show` shows.
+pub class ShowView
+  getter room : RoomView
+  # `room.updated_at`, the refresh controller's `loaded_at`.
+  getter updated_at : Time
+  # `Current.user`, for the client-side message template.
+  getter user : UserView
+  # The page's messages, each rendered (and cached) on its own.
+  getter messages : Array(Fragment)
+  # `@room == Room.original && !@room.messages.paged?` (`rooms/show/_invitation`).
+  getter invitation : Bool
+  # `Current.account.join_code`, for the invitation's join link.
+  getter join_code : String
+  # `Turbo::StreamsChannel.signed_stream_name([room, :messages])`.
+  getter messages_stream_name : String
+
+  def initialize(@room : RoomView, @updated_at : Time, @user : UserView, @messages : Array(Fragment), @invitation : Bool, @join_code : String, @messages_stream_name : String)
+  end
+end
+
+# `rooms/show.html.erb`.
+pub class Show
+  getter ctx : ViewContext
+  getter show : ShowView
+
+  def initialize(@ctx : ViewContext, @show : ShowView)
+  end
+
+  def loaded_at : Int64
+    epoch_ms(@show.updated_at)
+  end
+
+  Template.def_page("rooms/show.html.erb")
+
+  pub def page(frame : Bool = false) : RecordedPage
+    render_in_layout(@ctx, @show.room.display_name, "sidebar", frame) { |buffer| render_into(buffer) }
+  end
+end
+
+# `rooms/involvements/show.html.erb`: the bell for *room* at *involvement*,
+# in the frame the room's header loads it into.
+pub class InvolvementsShow
+  getter ctx : ViewContext
+  getter room : RoomView
+  getter involvement : String
+
+  def initialize(@ctx : ViewContext, @room : RoomView, @involvement : String)
+  end
+
+  Template.def_page("rooms/involvements/show.html.erb")
+
+  pub def page(frame : Bool = false) : RecordedPage
+    render_in_layout(@ctx, nil, nil, frame) { |buffer| render_into(buffer) }
+  end
+end

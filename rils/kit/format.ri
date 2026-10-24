@@ -1,0 +1,417 @@
+# MIME types and format negotiation: `Mime::Type`, `Mime::Type.parse` (the
+# `Accept` header), `ActionDispatch::Http::MimeNegotiation#formats` and
+# `respond_to`'s `negotiate_mime`.
+module rils/kit/format
+
+import std/traits
+import std/text
+import std/float
+import std/indexable
+import rils/ruby/floats::{to_f}
+
+# A registered MIME type (`Mime[:html]` and friends).
+pub class Mime
+  getter symbol : String
+  getter string : String
+  getter synonyms : Array(String)
+  getter extensions : Array(String)
+
+  def initialize(@symbol : String, @string : String, @synonyms : Array(String) = [] of String, @extensions : Array(String) = [] of String)
+  end
+
+  pub def is?(symbol : String) : Bool
+    @symbol == symbol
+  end
+
+  pub def ==(other : Mime) : Bool
+    @symbol == other.symbol
+  end
+
+  # `Mime::Type#match?`: *pattern* appears in the type or one of its
+  # synonyms.
+  def matches?(pattern : String) : Bool
+    @string.includes?(pattern) || @synonyms.any?(&.includes?(pattern))
+  end
+
+  pub def to_s : String
+    @string
+  end
+end
+
+pub alias Format = Mime
+
+# `action_dispatch/http/mime_types.rb`, then turbo-rails' `:turbo_stream`,
+# in registration order (the order matters for `text/*` expansion).
+pub HTML             = Mime.new("html", "text/html", ["application/xhtml+xml"], ["xhtml"])
+pub TEXT             = Mime.new("text", "text/plain", [] of String, ["txt"])
+pub JS               = Mime.new("js", "text/javascript", ["application/javascript", "application/x-javascript"])
+pub CSS              = Mime.new("css", "text/css")
+pub ICS              = Mime.new("ics", "text/calendar")
+pub CSV              = Mime.new("csv", "text/csv")
+pub VCF              = Mime.new("vcf", "text/vcard")
+pub VTT              = Mime.new("vtt", "text/vtt", [] of String, ["vtt"])
+pub MD               = Mime.new("md", "text/markdown", [] of String, ["md", "markdown"])
+pub PNG              = Mime.new("png", "image/png", [] of String, ["png"])
+pub JPEG             = Mime.new("jpeg", "image/jpeg", [] of String, ["jpg", "jpeg", "jpe", "pjpeg"])
+pub GIF              = Mime.new("gif", "image/gif", [] of String, ["gif"])
+pub BMP              = Mime.new("bmp", "image/bmp", [] of String, ["bmp"])
+pub TIFF             = Mime.new("tiff", "image/tiff", [] of String, ["tif", "tiff"])
+pub SVG              = Mime.new("svg", "image/svg+xml")
+pub WEBP             = Mime.new("webp", "image/webp", [] of String, ["webp"])
+pub MPEG             = Mime.new("mpeg", "video/mpeg", [] of String, ["mpg", "mpeg", "mpe"])
+pub MP3              = Mime.new("mp3", "audio/mpeg", [] of String, ["mp1", "mp2", "mp3"])
+pub OGG              = Mime.new("ogg", "audio/ogg", [] of String, ["oga", "ogg", "spx", "opus"])
+pub M4A              = Mime.new("m4a", "audio/aac", ["audio/mp4"], ["m4a", "mpg4", "aac"])
+pub WEBM             = Mime.new("webm", "video/webm", [] of String, ["webm"])
+pub MP4              = Mime.new("mp4", "video/mp4", [] of String, ["mp4", "m4v"])
+pub OTF              = Mime.new("otf", "font/otf", [] of String, ["otf"])
+pub TTF              = Mime.new("ttf", "font/ttf", [] of String, ["ttf"])
+pub WOFF             = Mime.new("woff", "font/woff", [] of String, ["woff"])
+pub WOFF2            = Mime.new("woff2", "font/woff2", [] of String, ["woff2"])
+pub XML              = Mime.new("xml", "application/xml", ["text/xml", "application/x-xml"])
+pub RSS              = Mime.new("rss", "application/rss+xml")
+pub ATOM             = Mime.new("atom", "application/atom+xml")
+pub YAML_MIME        = Mime.new("yaml", "application/x-yaml", ["text/yaml"], ["yml", "yaml"])
+pub MULTIPART_FORM   = Mime.new("multipart_form", "multipart/form-data")
+pub URL_ENCODED_FORM = Mime.new("url_encoded_form", "application/x-www-form-urlencoded")
+pub JSON_MIME        = Mime.new("json", "application/json", ["text/x-json", "application/jsonrequest", "application/problem+json"])
+pub PDF              = Mime.new("pdf", "application/pdf", [] of String, ["pdf"])
+pub ZIP              = Mime.new("zip", "application/zip", [] of String, ["zip"])
+pub GZIP             = Mime.new("gzip", "application/gzip", ["application/x-gzip"], ["gz"])
+pub TURBO_STREAM     = Mime.new("turbo_stream", "text/vnd.turbo-stream.html")
+# `Mime::ALL`: the `*/*` wildcard, only meaningful in negotiation.
+pub ALL = Mime.new("*/*", "*/*")
+
+pub REGISTERED = [
+  HTML, TEXT, JS, CSS, ICS, CSV, VCF, VTT, MD, PNG, JPEG, GIF, BMP, TIFF, SVG, WEBP, MPEG, MP3, OGG, M4A, WEBM,
+  MP4, OTF, TTF, WOFF, WOFF2, XML, RSS, ATOM, YAML_MIME, MULTIPART_FORM, URL_ENCODED_FORM, JSON_MIME, PDF, ZIP, GZIP, TURBO_STREAM,
+]
+
+# `Mime[ext]` / `Mime::Type.lookup_by_extension`.
+pub def lookup_by_extension(extension : String) : Format?
+  REGISTERED.find { |mime| mime.symbol == extension || mime.extensions.includes?(extension) }
+end
+
+# `ActionDispatch::Http::MimeNegotiation::InvalidType`.
+pub struct InvalidMimeType
+  getter text : String
+
+  def initialize(@text : String)
+  end
+end
+
+impl Error for InvalidMimeType
+  def message : String
+    "#{@text.inspect} is not a valid MIME type"
+  end
+end
+
+# `Mime::Type.lookup`: exact type string or synonym, else the part before
+# `;`. nil is a valid but unregistered type.
+pub def lookup(string : String) : Format | InvalidMimeType | Nil
+  if mime = lookup_exact(string)
+    return mime
+  end
+  base = string.partition(';')[0].rstrip
+  if mime = lookup_exact(base)
+    return mime
+  end
+  return ALL if base == "*/*"
+  valid_mime_type?(string) ? nil : InvalidMimeType.new(string)
+end
+
+def lookup_exact(string : String) : Format?
+  REGISTERED.find { |mime| mime.string == string || mime.synonyms.includes?(string) }
+end
+
+# `Mime::Type::MIME_REGEXP`, loosely: `type/subtype` with name characters,
+# optional params.
+def valid_mime_type?(string : String) : Bool
+  base = string.partition(';')[0].rstrip
+  return true if base == "*/*"
+  kind, slash, sub = base.partition('/')
+  return false if slash.empty?
+  mime_name?(kind) && (sub == "*" || mime_name?(sub))
+end
+
+def mime_name?(text : String) : Bool
+  return false if text.empty? || text.bytesize > 127
+  return false unless text[0].ascii_alphanumeric?
+  text.chars.all? { |c| c.ascii_alphanumeric? || "!#$&-^_.+".includes?(c.to_s) }
+end
+
+# One `Accept` entry: its position, name and `(q.to_f * 100).to_i`, kept in
+# a float so that q-values past Int64 still order as Ruby's Integers do.
+class AcceptItem
+  property index : Int32
+  property name : String
+  property q : Float64
+
+  def initialize(@index : Int32, @name : String, @q : Float64)
+  end
+end
+
+# `Mime::Type.parse(accept_header)`, keeping only registered types and `*/*`
+# (the `formats.select!` that follows in `MimeNegotiation#formats`).
+pub def parse_accept(header : String) : Array(Format) | InvalidMimeType
+  formats = [] of Format
+  unless header.includes?(",")
+    separator = find_q_separator(header)
+    header = header[0, separator[0]].strip if separator
+    return formats if header.strip.empty?
+    if expanded = trailing_star_formats(header)
+      return expanded
+    end
+    found = lookup(header)
+    return found if found.is_a?(InvalidMimeType)
+    formats << found if found
+    return formats
+  end
+
+  list = [] of AcceptItem
+  index = 0
+  scan_accept_items(header).each do |item|
+    # `params, q = header.split(PARAMETER_SEPARATOR_REGEXP)`
+    fields = ruby_split_q(item)
+    next if fields.empty?
+    params = fields[0].strip
+    q_text = fields.size > 1 ? fields[1] : nil
+    next if params.empty?
+    names = trailing_star(params).try_names || [params]
+    names.each do |name|
+      q = q_text ? to_f(q_text) : (name == "*/*" ? 0.0 : 1.0)
+      list << AcceptItem.new(index, name, truncate(q * 100.0))
+      index += 1
+    end
+  end
+  list = list.sorted do |a, b|
+    a.q == b.q ? a.index <=> b.index : (b.q > a.q ? 1 : -1)
+  end
+  sort_xml(list)
+
+  list.each do |item|
+    found = lookup(item.name)
+    return found if found.is_a?(InvalidMimeType)
+    formats << found if found && !formats.includes?(found)
+  end
+  formats
+end
+
+def truncate(value : Float64) : Float64
+  return value if value != value || value - value != 0.0
+  value < 0 ? -((-value).floor) : value.floor
+end
+
+# The names a `text/*` or `application/*` entry expands to.
+struct Expansion
+  getter formats : Array(Format)?
+
+  def initialize(@formats : Array(Format)?)
+  end
+
+  def try_names : Array(String)?
+    found = @formats
+    found ? found.map(&.string) : nil
+  end
+end
+
+def trailing_star(accept : String) : Expansion
+  Expansion.new(trailing_star_formats(accept))
+end
+
+# `TRAILING_STAR_REGEXP = /^(text|application)\/\*/`: every registered type
+# matching `text/` or `application/`, in registration order.
+def trailing_star_formats(accept : String) : Array(Format)?
+  prefix = if accept.starts_with?("text/*")
+             "text/"
+           elsif accept.starts_with?("application/*")
+             "application/"
+           else
+             return nil
+           end
+  REGISTERED.select(&.matches?(prefix))
+end
+
+# `Mime::Type::AcceptList.sort!`'s XML juggling: `text/xml` folds into
+# `application/xml`, which then yields to any `+xml` type of the same
+# quality listed after it.
+def sort_xml(list : Array(AcceptItem)) : Nil
+  text_index = position(list, "text/xml")
+  app_index = position(list, "application/xml")
+  if text_index && app_index
+    list[app_index].q = list[app_index].q > list[text_index].q ? list[app_index].q : list[text_index].q
+    if app_index > text_index
+      list[app_index], list[text_index] = list[text_index], list[app_index]
+      app_index, text_index = text_index, app_index
+    end
+    list.delete_at(text_index)
+  elsif text_index
+    list[text_index].name = "application/xml"
+  end
+  if app = app_index
+    app_q = list[app].q
+    i = app
+    while i < list.size
+      break if list[i].q < app_q
+      if list[i].name.ends_with?("+xml")
+        list[app], list[i] = list[i], list[app]
+        app = i
+      end
+      i += 1
+    end
+  end
+end
+
+# `PARAMETER_SEPARATOR_REGEXP = /;\s*q="?/`: where the first one starts and
+# ends.
+def find_q_separator(text : String) : Tuple(Int32, Int32)?
+  bytes = text.as_tape
+  size = text.bytesize
+  i = 0
+  while i < size
+    if bytes[i] == ';'.ord
+      j = i + 1
+      while j < size && (bytes[j] == ' '.ord || (bytes[j] >= 9 && bytes[j] <= 13))
+        j += 1
+      end
+      if j + 1 < size && bytes[j] == 'q'.ord && bytes[j + 1] == '='.ord
+        return {i, j + 2 < size && bytes[j + 2] == '"'.ord ? j + 3 : j + 2}
+      end
+    end
+    i += 1
+  end
+  nil
+end
+
+# `String#split` on the q separator. It drops trailing empty fields, so a
+# `q=` with nothing after it leaves `q` nil (1.0), not "" (0.0).
+def ruby_split_q(text : String) : Array(String)
+  fields = [] of String
+  rest = text
+  while found = find_q_separator(rest)
+    fields << rest[0, found[0]]
+    rest = rest[found[1], rest.bytesize - found[1]]
+  end
+  fields << rest
+  while !fields.empty? && fields.last.empty?
+    fields.pop
+  end
+  fields
+end
+
+# `ACCEPT_HEADER_REGEXP = /[^,\s"](?:[^,"]|"[^"]*")*/`
+def scan_accept_items(header : String) : Array(String)
+  bytes = header.as_tape
+  size = header.bytesize
+  items = [] of String
+  i = 0
+  while i < size
+    if bytes[i] == ','.ord || bytes[i] == '"'.ord || bytes[i] == ' '.ord || (bytes[i] >= 9 && bytes[i] <= 13)
+      i += 1
+      next
+    end
+    start = i
+    i += 1
+    while i < size && bytes[i] != ','.ord
+      if bytes[i] == '"'.ord
+        close = header.byte_index("\"", i + 1)
+        break unless close
+        i = close + 1
+      else
+        i += 1
+      end
+    end
+    items << header[start, i - start]
+  end
+  items
+end
+
+# Everything `MimeNegotiation#formats` looks at.
+pub struct NegotiationInput
+  # `params[:format]` (path extension captured by the router, or
+  # `?format=`).
+  getter format_param : String?
+  getter accept : String?
+  getter content_type : String?
+  getter path : String
+  getter xhr : Bool
+
+  def initialize(@format_param : String?, @accept : String?, @content_type : String?, @path : String, @xhr : Bool)
+  end
+end
+
+# `request.formats`.
+pub def formats(input : NegotiationInput) : Array(Format) | InvalidMimeType
+  if format = input.format_param
+    found = lookup_by_extension(format)
+    return found ? [found] : [] of Format
+  end
+  if valid_accept_header?(input)
+    accept = (input.accept || "").strip
+    if accept.empty?
+      mime = content_mime_type(input.content_type)
+      return mime if mime.is_a?(InvalidMimeType)
+      return mime ? [mime] : [] of Format
+    end
+    return parse_accept(accept)
+  end
+  if format = format_from_path_extension(input.path)
+    return [format]
+  end
+  [input.xhr ? JS : HTML]
+end
+
+# `request.content_mime_type`.
+pub def content_mime_type(content_type : String?) : Format | InvalidMimeType | Nil
+  return nil unless content_type
+  base = content_type.tr(";", ",").partition(',')[0].strip.downcase
+  base.empty? ? nil : lookup(base)
+end
+
+# `request.should_apply_vary_header?`: the format came from the `Accept`
+# header, not a format param.
+pub def should_apply_vary_header?(input : NegotiationInput) : Bool
+  input.format_param.nil? && valid_accept_header?(input)
+end
+
+def valid_accept_header?(input : NegotiationInput) : Bool
+  accept = input.accept || ""
+  present = !accept.strip.empty?
+  content_type = input.content_type
+  (input.xhr && (present || (!content_type.nil? && !content_type.empty?))) || (present && !browser_like?(accept))
+end
+
+# `BROWSER_LIKE_ACCEPTS = /,\s*\*\/\*|\*\/\*\s*,/`
+def browser_like?(accept : String) : Bool
+  compact = String.build { |io| accept.each_char { |c| io << c unless c.whitespace? } }
+  compact.includes?(",*/*") || compact.includes?("*/*,")
+end
+
+def format_from_path_extension(path : String) : Format?
+  dot = path.rindex('.')
+  return nil unless dot
+  extension = path[dot + 1, path.bytesize - dot - 1]
+  return nil if extension.empty? || !extension.chars.all? { |c| c.ascii_alphanumeric? || c == '_' }
+  lookup_by_extension(extension)
+end
+
+# `request.negotiate_mime(order)`: the first acceptable format *order*
+# offers.
+pub def negotiate(formats : Array(Format), order : Array(Format)) : Format?
+  formats.each do |priority|
+    return order.empty? ? nil : order.first if priority == ALL
+    return priority if order.includes?(priority)
+  end
+  order.includes?(ALL) && !formats.empty? ? formats.first : nil
+end
+
+def position(list : Array(AcceptItem), name : String) : Int32?
+  list.each_with_index { |item, i| return i if item.name == name }
+  nil
+end
+
+# `request.formats` by another name, for callers that have a `formats` of
+# their own.
+pub def request_formats(input : NegotiationInput) : Array(Format) | InvalidMimeType
+  formats(input)
+end

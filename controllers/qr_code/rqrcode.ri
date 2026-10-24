@@ -1,0 +1,652 @@
+# A port of rqrcode_core 2.1.0 and rqrcode 3.2.0's `as_svg` (Rect output),
+# for `QrCodeController#show` (reference/app/controllers/qr_code_controller.rb):
+# `RQRCode::QRCode.new(url).as_svg(viewbox: true, fill: :white, color: :black)`.
+#
+# The output has to be byte-identical to the gem's, so this follows its
+# algorithms rather than the QR spec's optimal choices: a single segment
+# whose mode is numeric, alphanumeric or 8-bit byte (in that order of
+# preference), error correction level H, the smallest version whose capacity
+# is *strictly* greater than the segment's bits, and the mask with the fewest
+# "lost points" as the gem scores them (including its floating-point
+# dark-ratio term). Golden vectors: `reference-tools/campfire/rqrcode.rb`.
+module controllers/qr_code/rqrcode
+
+import std/int
+import std/text
+
+# `RQRCode::QRCode.new(data).as_svg(viewbox: true, fill: :white, color:
+# :black)`, for the binary string `Base64.urlsafe_decode64` returns; nil when
+# it doesn't fit a version 40 code.
+pub def svg_bytes(data : String) : String?
+  modules = qr_modules(data)
+  return nil unless modules
+  module_size = 11
+  dimension = modules.size * module_size
+  String.build(256 + modules.size * modules.size * 30) do |io|
+    io << %(<?xml version="1.0" standalone="yes"?>)
+    io << %(<svg version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:ev="http://www.w3.org/2001/xml-events" viewBox="0 0 #{dimension} #{dimension}" shape-rendering="crispEdges">)
+    io << %(<rect width="#{dimension}" height="#{dimension}" x="0" y="0" fill="white"/>)
+    modules.each_with_index do |cells, row|
+      cells.each_with_index do |dark, col|
+        io << %(<rect width="#{module_size}" height="#{module_size}" x="#{col * module_size}" y="#{row * module_size}" fill="black"/>) if dark
+      end
+    end
+    io << "</svg>"
+  end
+end
+
+# `RQRCodeCore::QRCode#modules`: the dark (true) and light modules, row by
+# row; nil where rqrcode raises "Data length exceed maximum capacity of
+# version 40".
+pub def qr_modules(data : String) : Array(Array(Bool))?
+  segment = Segment.new(data)
+  version = minimum_version(segment)
+  return nil unless version
+  count = version * 4 + 17
+
+  common = Grid.new(count)
+  place_position_probe_pattern(common, 0, 0)
+  place_position_probe_pattern(common, count - 7, 0)
+  place_position_probe_pattern(common, 0, count - 7)
+  place_position_adjust_pattern(common, version)
+  place_timing_pattern(common)
+
+  codewords = create_data(version, segment)
+
+  # `get_best_mask_pattern`: the first pattern with the fewest lost points.
+  best_pattern = 0
+  best_points = 0.0
+  8.times do |pattern|
+    points = lost_points(make(common, version, codewords, true, pattern))
+    if pattern == 0 || best_points > points
+      best_pattern = pattern
+      best_points = points
+    end
+  end
+  make(common, version, codewords, false, best_pattern)
+end
+
+def make(common : Grid, version : Int32, codewords : Array(Int32), test : Bool, pattern : Int32) : Array(Array(Bool))
+  grid = common.dup
+  place_format_info(grid, test, pattern)
+  place_version_info(grid, version, test) if version >= 7
+  map_data(grid, codewords, pattern)
+  grid.to_modules
+end
+
+enum Mode
+  Number      = 1
+  AlphaNumeric = 2
+  Byte        = 4
+end
+
+ALPHANUMERIC = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:"
+
+# `QRERRORCORRECTLEVEL[:h]`
+LEVEL_H = 2
+
+# `QRMAXBITS[:h]`
+MAX_BITS_H = [
+  72, 128, 208, 288, 368, 480, 528, 688, 800, 976, 1120, 1264, 1440, 1576,
+  1784, 2024, 2264, 2504, 2728, 3080, 3248, 3536, 3712, 4112, 4304, 4768,
+  5024, 5288, 5608, 5960, 6344, 6760, 7208, 7688, 7888, 8432, 8768, 9136,
+  9776, 10208,
+]
+
+# The H rows of `QRRSBlock::RS_BLOCK_TABLE`: (count, total, data) groups.
+RS_BLOCKS_H = [
+  [1, 26, 9],
+  [1, 44, 16],
+  [2, 35, 13],
+  [4, 25, 9],
+  [2, 33, 11, 2, 34, 12],
+  [4, 43, 15],
+  [4, 39, 13, 1, 40, 14],
+  [4, 40, 14, 2, 41, 15],
+  [4, 36, 12, 4, 37, 13],
+  [6, 43, 15, 2, 44, 16],
+  [3, 36, 12, 8, 37, 13],
+  [7, 42, 14, 4, 43, 15],
+  [12, 33, 11, 4, 34, 12],
+  [11, 36, 12, 5, 37, 13],
+  [11, 36, 12, 7, 37, 13],
+  [3, 45, 15, 13, 46, 16],
+  [2, 42, 14, 17, 43, 15],
+  [2, 42, 14, 19, 43, 15],
+  [9, 39, 13, 16, 40, 14],
+  [15, 43, 15, 10, 44, 16],
+  [19, 46, 16, 6, 47, 17],
+  [34, 37, 13],
+  [16, 45, 15, 14, 46, 16],
+  [30, 46, 16, 2, 47, 17],
+  [22, 45, 15, 13, 46, 16],
+  [33, 46, 16, 4, 47, 17],
+  [12, 45, 15, 28, 46, 16],
+  [11, 45, 15, 31, 46, 16],
+  [19, 45, 15, 26, 46, 16],
+  [23, 45, 15, 25, 46, 16],
+  [23, 45, 15, 28, 46, 16],
+  [19, 45, 15, 35, 46, 16],
+  [11, 45, 15, 46, 46, 16],
+  [59, 46, 16, 1, 47, 17],
+  [22, 45, 15, 41, 46, 16],
+  [2, 45, 15, 64, 46, 16],
+  [24, 45, 15, 46, 46, 16],
+  [42, 45, 15, 32, 46, 16],
+  [10, 45, 15, 67, 46, 16],
+  [20, 45, 15, 61, 46, 16],
+]
+
+# `QRUtil::PATTERN_POSITION_TABLE`
+PATTERN_POSITIONS = [
+  [] of Int32,
+  [6, 18],
+  [6, 22],
+  [6, 26],
+  [6, 30],
+  [6, 34],
+  [6, 22, 38],
+  [6, 24, 42],
+  [6, 26, 46],
+  [6, 28, 50],
+  [6, 30, 54],
+  [6, 32, 58],
+  [6, 34, 62],
+  [6, 26, 46, 66],
+  [6, 26, 48, 70],
+  [6, 26, 50, 74],
+  [6, 30, 54, 78],
+  [6, 30, 56, 82],
+  [6, 30, 58, 86],
+  [6, 34, 62, 90],
+  [6, 28, 50, 72, 94],
+  [6, 26, 50, 74, 98],
+  [6, 30, 54, 78, 102],
+  [6, 28, 54, 80, 106],
+  [6, 32, 58, 84, 110],
+  [6, 30, 58, 86, 114],
+  [6, 34, 62, 90, 118],
+  [6, 26, 50, 74, 98, 122],
+  [6, 30, 54, 78, 102, 126],
+  [6, 26, 52, 78, 104, 130],
+  [6, 30, 56, 82, 108, 134],
+  [6, 34, 60, 86, 112, 138],
+  [6, 30, 58, 86, 114, 142],
+  [6, 34, 62, 90, 118, 146],
+  [6, 30, 54, 78, 102, 126, 150],
+  [6, 24, 50, 76, 102, 128, 154],
+  [6, 28, 54, 80, 106, 132, 158],
+  [6, 32, 58, 84, 110, 136, 162],
+  [6, 26, 54, 82, 110, 138, 166],
+  [6, 30, 58, 86, 114, 142, 170],
+]
+
+G15      = (1 << 10) | (1 << 8) | (1 << 5) | (1 << 4) | (1 << 2) | (1 << 1) | 1
+G18      = (1 << 12) | (1 << 11) | (1 << 10) | (1 << 9) | (1 << 8) | (1 << 5) | (1 << 2) | 1
+G15_MASK = (1 << 14) | (1 << 12) | (1 << 10) | (1 << 4) | (1 << 1)
+
+# `QRSegment`: the whole input in one mode.
+struct Segment
+  getter data : String
+  getter mode : Mode
+
+  # `QRSegment.new(data:)` without a mode: numeric, then alphanumeric, then
+  # 8-bit byte. The gem checks `data.chars`; every valid character is ASCII,
+  # so checking bytes is the same.
+  def initialize(@data : String)
+    numeric = true
+    alphanumeric = true
+    @data.each_byte do |byte|
+      numeric = false unless byte >= 48 && byte <= 57
+      alphanumeric = false unless alphanumeric_index(byte) >= 0
+    end
+    @mode = numeric ? Mode::Number : (alphanumeric ? Mode::AlphaNumeric : Mode::Byte)
+  end
+
+  # `QRSegment#size(version)`: bits needed, including the mode indicator and
+  # length.
+  def size(version : Int32) : Int32
+    4 + length_in_bits(@mode, version) + content_size
+  end
+
+  def content_size : Int32
+    length = @data.bytesize
+    chunk, bits, extra = case @mode
+                         when Mode::Number       then {3, 10, [0, 4, 7][length % 3]}
+                         when Mode::AlphaNumeric then {2, 11, 6}
+                         else                         {1, 8, 0}
+                         end
+    (length // chunk) * bits + (length % chunk == 0 ? 0 : extra)
+  end
+
+  def write(buffer : BitBuffer) : Nil
+    buffer.put(@mode.value, 4)
+    buffer.put(@data.bytesize, length_in_bits(@mode, buffer.version))
+    bytes = @data.as_tape
+    size = @data.bytesize
+    case @mode
+    when Mode::Number
+      i = 0
+      while i < size
+        chunk = size - i < 3 ? size - i : 3
+        code = 0
+        chunk.times { |k| code = code * 10 + (bytes[i + k].to_i32 - 48) }
+        buffer.put(code, [0, 4, 7, 10][chunk])
+        i += 3
+      end
+    when Mode::AlphaNumeric
+      i = 0
+      while i < size
+        if i + 1 < size
+          buffer.put(alphanumeric_index(bytes[i]) * 45 + alphanumeric_index(bytes[i + 1]), 11)
+        else
+          buffer.put(alphanumeric_index(bytes[i]), 6)
+        end
+        i += 2
+      end
+    else
+      size.times { |k| buffer.put(bytes[k].to_i32, 8) }
+    end
+  end
+end
+
+# The byte's place in `ALPHANUMERIC`, or -1.
+def alphanumeric_index(byte : UInt8) : Int32
+  table = ALPHANUMERIC.as_tape
+  ALPHANUMERIC.bytesize.times { |i| return i if table[i] == byte }
+  -1
+end
+
+# `QRUtil.get_length_in_bits`
+def length_in_bits(mode : Mode, version : Int32) : Int32
+  macro_version = version <= 9 ? 0 : (version <= 26 ? 1 : 2)
+  case mode
+  when Mode::Number       then [10, 12, 14][macro_version]
+  when Mode::AlphaNumeric then [9, 11, 13][macro_version]
+  else                         [8, 16, 16][macro_version]
+  end
+end
+
+# `QRBitBuffer`
+class BitBuffer
+  getter version : Int32
+  getter buffer : Array(Int32)
+  getter length : Int32
+
+  def initialize(@version : Int32)
+    @buffer = [] of Int32
+    @length = 0
+  end
+
+  def put(num : Int32, length : Int32) : Nil
+    length.times { |i| put_bit((num >> (length - i - 1)) & 1 == 1) }
+  end
+
+  def put_bit(bit : Bool) : Nil
+    index = @length // 8
+    @buffer << 0 if @buffer.size <= index
+    @buffer[index] = @buffer[index] | (0x80 >> (@length % 8)) if bit
+    @length += 1
+  end
+
+  def end_of_message(max_data_bits : Int32) : Nil
+    put(0, 4) if @length + 4 <= max_data_bits
+  end
+
+  def pad_until(preferred_size : Int32) : Nil
+    while @length % 8 != 0
+      put_bit(false)
+    end
+    while @length < preferred_size
+      put(0xEC, 8)
+      put(0x11, 8) if @length < preferred_size
+    end
+  end
+end
+
+# `QRMath`: GF(256) exp/log tables.
+class Galois
+  getter exp : Array(Int32)
+  getter log : Array(Int32)
+
+  def initialize
+    @exp = Array.new(256, 0)
+    @log = Array.new(256, 0)
+    8.times { |i| @exp[i] = 1 << i }
+    (8...256).each { |i| @exp[i] = @exp[i - 4] ^ @exp[i - 5] ^ @exp[i - 6] ^ @exp[i - 8] }
+    255.times { |i| @log[@exp[i]] = i }
+  end
+
+  def glog(n : Int32) : Int32
+    raise "glog(#{n})" if n < 1
+    @log[n]
+  end
+
+  def gexp(n : Int32) : Int32
+    while n < 0
+      n += 255
+    end
+    while n >= 256
+      n -= 255
+    end
+    @exp[n]
+  end
+end
+
+# `QRPolynomial.new(num, shift)`. The gem pads with `nil`s where this pads
+# with zeros; they only differ in inputs where the gem raises.
+def polynomial(num : Array(Int32), shift : Int32) : Array(Int32)
+  offset = 0
+  while offset < num.size && num[offset] == 0
+    offset += 1
+  end
+  values = Array.new(num.size - offset + shift, 0)
+  (num.size - offset).times { |i| values[i] = num[offset + i] }
+  values
+end
+
+def multiply(a : Array(Int32), b : Array(Int32), gf : Galois) : Array(Int32)
+  num = Array.new(a.size + b.size - 1, 0)
+  a.each_with_index do |x, i|
+    b.each_with_index do |y, j|
+      num[i + j] = num[i + j] ^ gf.gexp(gf.glog(x) + gf.glog(y))
+    end
+  end
+  polynomial(num, 0)
+end
+
+def modulo(dividend : Array(Int32), divisor : Array(Int32), gf : Galois) : Array(Int32)
+  current = dividend
+  while current.size >= divisor.size
+    ratio = gf.glog(current[0]) - gf.glog(divisor[0])
+    num = current.dup
+    divisor.each_with_index { |value, i| num[i] = num[i] ^ gf.gexp(gf.glog(value) + ratio) }
+    current = polynomial(num, 0)
+  end
+  current
+end
+
+# `QRUtil.get_error_correct_polynomial`
+def error_correct_polynomial(length : Int32, gf : Galois) : Array(Int32)
+  a = polynomial([1], 0)
+  length.times { |i| a = multiply(a, polynomial([1, gf.gexp(i)], 0), gf) }
+  a
+end
+
+# `QRCode.create_data`: the data and error correction codewords, interleaved.
+def create_data(version : Int32, segment : Segment) : Array(Int32)
+  blocks = [] of Tuple(Int32, Int32)
+  row = RS_BLOCKS_H[version - 1]
+  (row.size // 3).times do |g|
+    row[g * 3].times { blocks << {row[g * 3 + 1], row[g * 3 + 2]} }
+  end
+  max_data_bits = blocks.sum { |block| block[1] } * 8
+
+  buffer = BitBuffer.new(version)
+  segment.write(buffer)
+  buffer.end_of_message(max_data_bits)
+  raise "code length overflow" if buffer.length > max_data_bits
+  buffer.pad_until(max_data_bits)
+
+  gf = Galois.new
+  offset = 0
+  dc_data = [] of Array(Int32)
+  ec_data = [] of Array(Int32)
+  blocks.each do |block|
+    total, data_count = block
+    ec_count = total - data_count
+    dc = Array.new(data_count) { |i| buffer.buffer[offset + i] }
+    offset += data_count
+    rs_poly = error_correct_polynomial(ec_count, gf)
+    ec_length = rs_poly.size - 1
+    mod_poly = modulo(polynomial(dc, ec_length), rs_poly, gf)
+    ec = Array.new(ec_length) do |i|
+      index = i + mod_poly.size - ec_length
+      index >= 0 ? mod_poly[index] : 0
+    end
+    dc_data << dc
+    ec_data << ec
+  end
+
+  data = [] of Int32
+  [dc_data, ec_data].each do |codewords|
+    longest = 0
+    codewords.each { |block| longest = block.size if block.size > longest }
+    longest.times do |i|
+      codewords.each do |block|
+        value = block[i]?
+        data << value if value
+      end
+    end
+  end
+  data
+end
+
+# `QRUtil.get_bch_digit`
+def bch_digit(data : Int32) : Int32
+  digit = 0
+  while data != 0
+    digit += 1
+    data = data >> 1
+  end
+  digit
+end
+
+def bch_format_info(data : Int32) : Int32
+  d = data << 10
+  while bch_digit(d) - bch_digit(G15) >= 0
+    d = d ^ (G15 << (bch_digit(d) - bch_digit(G15)))
+  end
+  ((data << 10) | d) ^ G15_MASK
+end
+
+def bch_version(data : Int32) : Int32
+  d = data << 12
+  while bch_digit(d) - bch_digit(G18) >= 0
+    d = d ^ (G18 << (bch_digit(d) - bch_digit(G18)))
+  end
+  (data << 12) | d
+end
+
+# `QRMASKCOMPUTATIONS`
+def mask?(pattern : Int32, i : Int32, j : Int32) : Bool
+  case pattern
+  when 0 then (i + j) % 2 == 0
+  when 1 then i % 2 == 0
+  when 2 then j % 3 == 0
+  when 3 then (i + j) % 3 == 0
+  when 4 then (i // 2 + j // 3) % 2 == 0
+  when 5 then (i * j) % 2 + (i * j) % 3 == 0
+  when 6 then ((i * j) % 2 + (i * j) % 3) % 2 == 0
+  else        ((i * j) % 3 + (i + j) % 2) % 2 == 0
+  end
+end
+
+# The modules while they're placed: -1 for one not yet placed, 0 light, 1
+# dark.
+class Grid
+  getter count : Int32
+  getter cells : Array(Int8)
+
+  def initialize(@count : Int32, @cells : Array(Int8) = Array.new(count * count, -1_i8))
+  end
+
+  def dup : Grid
+    Grid.new(@count, @cells.dup)
+  end
+
+  def placed?(row : Int32, col : Int32) : Bool
+    @cells[row * @count + col] >= 0
+  end
+
+  def []=(row : Int32, col : Int32, dark : Bool) : Nil
+    @cells[row * @count + col] = dark ? 1_i8 : 0_i8
+  end
+
+  # An unplaced module is light.
+  def to_modules : Array(Array(Bool))
+    Array.new(@count) { |row| Array.new(@count) { |col| @cells[row * @count + col] == 1 } }
+  end
+end
+
+# `minimum_version`: the first version whose capacity is strictly greater
+# than the bits needed, or nil where rqrcode raises "Data length exceed
+# maximum capacity of version 40".
+pub def minimum_version(segment : Segment) : Int32?
+  (1..40).each { |version| return version if segment.size(version) < MAX_BITS_H[version - 1] }
+  nil
+end
+
+# The version rqrcode picks for *data*.
+pub def minimum_version(data : String) : Int32?
+  minimum_version(Segment.new(data))
+end
+
+def place_position_probe_pattern(grid : Grid, row : Int32, col : Int32) : Nil
+  (-1..7).each do |r|
+    y = row + r
+    next unless y >= 0 && y < grid.count
+    (-1..7).each do |c|
+      x = col + c
+      next unless x >= 0 && x < grid.count
+      vertical = r >= 0 && r <= 6 && (c == 0 || c == 6)
+      horizontal = c >= 0 && c <= 6 && (r == 0 || r == 6)
+      square = r >= 2 && r <= 4 && c >= 2 && c <= 4
+      grid[y, x] = vertical || horizontal || square
+    end
+  end
+end
+
+def place_position_adjust_pattern(grid : Grid, version : Int32) : Nil
+  positions = PATTERN_POSITIONS[version - 1]
+  positions.each do |row|
+    positions.each do |col|
+      next if grid.placed?(row, col)
+      (-2..2).each do |r|
+        (-2..2).each do |c|
+          grid[row + r, col + c] = r.abs == 2 || c.abs == 2 || (r == 0 && c == 0)
+        end
+      end
+    end
+  end
+end
+
+def place_timing_pattern(grid : Grid) : Nil
+  (8...grid.count - 8).each do |i|
+    grid[i, 6] = i % 2 == 0
+    grid[6, i] = i % 2 == 0
+  end
+end
+
+def place_version_info(grid : Grid, version : Int32, test : Bool) : Nil
+  count = grid.count
+  bits = bch_version(version)
+  18.times do |i|
+    dark = !test && (bits >> i) & 1 == 1
+    grid[i // 3, i % 3 + count - 8 - 3] = dark
+    grid[i % 3 + count - 8 - 3, i // 3] = dark
+  end
+end
+
+def place_format_info(grid : Grid, test : Bool, pattern : Int32) : Nil
+  count = grid.count
+  bits = bch_format_info((LEVEL_H << 3) | pattern)
+  15.times do |i|
+    dark = !test && (bits >> i) & 1 == 1
+    row = i < 6 ? i : (i < 8 ? i + 1 : count - 15 + i)
+    grid[row, 8] = dark
+    col = i < 8 ? count - i - 1 : (i < 9 ? 15 - i : 15 - i - 1)
+    grid[8, col] = dark
+  end
+  grid[count - 8, 8] = !test
+end
+
+def map_data(grid : Grid, data : Array(Int32), pattern : Int32) : Nil
+  count = grid.count
+  inc = -1
+  row = count - 1
+  bit_index = 7
+  byte_index = 0
+
+  col = count - 1
+  while col >= 1
+    c0 = col <= 6 ? col - 1 : col
+    loop do
+      2.times do |c|
+        x = c0 - c
+        unless grid.placed?(row, x)
+          dark = byte_index < data.size && (data[byte_index] >> bit_index) & 1 == 1
+          dark = !dark if mask?(pattern, row, x)
+          grid[row, x] = dark
+          bit_index -= 1
+          if bit_index == -1
+            byte_index += 1
+            bit_index = 7
+          end
+        end
+      end
+      row += inc
+      if row < 0 || count <= row
+        row -= inc
+        inc = -inc
+        break
+      end
+    end
+    col -= 2
+  end
+end
+
+# `QRUtil.get_lost_points`. The dark-ratio term is a Float in Ruby, so the
+# total is too.
+def lost_points(modules : Array(Array(Bool))) : Float64
+  count = modules.size
+  max = count - 1
+  points = 0_i64
+
+  # Same-color neighbours.
+  count.times do |row|
+    count.times do |col|
+      dark = modules[row][col]
+      same = 0
+      if row > 0
+        above = modules[row - 1]
+        same += 1 if col > 0 && dark == above[col - 1]
+        same += 1 if dark == above[col]
+        same += 1 if col < max && dark == above[col + 1]
+      end
+      same += 1 if col > 0 && dark == modules[row][col - 1]
+      same += 1 if col < max && dark == modules[row][col + 1]
+      if row < max
+        below = modules[row + 1]
+        same += 1 if col > 0 && dark == below[col - 1]
+        same += 1 if dark == below[col]
+        same += 1 if col < max && dark == below[col + 1]
+      end
+      points += 3 + same - 5 if same > 5
+    end
+  end
+
+  # 2x2 blocks.
+  max.times do |row|
+    max.times do |col|
+      value = modules[row][col]
+      points += 3 if value == modules[row + 1][col] && value == modules[row][col + 1] && value == modules[row + 1][col + 1]
+    end
+  end
+
+  # 1:1:3:1:1 patterns, in rows then columns.
+  (count - 6).times do |start|
+    count.times do |line|
+      row = modules[line]
+      points += 40 if row[start] && !row[start + 1] && row[start + 2] && row[start + 3] && row[start + 4] && !row[start + 5] && row[start + 6]
+      points += 40 if modules[start][line] && !modules[start + 1][line] && modules[start + 2][line] && modules[start + 3][line] && modules[start + 4][line] && !modules[start + 5][line] && modules[start + 6][line]
+    end
+  end
+
+  # Dark ratio.
+  dark = 0
+  modules.each { |cells| dark += cells.count { |m| m } }
+  ratio = dark.to_f64 / (count * count).to_f64
+  delta = (100.0 * ratio - 50.0).abs / 5.0
+  points.to_f64 + delta * 10.0
+end

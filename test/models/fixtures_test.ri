@@ -1,0 +1,37 @@
+# The fixture loader against Rails' own answers, and the loaded fixtures as
+# the Ruby tests see them.
+module test/models/fixtures_test
+
+import rils/rails_compat/clock::{Clock}
+import rils/record/database::*
+import rils/record/events::{RecordingSink}
+import rils/record/timestamp::{Timestamp}
+import test/models/fixtures::*
+import models/user::{User}
+import models/room::{Room, Membership}
+import models/message::{Message}
+
+# ActiveRecord::FixtureSet.identify, from the reference app.
+assert identify("david") == 127326141
+assert identify("signal") == 873240054
+assert identify("designers") == 654632876
+
+now = Timestamp.parse_db("2026-09-26 12:24:38.211309") || raise("time")
+erb = FixtureErb.new(now, 4)
+assert erb.render("created_at: <%= 1.hour.ago %>") == "created_at: 2026-09-26 11:24:38 UTC"
+assert erb.render("<% x = 5.minutes.ago %>\na: <%= x %>") == "\na: 2026-09-26 12:19:38 UTC"
+
+db = Database.open(Config.new(":memory:"), Env.new(Clock.new, RecordingSink.new, RichText.new, 4))
+raise db if db.is_a?(String)
+loaded = db.write { |tx| load_fixtures(tx.conn, fixtures_dir, tx.now, 4) }
+david = db.read { |c| User.find(c, loaded.id("users", "david")) }
+raise "no david" unless david.is_a?(User)
+assert david.name == "David" && david.administrator?
+assert david.authenticate?("secret123456")
+designers = db.read { |c| Room.find(c, loaded.id("rooms", "designers")) }
+raise "no designers" unless designers.is_a?(Room)
+assert designers.closed?
+assert db.read { |c| Message.for_room(c, designers.id).size } >= 3
+first = db.read { |c| Message.find(c, loaded.id("messages", "first")) }
+raise "no first" unless first.is_a?(Message)
+assert db.read { |c| first.body_html(c) } == "First post!"

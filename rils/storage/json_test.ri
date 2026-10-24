@@ -1,0 +1,18 @@
+# The Rust port's JSON tests, checked against `ActiveSupport::JSON.encode`
+# and `ActiveRecord::Coders::JSON` in the reference.
+module rils/storage/json_test
+
+import rils/storage/json::*
+import std/json::{Any}
+import web/web/spec::*
+
+describe "json" do
+  it "leaves JS line separators raw" do
+    assert json_encode(Any.new("a\u{2028}b\u{2029}c<>&")) == "\"a\u{2028}b\u{2029}c\\u003c\\u003e\\u0026\""
+  end
+
+  it "preserves order and escapes like Active Support" do
+    json = json_parse(%({"z":1,"a":[true,null,2.0,1e16,1e-5],"s":"<a & b>"})) || raise "unparsed"
+    assert json_encode(json) == %({"z":1,"a":[true,null,2.0,1e+16,0.00001],"s":"\\u003ca \\u0026 b\\u003e"})
+  end
+end

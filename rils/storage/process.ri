@@ -1,0 +1,153 @@
+# Producing variant and preview bytes: `ActiveStorage::Transformers::Vips`
+# (image_processing 1.14) and `ActiveStorage::Previewer::VideoPreviewer`,
+# and running ffmpeg/ffprobe with a time limit.
+module rils/storage/process
+
+import std/file
+import std/process::{ProcessResult, ProcessError}
+import std/text
+import rils/storage/errors::{StorageError}
+import rils/storage/content_types::{FFMPEG, VIDEO_PREVIEW_ARGUMENTS}
+import rils/storage/marshal::{Value, Kind}
+import rils/storage/variation::{Variation}
+import rils/storage/vips::{Image}
+
+# How long ffmpeg may take to draw a preview frame before it's killed.
+# Rails sets no limit, but a crafted or hour-long video shouldn't hold a
+# processing task indefinitely.
+pub FFMPEG_TIMEOUT_MS = 60_000
+
+# A child that ran past its time and was ended.
+pub struct TimedOut
+  getter command : String
+  getter milliseconds : Int32
+
+  def initialize(@command : String, @milliseconds : Int32)
+  end
+end
+
+impl Error for TimedOut
+  def message : String
+    "#{@command} timed out after #{@milliseconds}ms"
+  end
+end
+
+# `Process.run`, except the child is ended once *milliseconds* pass. The
+# group's block leaving early cancels the task running it, and a cancelled
+# `Process.run` ends its child.
+pub def output_within(command : String, args : Array(String), milliseconds : Int32) : ProcessResult | ProcessError | TimedOut
+  done = Channel(ProcessResult | ProcessError).new(1)
+  outcome = group do |g|
+    g.spawn do
+      result = Std::Process::Process.run(command, args)
+      done.send(result) unless result.is_a?(Cancelled)
+      0
+    end
+    answer = nil.as(ProcessResult | ProcessError | Nil)
+    select
+    when r = done.receive
+      answer = r if r.is_a?(ProcessResult) || r.is_a?(ProcessError)
+    when timeout(milliseconds)
+      # Leaving the block early cancels the task, which ends the child.
+      return TimedOut.new(command, milliseconds)
+    end
+    answer || TimedOut.new(command, milliseconds)
+  end
+  return TimedOut.new(command, milliseconds) if outcome.is_a?(Panicked)
+  outcome
+end
+
+# `variation.transform(file)`: `ImageProcessing::Vips.source(file)
+# .loader(page: 0).convert(format).apply(operations).call`, saved to a
+# tempfile named for the format. The caller deletes the file.
+pub def transform(input : String, variation : Variation) : String | StorageError
+  format = variation.format
+  return format if format.is_a?(StorageError)
+  ops = operations(variation)
+  return ops if ops.is_a?(StorageError)
+  image = Image.load_for_processing(input)
+  return image if image.is_a?(StorageError)
+  ops.each do |op|
+    resized = image.resize_to_limit(op[0], op[1])
+    return resized if resized.is_a?(StorageError)
+    image = resized
+  end
+  output = File.tempfile("image_processing", ".#{format}")
+  written = image.write_to_file(output)
+  if written
+    File.delete(output) if File.exists?(output)
+    return written
+  end
+  output
+end
+
+# `ImageProcessingTransformer#operations`: every transformation but
+# `format`, skipping blank arguments. Only `resize_to_limit` is built: it's
+# the only one Campfire defines.
+pub def operations(variation : Variation) : Array(Tuple(Int32?, Int32?)) | StorageError
+  ops = [] of Tuple(Int32?, Int32?)
+  variation.transformations.each do |entry|
+    name, argument = entry
+    next if name == "format"
+    return StorageError.invalid_variation("combine_options is not supported") if name == "combine_options"
+    next if blank?(argument)
+    if name == "resize_to_limit" && argument.kind == Kind::List && argument.items.size == 2
+      width = dimension(argument.items[0])
+      return width if width.is_a?(StorageError)
+      height = dimension(argument.items[1])
+      return height if height.is_a?(StorageError)
+      return StorageError.invalid_variation("either width or height must be specified") if width.nil? && height.nil?
+      ops << {width, height}
+    else
+      return StorageError.invalid_variation("unsupported transformation #{name}: #{argument.inspect}")
+    end
+  end
+  ops
+end
+
+def dimension(value : Value) : Int32? | StorageError
+  return nil if value.kind == Kind::Nil
+  if value.kind == Kind::Int && value.int >= -2147483648_i64 && value.int <= 2147483647_i64
+    return value.int.to_i32
+  end
+  StorageError.invalid_variation("resize_to_limit argument #{value.inspect}")
+end
+
+# `Object#present?` negated, for the values a transformation can hold.
+def blank?(value : Value) : Bool
+  case value.kind
+  when Kind::Nil  then true
+  when Kind::Bool then !value.flag
+  when Kind::Str  then value.text.strip.empty?
+  when Kind::List then value.items.empty?
+  when Kind::Map  then value.entries.empty?
+  else                 false
+  end
+end
+
+FFMPEG_FOUND = [] of Bool
+
+# `VideoPreviewer.accept?`: `system(ffmpeg, "-version")`, memoized.
+pub def ffmpeg_exists? : Bool
+  if FFMPEG_FOUND.empty?
+    result = Std::Process::Process.run(FFMPEG, ["-version"])
+    FFMPEG_FOUND << (result.is_a?(ProcessResult) && result.success?)
+  end
+  FFMPEG_FOUND[0]
+end
+
+# `draw_relevant_frame_from`: `ffmpeg -i <input> <arguments> -`, capturing
+# stdout.
+pub def video_preview(input : String) : String | StorageError
+  args = ["-i", input] + VIDEO_PREVIEW_ARGUMENTS + ["-"]
+  result = output_within(FFMPEG, args, FFMPEG_TIMEOUT_MS)
+  case result
+  when TimedOut     then StorageError.preview("#{FFMPEG} #{result.message}")
+  when ProcessError then StorageError.preview(result.message)
+  else
+    unless result.success?
+      return StorageError.preview("#{FFMPEG} failed (status #{result.exit_code}): #{result.stderr.rstrip}")
+    end
+    result.stdout
+  end
+end

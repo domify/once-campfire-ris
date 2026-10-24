@@ -1,0 +1,30 @@
+# The user URLs views and rich text share, and `to_fs(:number)` that
+# versions them.
+module views/helpers/user_paths
+
+import std/time::{Time}
+import rils/rails_compat/key_generator::{Secrets}
+import rils/rails_compat/signed_id::{generate_signed_id}
+import models/user::{User}
+import rils/record/timestamp::{Timestamp}
+import rils/routes/paths::{fresh_user_avatar_path}
+
+# `time.to_fs(:number)`: `%Y%m%d%H%M%S` in UTC.
+pub def to_fs_number(stamp : Timestamp) : String
+  t = stamp.time
+  "#{Time.pad4(t.year)}#{Time.pad2(t.month)}#{Time.pad2(t.day)}#{Time.pad2(t.hour)}#{Time.pad2(t.minute)}#{Time.pad2(t.second)}"
+end
+
+# `fresh_user_avatar_path(user)`: the avatar token, versioned by
+# `updated_at.to_fs(:number)`.
+pub def avatar_path(secrets : Secrets, user : User) : String
+  fresh_user_avatar_path(generate_signed_id(secrets, "User", user.id, "avatar"), to_fs_number(user.updated_at))
+end
+
+# `time.utc.to_fs(:usec)`: `%Y%m%d%H%M%S%6N`, the version in
+# `cache_key_with_version`.
+pub def to_fs_usec(stamp : Timestamp) : String
+  micros = stamp.microseconds % 1_000_000
+  micros += 1_000_000 if micros < 0
+  "#{to_fs_number(stamp)}#{micros.to_s.rjust(6, '0')}"
+end

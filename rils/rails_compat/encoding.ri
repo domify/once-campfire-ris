@@ -1,0 +1,135 @@
+# Ruby's Base64 flavors as Rails uses them.
+module rils/rails_compat/encoding
+import std/text
+import std/int
+import std/base64::{Base64}
+
+# `Base64.strict_encode64`.
+pub def strict_encode(data : String) : String
+  Base64.encode(data)
+end
+
+# `Base64.urlsafe_encode64(data, padding: false)`.
+pub def urlsafe_encode_unpadded(data : String) : String
+  Base64.urlsafe_encode(data).rstrip('=')
+end
+
+# `Base64.urlsafe_encode64(data)` (padded).
+pub def urlsafe_encode_padded(data : String) : String
+  Base64.urlsafe_encode(data)
+end
+
+def sextet(byte : UInt8) : Int32
+  return (byte - 65).to_i32 if byte >= 65 && byte <= 90
+  return (byte - 97 + 26).to_i32 if byte >= 97 && byte <= 122
+  return (byte - 48 + 52).to_i32 if byte >= 48 && byte <= 57
+  return 62 if byte == '+'.ord
+  return 63 if byte == '/'.ord
+  -1
+end
+
+# `Base64.strict_decode64`: standard alphabet, canonical padding, no
+# whitespace, and no stray bits in the last character.
+pub def strict_decode(encoded : String) : String?
+  size = encoded.bytesize
+  return nil unless size % 4 == 0
+  bytes = encoded.as_tape
+  padding = 0
+  padding = 1 if size > 0 && bytes[size - 1] == '='.ord
+  padding = 2 if size > 1 && bytes[size - 1] == '='.ord && bytes[size - 2] == '='.ord
+  failed = false
+  decoded = String.build(size // 4 * 3 - padding) do |io|
+    i = 0
+    while i < size && !failed
+      a = sextet(bytes[i])
+      b = sextet(bytes[i + 1])
+      last = i + 4 == size
+      c = last && padding == 2 ? 0 : sextet(bytes[i + 2])
+      d = last && padding >= 1 ? 0 : sextet(bytes[i + 3])
+      if a < 0 || b < 0 || c < 0 || d < 0
+        failed = true
+      else
+        n = a << 18 | b << 12 | c << 6 | d
+        io.write_byte((n >> 16 & 255).to_u8)
+        if last && padding == 2
+          failed = true unless n & 0xFFFF == 0
+        elsif last && padding == 1
+          io.write_byte((n >> 8 & 255).to_u8)
+          failed = true unless n & 0xFF == 0
+        else
+          io.write_byte((n >> 8 & 255).to_u8)
+          io.write_byte((n & 255).to_u8)
+        end
+      end
+      i += 4
+    end
+  end
+  failed ? nil : decoded
+end
+
+# `Base64.urlsafe_decode64`, which pads a short unpadded string and then
+# translates `-_` to `+/` before a strict decode. So it accepts either
+# alphabet (even mixed) and optional padding, and refuses partial padding
+# (`"ab="`) and non-zero trailing bits, as Ruby does.
+pub def urlsafe_decode(encoded : String) : String?
+  translated = String.build(encoded.bytesize + 3) do |io|
+    encoded.each_byte do |byte|
+      if byte == '-'.ord
+        io << '+'
+      elsif byte == '_'.ord
+        io << '/'
+      else
+        io.write_byte(byte)
+      end
+    end
+    unless encoded.ends_with?("=") || encoded.bytesize % 4 == 0
+      (4 - encoded.bytesize % 4).times { io << '=' }
+    end
+  end
+  strict_decode(translated)
+end
+
+# `urlsafe_decode` of text on the tape, onto the tape: the same alphabets,
+# padding and refusals, the bytes written once.
+pub def urlsafe_decode(encoded : Str) : Str?
+  given = encoded.bytesize
+  padded = encoded.bytesize > 0 && encoded[given - 1] == '='.ord
+  size = padded || given % 4 == 0 ? given : given + 4 - given % 4
+  return nil unless size % 4 == 0
+  padding = 0
+  padding = 1 if size > 0 && byte64(encoded, size - 1) == '='.ord
+  padding = 2 if size > 1 && byte64(encoded, size - 1) == '='.ord && byte64(encoded, size - 2) == '='.ord
+  output = Str::Builder.new(size // 4 * 3)
+  i = 0
+  while i < size
+    a = sextet(byte64(encoded, i))
+    b = sextet(byte64(encoded, i + 1))
+    last = i + 4 == size
+    c = last && padding == 2 ? 0 : sextet(byte64(encoded, i + 2))
+    d = last && padding >= 1 ? 0 : sextet(byte64(encoded, i + 3))
+    return nil if a < 0 || b < 0 || c < 0 || d < 0
+    n = a << 18 | b << 12 | c << 6 | d
+    output.push((n >> 16 & 255).to_u8)
+    if last && padding == 2
+      return nil unless n & 0xFFFF == 0
+    elsif last && padding == 1
+      output.push((n >> 8 & 255).to_u8)
+      return nil unless n & 0xFF == 0
+    else
+      output.push((n >> 8 & 255).to_u8)
+      output.push((n & 255).to_u8)
+    end
+    i += 4
+  end
+  output.finish
+end
+
+# The byte at *index* as `urlsafe_decode` reads it: `-_` as `+/`, and `=`
+# past the end, where it pads.
+def byte64(encoded : Str, index : Int32) : UInt8
+  return '='.ord.to_u8 if index >= encoded.bytesize
+  byte = encoded[index]
+  return '+'.ord.to_u8 if byte == '-'.ord
+  return '/'.ord.to_u8 if byte == '_'.ord
+  byte
+end

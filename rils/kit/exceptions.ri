@@ -1,0 +1,86 @@
+# `ActionDispatch::PublicExceptions`: what an error looks like on the wire
+# in production.
+#
+# JSON, XML and YAML requests get the `{ status:, error: }` hash in that
+# format; everything else gets `public/<status>.html`, or an empty body with
+# the status when that file doesn't exist. HEAD gets an empty body in the
+# request's format, `*/*` included.
+#
+# Unlike rendered responses (`charset=utf-8`), these say `charset=UTF-8`:
+# PublicExceptions and `ShowExceptions#pass_response` interpolate
+# `ActionDispatch::Response.default_charset`, which the railtie sets from
+# `config.encoding` (verified against the reference).
+module rils/kit/exceptions
+
+import std/text
+import rils/kit/format::{Format}
+import rils/kit/response::{Response}
+
+# The `public/<status>.html` pages, held in memory.
+pub class ErrorPages
+  getter pages : Hash(Int32, String)
+
+  def initialize(@pages : Hash(Int32, String) = {} of Int32 => String)
+  end
+end
+
+pub def render_error(pages : ErrorPages, status : Int32, format : Format?, head : Bool) : Response
+  # `request.formats.first`, `*/*` included (only `formats` failing falls
+  # back to HTML).
+  content_type = format ? format.string : "text/html"
+  return with_length(status, content_type, "") if head
+  error = reason(status)
+  symbol = format ? format.symbol : ""
+  body = case symbol
+         when "json" then %({"status":#{status},"error":"#{error}"})
+         when "xml"  then "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<hash>\n  <status type=\"integer\">#{status}</status>\n  <error>#{xml_escape(error)}</error>\n</hash>\n"
+         when "yaml" then "---\n:status: #{status}\n:error: #{error}\n"
+         else             nil
+         end
+  return with_length(status, content_type, body) if body
+  # PublicExceptions answers X-Cascade: pass; ShowExceptions#pass_response
+  # turns that into an empty page with the error's status.
+  with_length(status, "text/html", pages.pages[status]? || "")
+end
+
+# `render_format` and `pass_response` set `Content-Length` themselves.
+def with_length(status : Int32, content_type : String, body : String) : Response
+  Response.with_body(status, "#{content_type}; charset=UTF-8", body).header("content-length", body.bytesize.to_s)
+end
+
+# Builder's text escaping (`Hash#to_xml`).
+def xml_escape(text : String) : String
+  text.gsub("&", "&amp;").gsub("<", "&lt;").gsub(">", "&gt;")
+end
+
+# `Rack::Utils::HTTP_STATUS_CODES`.
+pub def reason(status : Int32) : String
+  case status
+  when 200 then "OK"
+  when 201 then "Created"
+  when 204 then "No Content"
+  when 301 then "Moved Permanently"
+  when 302 then "Found"
+  when 303 then "See Other"
+  when 304 then "Not Modified"
+  when 400 then "Bad Request"
+  when 401 then "Unauthorized"
+  when 403 then "Forbidden"
+  when 404 then "Not Found"
+  when 405 then "Method Not Allowed"
+  when 406 then "Not Acceptable"
+  when 409 then "Conflict"
+  when 410 then "Gone"
+  when 413 then "Content Too Large"
+  when 415 then "Unsupported Media Type"
+  when 416 then "Range Not Satisfiable"
+  when 422 then "Unprocessable Content"
+  when 429 then "Too Many Requests"
+  when 500 then "Internal Server Error"
+  when 501 then "Not Implemented"
+  when 502 then "Bad Gateway"
+  when 503 then "Service Unavailable"
+  when 504 then "Gateway Timeout"
+  else          "Internal Server Error"
+  end
+end

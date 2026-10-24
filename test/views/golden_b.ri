@@ -1,0 +1,259 @@
+# The views tests' `golden/b` goldens (vectors/views_b, from the Rust
+# port's `crates/views/tests/golden/b`): what the reference rendered, as
+# the canonical token stream (`views/dom`), with the request's context
+# and the view model it was rendered from. A page compares region by
+# region (title, the head block, nav, main, footer, sidebar), so the
+# layout's own tags, compared byte for byte elsewhere, are left out.
+module test/views/golden_b
+
+import std/text
+import std/file::{File}
+import std/time::{Time}
+import std/json::{JSON, Any}
+import views/context::{ViewContext, AccountSummary, Assets, CurrentUser, Platform}
+import test/views/dom::{tokens, push_text, VOID}
+import views/messages/messages::{UserView, BoostView, MessageView, MessageContent, TextContent, SoundView, SoundImageView, AttachmentView, RubyNumber}
+
+VECTORS = "#{__DIR__}/../../vectors/views_b"
+
+pub class GoldenB
+  getter name : String
+  getter json : Any
+
+  def initialize(@name : String)
+    @json = JSON.parse(File.read("#{VECTORS}/#{@name}.json"))
+  end
+
+  pub def input : Any
+    @json["input"]
+  end
+
+  # The reference request's context. The layout's stylesheet tags are left
+  # out and the import map is only its module script, which marks where
+  # the page's head block starts.
+  pub def context : ViewContext
+    c = @json["context"]
+    paths = {} of String => String
+    c["assets"].as_h.each { |logical, path| paths[logical] = path.as_s }
+    assets = Assets.new(->(logical : String) { paths[logical]? || raise "#{@name}: unknown asset #{logical}" }, "<script type=\"module\">import \"application\"</script>", "")
+    current_user = nil.as(CurrentUser?)
+    if user = c.as_h["current_user"]?
+      current_user = CurrentUser.new(user["id"].as_i64, user["name"].as_s, user["administrator"].as_bool, user["bot"].as_bool, user["avatar_url"].as_s) unless user.as_h?.nil?
+    end
+    account = c["account"]
+    p = c["platform"]
+    platform = Platform.new
+    platform.ios = flag(p, "ios")
+    platform.android = flag(p, "android")
+    platform.mac = flag(p, "mac")
+    platform.windows = flag(p, "windows")
+    platform.chrome = flag(p, "chrome")
+    platform.firefox = flag(p, "firefox")
+    platform.safari = flag(p, "safari")
+    platform.edge = flag(p, "edge")
+    platform.mobile = flag(p, "mobile")
+    platform.desktop = flag(p, "desktop")
+    platform.apple_messages = flag(p, "apple_messages")
+    platform.browser = p["browser"].as_s? || ""
+    platform.operating_system = p["operating_system"].as_s? || ""
+    last_room = c.as_h["last_room_visited_id"]?
+    ViewContext.new(AccountSummary.new(account["name"].as_s, account["logo_url"].as_s, account["has_logo"].as_bool), assets, current_user,
+      platform: platform, base_url: c["base_url"].as_s, last_room_visited_id: last_room ? last_room.as_i64? : nil)
+  end
+
+  def flag(platform : Any, key : String) : Bool
+    value = platform.as_h[key]?
+    value ? value.as_bool? || false : false
+  end
+
+  # Panics where *html*'s regions part from the reference's.
+  pub def assert_dom(html : String) : Nil
+    expected = without_forgery_tokens(@json["expected"].as_a.map(&.as_s))
+    actual = tokens(html)
+    if @json["kind"].as_s == "page"
+      REGION_NAMES.each do |region|
+        assert_same("#{@name} [#{region}]", region_of(expected, region), region_of(actual, region))
+      end
+    else
+      assert_same(@name, trim_whitespace(expected), trim_whitespace(actual))
+    end
+  end
+end
+
+REGION_NAMES = ["title", "head", "nav", "main", "footer", "sidebar"]
+
+def region_of(stream : Array(String), name : String) : Array(String)
+  region = case name
+           when "title" then element_children(stream) { |t| t == "<title>" }
+           when "head"  then head_block(stream)
+           when "nav"   then element_children(stream) { |t| t.starts_with?("<nav id=\"nav\"") }
+           when "main"
+             main = element_children(stream) { |t| t.starts_with?("<main id=\"main-content\"") }
+             footer = main.index { |t| t.starts_with?("<footer id=\"footer\"") }
+             footer ? slice(main, 0, footer) : main
+           when "footer" then element_children(stream) { |t| t.starts_with?("<footer id=\"footer\"") }
+           else               element_children(stream) { |t| t.starts_with?("<aside id=\"sidebar\"") }
+           end
+  trim_whitespace(region)
+end
+
+# The page's `yield :head`: what's in head after the import map's module
+# script (its start tag, text and end tag).
+def head_block(stream : Array(String)) : Array(String)
+  head = element_children(stream) { |t| t == "<head>" }
+  script = head.rindex { |t| t.starts_with?("<script type=\"module\"") }
+  start = script ? script + 3 : head.size
+  slice(head, start, head.size - start)
+end
+
+def trim_whitespace(stream : Array(String)) : Array(String)
+  first = 0
+  while first < stream.size && stream[first] == "# "
+    first += 1
+  end
+  last = stream.size
+  while last > first && stream[last - 1] == "# "
+    last -= 1
+  end
+  slice(stream, first, last - first)
+end
+
+def element_children(stream : Array(String), & : String -> Bool) : Array(String)
+  start = stream.index { |t| yield t } || return [] of String
+  name = tag_name(stream[start])
+  depth = 0
+  i = start + 1
+  while i < stream.size
+    token = stream[i]
+    if token.starts_with?('<') && !token.starts_with?("</") && tag_name(token) == name && !VOID.includes?(name)
+      depth += 1
+    elsif token == "</#{name}>"
+      return slice(stream, start + 1, i - start - 1) if depth == 0
+      depth -= 1
+    end
+    i += 1
+  end
+  slice(stream, start + 1, stream.size - start - 1)
+end
+
+def tag_name(token : String) : String
+  name = token.lstrip('<').lstrip('/')
+  stop = 0
+  while stop < name.bytesize && name[stop, 1] != " " && name[stop, 1] != ">"
+    stop += 1
+  end
+  name[0, stop]
+end
+
+# The reference's tokens without the CSRF tags and fields Rails renders
+# and this app doesn't, the text around a dropped tag merged as the
+# tokenizer would have merged it.
+def without_forgery_tokens(expected : Array(String)) : Array(String)
+  kept = [] of String
+  expected.each do |token|
+    next if token.starts_with?("<input ") && token.includes?("name=\"authenticity_token\"")
+    next if token.starts_with?("<meta ") && (token.includes?("name=\"csrf-token\"") || token.includes?("name=\"csrf-param\""))
+    token = with_relative_copy_link(token)
+    if token.starts_with?('#')
+      push_text(kept, token[1, token.bytesize - 1])
+    else
+      kept << token
+    end
+  end
+  kept
+end
+
+# A message's "Copy link" button carries the message's path, which the
+# browser makes absolute, not a URL built from the request's host, as the
+# Rust port does (its README, Known differences).
+def with_relative_copy_link(token : String) : String
+  marker = "data-copy-to-clipboard-content-value=\"http"
+  return token unless token.includes?("title=\"Copy link\"")
+  start = token.byte_index(marker) || return token
+  value_start = start + "data-copy-to-clipboard-content-value=\"".bytesize
+  value_end = token.byte_index("\"", value_start) || return token
+  url = token[value_start, value_end - value_start]
+  after_scheme = (url.byte_index("://") || 0) + 3
+  path_start = url.byte_index("/", after_scheme) || url.bytesize
+  path = url[path_start, url.bytesize - path_start]
+  "#{token[0, start]}data-copy-to-clipboard-url-value=\"#{path}\"#{token[value_end + 1, token.bytesize - value_end - 1]}"
+end
+
+def assert_same(label : String, expected : Array(String), actual : Array(String)) : Nil
+  return if expected == actual
+  index = 0
+  while index < expected.size && index < actual.size && expected[index] == actual[index]
+    index += 1
+  end
+  from = index > 4 ? index - 4 : 0
+  STDERR.puts "#{label}: DOM differs at token #{index} (expected #{expected.size} tokens, got #{actual.size})"
+  STDERR.puts "  expected:"
+  slice(expected, from, 10).each { |t| STDERR.puts "    #{t[0, t.bytesize < 300 ? t.bytesize : 300]}" }
+  STDERR.puts "  actual:"
+  slice(actual, from, 10).each { |t| STDERR.puts "    #{t[0, t.bytesize < 300 ? t.bytesize : 300]}" }
+  raise "#{label}: DOM differs"
+end
+
+# `2026-09-26T13:01:08.148296000Z` as a UTC time.
+pub def parse_utc(text : String) : Time
+  nanos = 0
+  if dot = text.byte_index(".")
+    digits = text[dot + 1, text.bytesize - dot - 2]
+    nanos = digits.ljust(9, '0')[0, 9].to_i
+  end
+  Time.utc(text[0, 4].to_i, text[5, 2].to_i, text[8, 2].to_i, text[11, 2].to_i, text[14, 2].to_i, text[17, 2].to_i, nanosecond: nanos)
+end
+
+pub def user_view(json : Any) : UserView
+  UserView.new(json["id"].as_i64, json["name"].as_s, json["title"].as_s, json["avatar_url"].as_s)
+end
+
+# A message of an input, as `messages/_message` takes it.
+pub def message_view(json : Any) : MessageView
+  boosts = json["boosts"].as_a.map do |boost|
+    BoostView.new(boost["id"].as_i64, boost["message_id"].as_i64, boost["content"].as_s, boost["all_emoji"].as_bool, user_view(boost["booster"]))
+  end
+  MessageView.new(json["id"].as_i64, json["client_message_id"].as_s, json["room_id"].as_i64, json["room_name"].as_s, user_view(json["creator"]),
+    parse_utc(json["created_at"].as_s), parse_utc(json["updated_at"].as_s), json["all_emoji"].as_bool, content(json["content"]), boosts)
+end
+
+def content(json : Any) : MessageContent
+  case json["type"].as_s
+  when "text"
+    TextContent.new(json["html"].as_s)
+  when "sound"
+    image = json["image"]
+    shown = image.as_h? ? SoundImageView.new(image["src"].as_s, image["width"].as_i, image["height"].as_i) : nil
+    SoundView.new(json["url"].as_s, shown, json["text"].as_s?)
+  else
+    preview = json["preview"]
+    kind = preview["type"].as_s
+    url = case kind
+          when "video" then preview["poster_url"].as_s
+          when "image" then preview["thumb_url"].as_s
+          else              nil
+          end
+    AttachmentView.new(json["filename"].as_s, json["blob_path"].as_s, json["download_path"].as_s, kind, url, number(json.as_h["width"]?), number(json.as_h["height"]?))
+  end
+end
+
+def number(json : Any?) : RubyNumber?
+  return nil unless json
+  raw = json.raw
+  case raw
+  when Int64   then raw
+  when Float64 then raw
+  else              nil
+  end
+end
+
+# Up to *count* tokens from *start*.
+def slice(stream : Array(String), start : Int32, count : Int32) : Array(String)
+  part = [] of String
+  i = start
+  while i < stream.size && i < start + count
+    part << stream[i]
+    i += 1
+  end
+  part
+end

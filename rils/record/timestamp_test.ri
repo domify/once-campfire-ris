@@ -1,0 +1,24 @@
+# `Timestamp.parse_db` as a driver hands a column: a space or a T between
+# date and time, microseconds or none, a trailing Z or ` UTC`, spaces
+# around; and nil for what is not a time.
+module rils/record/timestamp_test
+
+import rils/record/timestamp::{Timestamp}
+
+def at(text : String) : Tuple(Int64, Int64)?
+  found = Timestamp.parse_db(text)
+  found ? {found.as_second, found.subsec_microsecond} : nil
+end
+
+base = at("2026-09-26 12:24:38") || raise("time")
+assert at("2026-09-26T12:24:38") == base
+assert at("2026-09-26 12:24:38 UTC") == base
+assert at("2026-09-26 12:24:38Z") == base
+assert at("  2026-09-26 12:24:38  ") == base
+assert at("2026-09-26 12:24:38.211309") == {base[0], 211309_i64}
+assert at("2026-09-26 12:24:38.5Z") == {base[0], 500000_i64}
+assert at("2026-09-26 12:24:38.") == nil
+assert at("2026-02-30 12:24:38") == nil
+assert at("2026-09-26 24:00:00") == nil
+assert at("2026-09-26") == nil
+assert at("") == nil

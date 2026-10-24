@@ -1,0 +1,53 @@
+# Views for `reference/app/views/users/push_subscriptions`: the push
+# subscriptions a user has, and the partial for each.
+module views/push_subscriptions
+
+import std/text
+import rils/routes/paths::{user_push_subscription_path, user_push_subscription_test_notifications_path}
+import rils/template/html::{Html}
+import rils/template/recorded::{RecordedPage}
+import rils/template/template::{Template, Buffer}
+import views/context::{ViewContext}
+import views/layouts::{render_in_layout}
+import views/helpers/tag::*
+import views/helpers/assets::{image_tag}
+import views/helpers/forms::{button_to}
+import views/helpers/application::{link_back_to_last_room_visited}
+
+# What a push subscription row shows, with its user agent already parsed.
+pub class PushSubscription
+  getter id : Int64
+  getter endpoint : String
+  getter browser : String
+  getter version : String
+  getter platform : String
+
+  def initialize(@id : Int64, @endpoint : String, @browser : String, @version : String, @platform : String)
+  end
+end
+
+# `users/push_subscriptions/_push_subscription.html.erb`.
+pub class PushSubscriptionItem
+  getter ctx : ViewContext
+  getter push_subscription : PushSubscription
+
+  def initialize(@ctx : ViewContext, @push_subscription : PushSubscription)
+  end
+
+  Template.def_render("users/push_subscriptions/_push_subscription.html.erb")
+end
+
+# `users/push_subscriptions/index.html.erb`.
+pub class Index
+  getter ctx : ViewContext
+  getter push_subscriptions : Array(PushSubscription)
+
+  def initialize(@ctx : ViewContext, @push_subscriptions : Array(PushSubscription))
+  end
+
+  Template.def_page("users/push_subscriptions/index.html.erb")
+
+  pub def page(frame : Bool = false) : RecordedPage
+    render_in_layout(@ctx, "Push notification subscriptions", nil, frame) { |buffer| render_into(buffer) }
+  end
+end

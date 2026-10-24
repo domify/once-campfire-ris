@@ -1,0 +1,46 @@
+# `WelcomeController` (reference/app/controllers/welcome_controller.rb):
+# the root.
+module controllers/welcome
+
+import std/text
+import models/room::{Room}
+import rils/routes/paths::{room_path}
+import rils/kit/ctx::{Ctx, ActionResult}
+import rils/kit/response::{Response}
+import rils/kit/errors::{HttpError}
+import rils/kit/format::{HTML}
+import views/context::{CurrentUser}
+import views/welcome::{Show}
+import config/app::{App}
+import controllers/concerns::{Current, allow_browser, set_version_headers, require_authentication}
+
+# `show`: the last room visited, or the welcome page for a user in no room.
+pub def show_welcome(app : App, c : Ctx) : ActionResult
+  platform = allow_browser(app, c)
+  return platform if platform.is_a?(HttpError)
+  current = require_authentication(app, c)
+  return current if current.is_a?(HttpError)
+  set_version_headers(app, c)
+  if room = last_room_visited(app, c, current)
+    return c.redirect_to(c.url_for(room_path(room.id)))
+  end
+  format = c.respond_to([HTML])
+  return format if format.is_a?(HttpError)
+  user = current.user
+  ctx = app.layout_context(c, CurrentUser.new(user.id, user.name, user.administrator?, user.bot?), platform)
+  app.render_layout(c, 200, "No rooms yet", "sidebar", ctx) { |buffer| Show.new(ctx, user.name).render_into(buffer) }
+end
+
+# `TrackedRoomVisit#last_room_visited`: the `last_room` cookie's room
+# when the user is in it, else `Current.user.rooms.original`. Nil only
+# when the user is in no room (`Current.user.rooms.any?`).
+pub def last_room_visited(app : App, c : Ctx, current : Current) : Room?
+  user_id = current.user.id
+  app.db.read do |conn|
+    found = nil.as(Room?)
+    if (cookie = c.cookies["last_room"]) && (id = cookie.to_i64?)
+      found = Room.find_for_user(conn, user_id, id)
+    end
+    found || Room.original_for_user(conn, user_id)
+  end
+end

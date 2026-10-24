@@ -1,0 +1,237 @@
+# Campfire's Action Text content pipeline: what a stored message body looks
+# like on screen, in the editor and as plain text, and what assigning one
+# stores. A port of the Rust port's `campfire_richtext` crate (html5ever
+# held to Gumbo's behaviour, Loofah's sanitizer, Campfire's presentation
+# filters) over htmlparse, on the tape: each call parses, filters and
+# renders on a tape of its own, and copies only its answer to the heap.
+#
+# The pipeline asks the app what attachments point at (`Resolver`) as it
+# goes.
+module rils/richtext/richtext
+
+import std/text
+import std/int
+import rils/rails_compat/json::{encode_string}
+import rils/richtext/records::*
+import rils/richtext/nodes::{Html, Failure}
+import rils/richtext/content::{Content, attachment_nodes, render_attachment_html}
+import rils/richtext/attachables::{attachment_from_node, action_text_attachable_from_node, Kind}
+import rils/richtext/filters::{apply}
+import rils/richtext/autolink::{auto_link}
+import rils/richtext/sanitizer::{sanitize, defaults, auto_link_list}
+import rils/richtext/chars::{strip, blank?, lossy}
+
+# What Ruby would have raised while rendering; *unrenderable* when its
+# message isn't valid UTF-8, so that logging it raises again.
+pub class RichtextError
+  getter message : String
+  getter unrenderable : Bool
+
+  def initialize(@message : String, @unrenderable : Bool)
+  end
+end
+
+# `messages/_message` shows `messages/_unrenderable` instead.
+pub class Unrenderable
+end
+
+private def error(failure : Failure) : RichtextError
+  RichtextError.new(failure.message, failure.unrenderable)
+end
+
+# The text branch of `message_presentation`: `auto_link
+# h(TextMessagePresentationFilters.apply(message.body.body)), ...`.
+private def message_presentation(
+  body : Str,
+  ctx : RenderContext,
+) : Str | Failure
+  content = Content.load(body, ctx)!
+  filtered = apply(content, ctx)!
+  rendered = filtered.to_rendered_html_with_layout(ctx)!
+  auto_link(rendered, auto_link_list)
+end
+
+# The text branch of `message_presentation`, with its rescue: an exception
+# renders as "", unless logging it raises too.
+pub def present_message(body : String, host : String?, resolver : Resolver) : String | Unrenderable
+  ctx = RenderContext.new(resolver, host)
+  text = lossy(body)
+  result = ""
+  unrenderable = false
+  tape do
+    presented = message_presentation(text.as_tape, ctx)
+    case presented
+    in Failure
+      unrenderable = presented.unrenderable
+    in Str
+      result = presented.to_heap
+    end
+  end
+  unrenderable ? Unrenderable.new : result
+end
+
+# `message.body.to_plain_text`.
+pub def to_plain_text(body : String, host : String?, resolver : Resolver) : String | RichtextError
+  ctx = RenderContext.new(resolver, host)
+  text = lossy(body)
+  result = ""
+  failure = nil
+  tape do
+    content = Content.load(text.as_tape, ctx)
+    if content.is_a?(Failure)
+      failure = content
+    else
+      plain = content.to_plain_text(ctx)
+      if plain.is_a?(Failure)
+        failure = plain
+      else
+        result = plain.to_heap
+      end
+    end
+  end
+  if f = failure
+    return error(f)
+  end
+  result
+end
+
+# The value Lexxy's editor gets: `RichTextHelper#editable_body`, then
+# Lexxy's `render_custom_attachments_in`; nil for a blank body.
+pub def editable_value(body : String, host : String?, resolver : Resolver) : String? | RichtextError
+  ctx = RenderContext.new(resolver, host)
+  text = lossy(body)
+  result = nil
+  failure = nil
+  tape do
+    value = editable(text.as_tape, ctx)
+    case value
+    in Failure
+      failure = value
+    in Str
+      result = value.to_heap
+    in Nil
+    end
+  end
+  if f = failure
+    return error(f)
+  end
+  result
+end
+
+private def editable(body : Str, ctx : RenderContext) : Str? | Failure
+  # editable_body: every attachment rebuilt from its attachable, on the
+  # stored markup as it is
+  tree = Html.new
+  root = tree.parse_fragment(strip(body))!
+  attachment_nodes(tree, root).each do |node|
+    attachment = attachment_from_node(tree, node, ctx)!
+    # A mention of a deleted user: nothing to edit, so it leaves the
+    # editor (Rails raises).
+    if attachment.attachable.kind == Kind::Missing
+      tree.detach(node)
+      next
+    end
+    content_type = attachment.attachable.attachable_content_type!
+    html = render_attachment_html(attachment, ctx, 0)!
+    tree.set_attr(node, "content-type", Str.new(content_type))
+    tree.set_attr(node, "content", html)
+  end
+  editable = tree.to_html(root)
+  return nil if blank?(editable)
+
+  # Lexxy: attachments without a url get their rendered partial as a JSON
+  # string
+  tree = Html.new
+  root = tree.parse_fragment(strip(editable))!
+  attachment_nodes(tree, root).each do |node|
+    next if tree.has_attr?(node, "url") && !blank?(tree.attr(node, "url"))
+    attachment = attachment_from_node(tree, node, ctx)!
+    html = render_attachment_html(attachment, ctx, 0)!
+    tree.set_attr(node, "content", Str.new(encode_string(html.to_heap)))
+  end
+  tree.to_html(root)
+end
+
+# `Message::Mentionee#mentioned_users`' ids: users attached with a
+# verified SGID, once each, in document order.
+pub def mentioned_user_ids(body : String, host : String?, resolver : Resolver) : Array(Int64) | RichtextError
+  ctx = RenderContext.new(resolver, host)
+  text = lossy(body)
+  ids = [] of Int64
+  failure = nil
+  tape do
+    content = Content.load(text.as_tape, ctx)
+    if content.is_a?(Failure)
+      failure = content
+    else
+      attachment_nodes(content.tree, content.root).each do |node|
+        attachable = action_text_attachable_from_node(content.tree, node, ctx)
+        if user = attachable.user
+          ids << user.id unless ids.includes?(user.id)
+        end
+      end
+    end
+  end
+  if f = failure
+    return error(f)
+  end
+  ids
+end
+
+# What assigning *body* stores
+# (`ActionText::Content.new(body, canonicalize: true).to_html`); the body
+# as given when it doesn't load.
+pub def canonical_body(body : String, host : String?, resolver : Resolver) : String
+  ctx = RenderContext.new(resolver, host)
+  text = lossy(body)
+  result = text
+  tape do
+    content = Content.load(text.as_tape, ctx)
+    result = content.to_html.to_heap unless content.is_a?(Failure)
+  end
+  result
+end
+
+# `message.body.to_s`: the body rendered in its `lexxy-content` layout;
+# "" where rendering raises.
+pub def rendered_body(body : String, host : String?, resolver : Resolver) : String
+  ctx = RenderContext.new(resolver, host)
+  text = lossy(body)
+  result = ""
+  tape do
+    content = Content.load(text.as_tape, ctx)
+    unless content.is_a?(Failure)
+      rendered = content.to_rendered_html_with_layout(ctx)
+      result = rendered.to_heap unless rendered.is_a?(Failure)
+    end
+  end
+  result
+end
+
+# `sanitize(strip_tags(text))`, as `Opengraph::Metadata` cleans a title or
+# a description (Rails::HTML5::FullSanitizer, then the SafeListSanitizer's
+# defaults); nil where Rails raises.
+pub def strip_and_sanitize(text : String) : String?
+  input = lossy(text)
+  result = nil
+  tape do
+    stripped = strip_tags(input.as_tape)
+    unless stripped.is_a?(Failure)
+      sanitized = sanitize(stripped, defaults)
+      result = sanitized.to_heap unless sanitized.is_a?(Failure)
+    end
+  end
+  result
+end
+
+private def strip_tags(html : Str) : Str | Failure
+  return html if html.empty?
+  tree = Html.new
+  fragment = tree.parse_fragment(html)!
+  text = Str::Builder.new(html.bytesize)
+  tree.descendants(fragment).each { |node| text << tree.text(node) if tree.text?(node) }
+  output = tree.new_fragment
+  joined = text.finish
+  tree.append(output, tree.create_text(joined)) unless joined.empty?
+  tree.to_html(output)
+end

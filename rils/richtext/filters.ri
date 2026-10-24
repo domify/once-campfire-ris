@@ -1,0 +1,98 @@
+# `ContentFilters::TextMessagePresentationFilters`: RemoveSoloUnfurledLinkText,
+# SanitizeTags, SanitizeAttributes, in that order (the Rust port's
+# richtext/src/filters.rs).
+module rils/richtext/filters
+
+import std/int
+import std/text
+import rils/ruby/uri_parser::{parse_uri, Uri, UriError}
+import rils/richtext/nodes::{Html, Failure}
+import rils/richtext/records::{RenderContext}
+import rils/richtext/content::{Content, ATTACHMENT_TAG}
+import rils/richtext/attachables::{opengraph_embed_from_node, OpengraphEmbed, OPENGRAPH_EMBED_CONTENT_TYPE}
+import rils/richtext/sanitizer::{sanitize, content_filter, SANITIZE_TAGS_ALLOWED_TAGS}
+import rils/richtext/chars::{blank?, strip}
+
+pub def apply(content : Content, ctx : RenderContext) : Content | Failure
+  content = remove_solo_unfurled_link_text(content, ctx)!
+  content = sanitize_tags(content)
+  sanitize_attributes(content)
+end
+
+# A message that is nothing but a link to what it unfurls shows just the
+# unfurl.
+pub def remove_solo_unfurled_link_text(content : Content, ctx : RenderContext) : Content | Failure
+  tree = content.tree
+  root = content.root
+  unfurled = Ary(Int32).new
+  tree.descendants(root).each do |n|
+    if tree.named?(n, ATTACHMENT_TAG) && tree.has_attr?(n, "content-type") &&
+       tree.attr(n, "content-type") == OPENGRAPH_EMBED_CONTENT_TYPE
+      unfurled << n
+    end
+  end
+  solo = nil
+  if unfurled.size == 1
+    embed = opengraph_embed_from_node(tree, unfurled[0], ctx)!
+    if embed.is_a?(OpengraphEmbed) && embed.href.present
+      solo = embed.href.text.to_heap
+    end
+  end
+  plain_text = content.to_plain_text(ctx)!
+  applicable = normalize_tweet_url(solo)! == normalize_tweet_url(plain_text.to_heap)!
+  return content unless applicable
+
+  is_trix_body = tree.descendants(root).any? { |n| tree.named?(n, "div") }
+  if is_trix_body
+    # Every div gets the unfurl as its only content
+    unfurl = tree.to_html(unfurled[0])
+    divs = Ary(Int32).new
+    tree.descendants(root).each { |n| divs << n if tree.named?(n, "div") }
+    divs.each { |div| tree.set_inner_html(div, unfurl)! }
+  else
+    paragraphs = Ary(Int32).new
+    tree.descendants(root).each { |n| paragraphs << n if tree.named?(n, "p") }
+    paragraphs.each do |p|
+      has_attachment = tree.descendants(p).any? { |n| tree.named?(n, ATTACHMENT_TAG) }
+      tree.detach(p) unless has_attachment
+    end
+  end
+  content
+end
+
+TWITTER_DOMAINS = ["x.com", "twitter.com"]
+
+pub def normalize_tweet_url(url : String?) : String? | Failure
+  return nil unless url
+  twitter = !blank?(url.as_tape) && TWITTER_DOMAINS.any? { |domain| strip(url.as_tape).to_heap.includes?(domain) }
+  return url unless twitter
+  parsed = parse_uri(url)
+  case parsed
+  in UriError
+    return Failure.raised("URI::InvalidComponentError") if parsed.component
+    url
+  in Uri
+    parsed.host = "twitter.com" if (host = parsed.host) && host.downcase == "x.com"
+    parsed.query = nil
+    parsed.to_s
+  end
+end
+
+# SanitizeTags: every element outside the allowlist goes, with its content.
+pub def sanitize_tags(content : Content) : Content
+  tree = content.tree
+  disallowed = Ary(Int32).new
+  tree.descendants(content.root).each do |n|
+    next unless tree.element?(n)
+    name = tree.local_name(n)
+    disallowed << n unless SANITIZE_TAGS_ALLOWED_TAGS.any? { |tag| name == tag }
+  end
+  disallowed.each { |n| tree.detach(n) }
+  content
+end
+
+# SanitizeAttributes: Rails' safe-list sanitizer over SanitizeTags' tags.
+pub def sanitize_attributes(content : Content) : Content | Failure
+  html = sanitize(content.to_html, content_filter)!
+  Content.wrap(html)
+end

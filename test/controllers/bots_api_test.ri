@@ -1,0 +1,129 @@
+# `test/controllers/messages/by_bots_controller_test.rb` and the boosts'
+# by-bots tests, through the drawn routes.
+module test/controllers/bots_api_test
+
+import std/text
+import std/json::{JSON}
+import std/file::{File}
+import std/dir::{Dir}
+import rils/rails_compat/global_id::{GlobalId, attachable_sgid}
+import test/models/testing::{id}
+import models/message::{Message, NewMessage}
+import models/boost::{Boost}
+import models/user::{User}
+import rils/record/events::{DeliverWebhook}
+import rils/kit/params::{RawPair, UploadedFile}
+import rils/storage/blob::{Blob}
+import test/testing::*
+import web/web/spec::*
+
+def bot_key(client : Client) : String
+  (client.t.read { |conn| User.find_by_id(conn, id("bender")) } || raise "no bender").bot_key
+end
+
+def last_plain(client : Client) : String
+  client.t.read { |conn| (Message.last(conn) || raise "none").plain_text_body(conn, client.app.db.env.rich_text) }
+end
+
+def count(client : Client) : Int64
+  client.t.read { |conn| Message.count(conn) }
+end
+
+describe "the bot messages API" do
+  it "creates messages from the raw body, UTF-8 included" do
+    client = Client.new
+    room = id("watercooler")
+    before = count(client)
+    response = client.submit("POST", "/rooms/#{room}/#{bot_key(client)}/messages", "Hello Bot World!")
+    assert response.status == 201
+    assert (response["location"] || "").starts_with?("http://once.campfire.test/messages/")
+    assert last_plain(client) == "Hello Bot World!"
+    client.submit("POST", "/rooms/#{room}/#{bot_key(client)}/messages", "Hello 👋!")
+    assert last_plain(client) == "Hello 👋!"
+    assert count(client) == before + 2
+  end
+
+  it "creates a message with a file" do
+    client = Client.new
+    path = "#{Dir.tempdir}/campfire-bot-moon.jpg"
+    File.write(path, File.read("#{__DIR__}/../../reference/test/fixtures/files/moon.jpg"))
+    response = client.submit_pairs("POST", "/rooms/#{id("watercooler")}/#{bot_key(client)}/messages", [RawPair.new("attachment", UploadedFile.new("moon.jpg", "image/jpeg", "", File.size(path), path))])
+    assert response.status == 201
+    assert !client.t.read { |conn| Blob.attached(conn, "Message", (Message.last(conn) || raise "none").id, "attachment") }.nil?
+  end
+
+  it "doesn't call the sending bot's own webhook" do
+    client = Client.new
+    sgid = attachable_sgid(client.app.secrets, GlobalId.new("User", id("bender")))
+    body = "<div>Hey <action-text-attachment sgid=\"#{sgid}\" content-type=\"application/vnd.campfire.mention\"></action-text-attachment></div>"
+    client.submit("POST", "/rooms/#{id("watercooler")}/#{bot_key(client)}/messages", body)
+    client.submit("POST", "/rooms/#{id("bender_and_kevin")}/#{bot_key(client)}/messages", "Talking to myself again!")
+    assert client.app.jobs.pending.none?(&.is_a?(DeliverWebhook))
+  end
+
+  it "refuses a blank body, a forged key and other rooms" do
+    client = Client.new
+    before = count(client)
+    room = id("watercooler")
+    assert client.submit("POST", "/rooms/#{room}/#{bot_key(client)}/messages", "").status == 422
+    assert client.submit("POST", "/rooms/#{room}/#{bot_key(client)}/messages", "   ").status == 422
+    assert client.submit("POST", "/rooms/#{id("bender_and_kevin")}/#{id("kevin")}-/messages", "Hello 👋!").status == 302
+    assert client.submit("POST", "/rooms/#{id("designers")}/#{bot_key(client)}/messages", "Hello!").status == 404
+    assert count(client) == before
+  end
+
+  it "lists the room's messages, paging with the Link header" do
+    client = Client.new
+    room = id("watercooler")
+    client.t.write do |tx|
+      n = 40 - Message.count_in_room(tx.conn, room) + 1
+      n.times { |i| Message.create(tx, NewMessage.new(room, id("jason"), "filler-#{i}", "Filler #{i}")) }
+    end
+    first = client.get("/rooms/#{room}/#{bot_key(client)}/messages")
+    assert first.status == 200
+    json = JSON.parse(body(first)).as_a
+    assert json.size == 40
+    assert first["x-total-count"] == "41"
+    link = first["link"] || raise "no link"
+    query = link.partition('?')[2].partition('>')[0]
+    second = client.get("/rooms/#{room}/#{bot_key(client)}/messages", query)
+    assert JSON.parse(body(second)).as_a.map(&.["id"].as_i64) == [id("fourth")]
+    assert second["link"].nil?
+    details = json.last
+    got = JSON.parse(body(second)).as_a.map(&.["id"].as_i64)
+    raise "#{got} #{id("fourth")} #{link}" unless got == [id("fourth")]
+    assert details["body"]["html"].as_s.includes?("lexxy-content")
+    assert details["url"].as_s == "http://once.campfire.test/rooms/#{room}/messages/#{details["id"].as_i64}"
+  end
+
+  it "is empty for a room without messages, and needs a valid key" do
+    client = Client.new
+    empty = client.get("/rooms/#{id("bender_and_kevin")}/#{bot_key(client)}/messages")
+    assert body(empty) == "[]"
+    assert empty["x-total-count"] == "0"
+    assert client.get("/rooms/#{id("watercooler")}/invalid-bot-key/messages").status == 302
+  end
+
+  it "keeps the regular messages and rooms pages from bots" do
+    client = Client.new
+    assert client.get("/rooms/#{id("watercooler")}/messages", "bot_key=#{bot_key(client)}").status == 403
+  end
+end
+
+describe "the bot boosts API" do
+  it "boosts with the raw body and removes the bot's own boost" do
+    client = Client.new
+    room = id("watercooler")
+    message = client.t.read { |conn| Message.last_page(conn, room).last }
+    response = client.submit("POST", "/rooms/#{room}/#{bot_key(client)}/messages/#{message.id}/boosts", "🤖")
+    assert response.status == 201
+    json = JSON.parse(body(response))
+    assert json["content"].as_s == "🤖"
+    assert json["booster"]["name"].as_s == "Bender Bot"
+    boost_id = json["id"].as_i64
+    assert client.submit("DELETE", "/rooms/#{room}/#{bot_key(client)}/messages/#{message.id}/boosts/#{boost_id}", "").status == 204
+    assert client.t.read { |conn| Boost.for_message(conn, message.id).none? { |b| b.id == boost_id } }
+    assert client.submit("POST", "/rooms/#{room}/#{bot_key(client)}/messages/#{message.id}/boosts", " ").status == 422
+    assert client.submit("POST", "/rooms/#{room}/#{bot_key(client)}/messages/1/boosts", "x").status == 404
+  end
+end

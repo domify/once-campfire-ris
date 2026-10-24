@@ -1,0 +1,27 @@
+<%# reference/app/views/accounts/users/_user.html.erb -%>
+<li class="flex align-center gap margin-none <% if user.banned? %>banned<% end %>">
+  <figure class="avatar flex-item-no-shrink" style="--avatar-size: 3.75ch;">
+    <%= avatar_tag(ctx, user.avatar, attrs.loading("lazy")) %>
+  </figure>
+
+  <div class="min-width">
+    <div class="overflow-ellipsis fill-shade"><strong><%= user.name %></strong></div>
+  </div>
+
+  <hr class="separator" aria-hidden="true">
+
+<% if ctx.can_administer? && user.active? %><% if !user.bot? %><% form = form_with(account_user_path(user.id)).model("user").data("controller", "form").method("patch") %>      <%= form.wrap do %>
+        <label class="btn txt-small flex-item-no-shrink" for="<%= dom_id("user", user.id, "role") %>">
+          <span class="for-screen-reader">Role: <% if user.administrator? %>Administrator<% else %>Member<% end %></span>
+          <%= image_tag(ctx, "crown.svg", attrs.size(20).aria_hidden) %>
+          <%= form.check_box("role", attrs.data("action", "form#submit").hidden.id(dom_id("user", user.id, "role")).disabled(ctx.current_user?(user.id)), "administrator", "member", user.role) %>
+        </label>
+<% end %><% end %>
+<% if !ctx.current_user?(user.id) %>      <%= button_to(account_user_path(user.id), attrs.method("delete").class("btn txt-small flex-item-no-shrink btn--negative").data("turbo_confirm", "Are you sure you want to permanently remove this person from the account? This can’t be undone.")) do %>
+        <%= image_tag(ctx, "minus.svg", attrs.size(20).aria_hidden) %>
+        <span class="for-screen-reader">Delete <%= user.name %></span>
+<% end %><% end %><% end %><% if ctx.current_user?(user.id) %>    <%= link_to(user_profile_path, attrs.class("btn txt-small flex-item-no-shrink").target("_top")) do %>
+      <%= image_tag(ctx, "pencil.svg", attrs.size(20).aria_hidden) %>
+      <span class="for-screen-reader">My settings</span>
+<% end %><% end %></li>
+

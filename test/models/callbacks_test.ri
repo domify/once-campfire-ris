@@ -1,0 +1,160 @@
+# Callback side effects, checked against what the reference app's SQL log
+# shows for the same operations.
+module test/models/callbacks_test
+
+import std/time::{Span}
+import std/text
+import rils/record/sqlite::{SqlValue}
+import rils/record/timestamp::{Timestamp}
+import rils/record/events::{PushMessage}
+import test/models/testing::*
+import models/room::{Room, Membership, Involvement}
+import models/message::{Message, NewMessage, create_boost, destroy_boost}
+import models/boost::{Boost}
+import models/session::{Session}
+import models/search::{Search}
+import web/web/spec::*
+
+def fts_body(t : TestDb, message_id : Int64) : String?
+  t.conn.query_one("SELECT body FROM message_search_index WHERE rowid = ?", [message_id] of SqlValue) { |row| row.text(0) }
+end
+
+describe "creating a message" do
+  it "touches the room, marks disconnected members unread and indexes after commit" do
+    t = TestDb.new
+    t.write { |tx| found(Membership.find(tx.conn, id("jz_designers"))).connected(tx) }
+    room_before = found(Room.find(t.conn, id("designers")))
+    t.travel(1)
+    message = t.write { |tx| Message.create(tx, NewMessage.new(id("designers"), id("david"), "abc", "Hello <b>there</b>")) }
+
+    # The body touches the message; the room is touched too.
+    assert message.updated_at >= message.created_at
+    assert found(Room.find(t.conn, id("designers"))).updated_at > room_before.updated_at
+
+    # Unread: visible, disconnected, not the creator; unread_at is the
+    # message's created_at.
+    unread = ->(label : String) { found(Membership.find(t.conn, id(label))).unread_at }
+    assert unread.call("jason_designers") == message.created_at
+    assert unread.call("kevin_designers") == message.created_at
+    assert unread.call("jz_designers").nil?, "connected"
+    assert unread.call("david_designers").nil?, "creator"
+
+    assert fts_body(t, message.id) == "Hello there"
+    assert t.events.size == 1
+    event = t.events[0]
+    assert event.is_a?(PushMessage) && event.room_id == id("designers") && event.message_id == message.id
+
+    body = t.conn.query_one("SELECT body, record_type, record_id FROM action_text_rich_texts WHERE record_id = ?", [message.id] of SqlValue) { |row| {row.text(0), row.text(1), row.int(2)} }
+    assert body == {"Hello <b>there</b>", "Message", message.id}
+  end
+
+  it "doesn't mark invisible members unread" do
+    t = TestDb.new
+    t.write { |tx| found(Membership.find(tx.conn, id("kevin_designers"))).update_involvement(tx, Involvement::Invisible) }
+    t.write { |tx| Message.create(tx, NewMessage.new(id("designers"), id("david"), body: "x")) }
+    assert found(Membership.find(t.conn, id("kevin_designers"))).unread_at.nil?
+  end
+
+  it "emits nothing after commit when the write rolls back" do
+    t = TestDb.new
+    t.write do |tx|
+      Message.create(tx, NewMessage.new(id("designers"), id("david"), body: "x"))
+      tx.roll_back
+    end
+    assert t.events.empty?
+    assert Message.count(t.conn) == 13
+  end
+end
+
+describe "boosts" do
+  it "touch the message and room and reindex" do
+    t = TestDb.new
+    first = found(Message.find(t.conn, id("first")))
+    room_before = found(Room.find(t.conn, id("designers")))
+    t.travel(1)
+    boost = t.write { |tx| create_boost(tx, found(Message.find(tx.conn, id("first"))), id("jason"), "hi") }
+    touched = found(Message.find(t.conn, id("first")))
+    assert touched.updated_at > first.updated_at
+    assert found(Room.find(t.conn, id("designers"))).updated_at > room_before.updated_at
+    # The fixture message was never indexed; the after_commit update finds
+    # no row, as in Rails.
+    assert fts_body(t, first.id).nil?
+
+    t.travel(1)
+    t.write { |tx| destroy_boost(tx, boost) }
+    assert found(Message.find(t.conn, id("first"))).updated_at > touched.updated_at
+    assert Boost.for_message(t.conn, id("first")).size == 1
+  end
+
+  it "are ordered by creation" do
+    t = TestDb.new
+    t.travel(1)
+    t.write { |tx| create_boost(tx, found(Message.find(tx.conn, id("first"))), id("jason"), "2") }
+    contents = found(Message.find(t.conn, id("first"))).boosts(t.conn).map(&.content)
+    assert contents == ["Hello", "2"]
+  end
+end
+
+describe "sessions" do
+  it "start and resume" do
+    t = TestDb.new
+    david = id("david")
+    session = t.write { |tx| Session.start(tx, david, "ua", "1.2.3.4") }
+    assert session.token.bytesize == 24
+    assert session.token.chars.all? { |c| c.ascii_alphanumeric? && !"0OIl".includes?(c.to_s) }
+    found_session = Session.find_by_token(t.conn, session.token)
+    assert !found_session.nil? && found_session.id == session.id
+
+    # Within the hour: nothing is written.
+    t.write { |tx| session.resume(tx, "ua2", "9.9.9.9") }
+    assert found(Session.find(t.conn, session.id)).user_agent == "ua"
+
+    t.travel(3601)
+    t.write { |tx| session.resume(tx, "ua2", "9.9.9.9") }
+    reloaded = found(Session.find(t.conn, session.id))
+    assert reloaded.user_agent == "ua2" && reloaded.ip_address == "9.9.9.9"
+    assert reloaded.last_active_at > found(Session.find(t.conn, session.id)).created_at
+  end
+
+  it "resumes the fixture session because it is two hours old" do
+    t = TestDb.new
+    session = found(Session.find(t.conn, id("david_safari")))
+    t.write { |tx| session.resume(tx, "ua", "9.9.9.9") }
+    assert found(Session.find(t.conn, id("david_safari"))).ip_address == "9.9.9.9"
+  end
+end
+
+describe "searches" do
+  it "keep the ten most recent" do
+    t = TestDb.new
+    david = id("david")
+    12.times do |n|
+      t.travel(1)
+      t.write { |tx| Search.record(tx, david, "query #{n}") }
+    end
+    searches = Search.ordered_for_user(t.conn, david)
+    # The 12th creation trims to ten before its touch.
+    assert searches.size == 10
+    assert searches[0].query == "query 11"
+    assert !searches.any? { |s| s.query == "pizza" }
+
+    t.travel(1)
+    t.write { |tx| Search.record(tx, david, "query 5") }
+    assert Search.ordered_for_user(t.conn, david)[0].query == "query 5"
+  end
+end
+
+describe "timestamps" do
+  it "are written like Active Record" do
+    t = TestDb.new
+    t.travel_to(Timestamp.parse_db("2026-09-26 12:34:56.123456") || raise("time"))
+    message = t.write { |tx| Message.create(tx, NewMessage.new(id("hq"), id("david"), body: "x")) }
+    stored = t.conn.query_one("SELECT created_at, typeof(created_at) FROM messages WHERE id = ?", [message.id] of SqlValue) { |row| {row.text(0), row.text(1)} }
+    assert stored == {"2026-09-26 12:34:56.123456", "text"}
+
+    t.travel_to(Timestamp.parse_db("2026-09-26 12:00:00") || raise("time"))
+    message = t.write { |tx| Message.create(tx, NewMessage.new(id("hq"), id("david"), body: "y")) }
+    created_at = t.conn.query_one("SELECT created_at FROM messages WHERE id = ?", [message.id] of SqlValue) { |row| row.text(0) }
+    assert created_at == "2026-09-26 12:00:00", "no fraction when microseconds are zero"
+  end
+end

@@ -1,0 +1,30 @@
+<%# reference/app/views/rooms/show.html.erb -%>
+
+<%- content_for "head" do %>
+  <meta name="turbo-cache-control" content="no-preview">
+  <meta name="current-room-id" content="<%= show.room.id %>">
+<%- end %>
+
+<%- content_for "nav" do %><% room = show.room %><% include "rooms/show/_nav.html.erb" %><% end %>
+
+<%- content_for "sidebar" do %><%= sidebar_turbo_frame_tag(user_sidebar_path, Html.new("")) %><% end %>
+
+<div id="message-area" class="message-area" contents="true" data-controller="messages presence drop-target" data-action="turbo:before-stream-render@document-&gt;messages#beforeStreamRender keydown.up@document-&gt;messages#editMyLastMessage dragenter-&gt;drop-target#dragenter dragover-&gt;drop-target#dragover drop-&gt;drop-target#drop visibilitychange@document-&gt;presence#visibilityChanged" data-messages-first-of-day-class="message--first-of-day" data-messages-formatted-class="message--formatted" data-messages-me-class="message--me" data-messages-mentioned-class="message--mentioned" data-messages-threaded-class="message--threaded" data-messages-page-url-value="<%= ctx.url(room_messages_path(show.room.id)) %>">
+  <%- user = show.user %>
+  <% include "messages/_template.html.erb" %>
+
+  <div id="<%= show.room.dom_id("messages") %>" class="messages" data-controller="maintain-scroll refresh-room" data-action="turbo:before-stream-render@document-&gt;maintain-scroll#beforeStreamRender visibilitychange@document-&gt;refresh-room#visibilityChanged online@window-&gt;refresh-room#online" data-messages-target="messages" data-refresh-room-loaded-at-value="<%= loaded_at %>" data-refresh-room-url-value="<%= ctx.url(room_refresh_path(show.room.id)) %>">
+    <%- if show.invitation %>
+    <%- join_code = show.join_code %>
+    <% include "rooms/show/_invitation.html.erb" %>
+    <%- end %>
+    <%- show.messages.each do |message| %>
+    <%= message %>
+    <%- end %>
+  </div>
+
+  <turbo-cable-stream-source channel="RoomMessagesChannel" signed-stream-name="<%= show.messages_stream_name %>"></turbo-cable-stream-source>
+  <button class="message-area__return-to-latest btn" data-action="messages#returnToLatest" data-messages-target="latest" hidden="hidden"><img aria-hidden="true" src="<%= ctx.asset("arrow-down.svg") %>" width="20" height="20" /><span class="for-screen-reader">Jump to newest message</span></button>
+</div>
+
+<%- content_for "footer" do %><% room = show.room %><% include "rooms/show/_composer.html.erb" %><% end %>

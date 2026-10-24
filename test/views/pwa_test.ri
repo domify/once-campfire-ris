@@ -1,0 +1,47 @@
+# The `pwa` partials for each platform the reference rendered them for,
+# byte for byte (vectors/views).
+module test/views/pwa_test
+
+import std/text
+import views/pwa::{BrowserSettings, SystemSettings, InstallInstructions, Manifest, ServiceWorker}
+import std/json::{JSON}
+import views/context::{AccountSummary, Assets, ViewContext}
+import test/views/golden::{golden_case, golden_context, golden_page, golden_file, golden_platform_labels}
+import test/views/testing::{assert_same}
+import web/web/spec::*
+
+describe "pwa partials" do
+  it "render as the reference does on every platform" do
+    golden_platform_labels.each do |ua|
+      ["browser_settings", "system_settings", "install_instructions"].each do |kind|
+        name = "#{kind}_#{ua}"
+        ctx = golden_context(name)
+        html = case kind
+               when "browser_settings" then BrowserSettings.new(ctx).render
+               when "system_settings"  then SystemSettings.new(ctx).render
+               else                         InstallInstructions.new(ctx).render
+               end
+        assert_same(name, golden_page(name), html.to_s)
+      end
+    end
+  end
+end
+
+describe "pwa/manifest and pwa/service_worker" do
+  it "render as the reference does, the manifest's values as JSON" do
+    name = "manifest"
+    account = golden_case(name)["account"]
+    json = Manifest.new(golden_context(name), account["name"].as_s, account["logo_path_small"].as_s, account["logo_path"].as_s).render.to_s
+    # Rails HTML-escapes the values into the JSON.
+    assert_same(name, golden_file(name, "json").gsub("&amp;", "&"), json)
+    assert_same("service_worker", golden_file("service_worker", "js"), ServiceWorker.new.render.to_s)
+  end
+
+  it "keep the manifest valid JSON whatever the account is called" do
+    name = "Back\\slash \"quoted\" <b>&amp;</b>"
+    ctx = ViewContext.new(AccountSummary.new(name), Assets.new(->(logical : String) { "/assets/#{logical}" }, "", ""))
+    manifest = JSON.parse(Manifest.new(ctx, name, "/account/logo?size=small&v=1", "/account/logo?v=1").render.to_s)
+    assert manifest["name"].as_s == name
+    assert manifest["icons"][0]["src"].as_s == "/account/logo?size=small&v=1"
+  end
+end

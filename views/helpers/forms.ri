@@ -1,0 +1,288 @@
+# `form_with`, its `FormBuilder` fields, `button_to`, `hidden_field_tag` and
+# `button_tag`, reproducing ActionView's attribute order (`form_helper.rb`,
+# `form_tag_helper.rb`, `tags/*.rb` and `url_helper.rb#button_to`).
+#
+# A form's block renders before its `<form>` tag is built, which is how
+# Rails learns about `multipart` from a `file_field`:
+#
+#   <% form = form_with(first_run_path).model("user").class("center") %>
+#   <%= form.wrap do %>
+#     <%= form.text_field("name", user.name, attrs.class("input")) %>
+#   <% end %>
+module views/helpers/forms
+
+import std/text
+import rils/template/html::{Html, escape}
+import views/helpers/tag::*
+
+# The hidden `_method` field (`method_tag`).
+pub def method_tag(method : String) : Html
+  legacy_tag("input", attrs.type("hidden").name("_method").value(method))
+end
+
+# Whether a form has a file field, shared by a form and its `fields_for`.
+class Multipart
+  property on : Bool = false
+
+  def initialize
+  end
+end
+
+# `form_with(url:, model:, method:, id:, class:, data:)`.
+pub class FormWith
+  @action : String
+  @method : String
+  @object_name : String?
+  @id : String?
+  @class : String?
+  @data : Attrs
+  @multipart : Multipart
+
+  def initialize(@action : String)
+    @method = "post"
+    @object_name = nil
+    @id = nil
+    @class = nil
+    @data = Attrs.new
+    @multipart = Multipart.new
+  end
+
+  def initialize(@action : String, @method : String, @object_name : String?, @id : String?, @class : String?, @data : Attrs, @multipart : Multipart)
+  end
+
+  # `model:`: the param key fields are scoped under ("user", "account").
+  def model(param_key : String) : FormWith
+    @object_name = param_key
+    self
+  end
+
+  # `method:`; a persisted `model:` implies "patch", so pass it for those too.
+  def method(method : String) : FormWith
+    @method = method
+    self
+  end
+
+  def id(id : String) : FormWith
+    @id = id
+    self
+  end
+
+  def class(name : String) : FormWith
+    @class = name
+    self
+  end
+
+  def data(key : String, value : AttrValue) : FormWith
+    @data = @data.dup.data(key, value)
+    self
+  end
+
+  # `auto_submit_form_with` (`FormsHelper`): prepends the auto-submit
+  # Stimulus controller.
+  def auto_submit : FormWith
+    existing = @data.get_str("data-controller") || ""
+    @data = @data.dup
+    @data.set("data-controller", "auto-submit #{existing}".strip)
+    self
+  end
+
+  # `multipart: true`; also set by any `file_field`.
+  def multipart : FormWith
+    @multipart.on = true
+    self
+  end
+
+  # `<form ...>` plus the `_method` hidden field (`html_options_for_form_with`
+  # + `extra_tags_for_form`). No `authenticity_token`: forgery protection is
+  # by `Sec-Fetch-Site`.
+  def open : Html
+    Html.new(String.build { |io| open_into(io) })
+  end
+
+  private def open_into(io : String::Builder) : Nil
+    html = attrs.attr("id", @id).attr("class", @class).merge(@data)
+    html.attr("enctype", "multipart/form-data") if @multipart.on
+    method = @method.downcase
+    form_method = method == "get" ? "get" : "post"
+    html.attr("action", @action).attr("accept-charset", "UTF-8").attr("method", form_method)
+    io << "<form"
+    html.render_into(io)
+    io << ">"
+    io << method_tag(method).to_s unless method == "get" || method == "post" || method.empty?
+  end
+
+  # The whole form around already-rendered *content* (a block-less
+  # `form_with` passes an empty one).
+  def wrap(content : Html) : Html
+    Html.new(String.build do |io|
+      open_into(io)
+      io << content.to_s
+      io << "</form>"
+    end)
+  end
+
+  # `form_with ... do |form| ... end`: the block renders first.
+  def wrap(& : -> Html) : Html
+    wrap(yield)
+  end
+
+  def text_field(method : String, value : String?, options : Attrs = Attrs.new) : Html
+    input_field("text", method, value, options)
+  end
+
+  def email_field(method : String, value : String?, options : Attrs = Attrs.new) : Html
+    input_field("email", method, value, options)
+  end
+
+  def url_field(method : String, value : String?, options : Attrs = Attrs.new) : Html
+    input_field("url", method, value, options)
+  end
+
+  # Password fields never render the model's value
+  # (`{ value: nil }.merge!(options)`).
+  def password_field(method : String, options : Attrs = Attrs.new) : Html
+    input_field("password", method, nil, attrs.attr("value", nil).merge(options))
+  end
+
+  def hidden_field(method : String, value : String?, options : Attrs = Attrs.new) : Html
+    input_field("hidden", method, value, options)
+  end
+
+  def file_field(method : String, options : Attrs = Attrs.new) : Html
+    input_field("file", method, nil, options)
+  end
+
+  # `Tags::TextArea#render`: the value is the element's content, after a
+  # newline.
+  def text_area(method : String, value : String?, options : Attrs = Attrs.new) : Html
+    options = options.dup
+    add_default_name_and_id(method, options)
+    given = options.remove("value")
+    content = if given.nil?
+                value ? escape(value) : ""
+              else
+                escape(value_to_s(given))
+              end
+    content_tag("textarea", options, Html.new(content))
+  end
+
+  # `form.check_box(method, options, checked_value, unchecked_value)`;
+  # *current* is the model's value, compared with *checked_value*.
+  def check_box(method : String, options : Attrs, checked_value : String, unchecked_value : String, current : String) : Html
+    options = options.dup
+    options.set("type", "checkbox")
+    options.set("value", checked_value)
+    options.set("checked", "checked") if current == checked_value
+    add_default_name_and_id(method, options)
+    hidden = attrs
+    ["name", "disabled", "form"].each do |key|
+      hidden.set(key, options.get(key)) if options.has?(key)
+    end
+    hidden.type("hidden").value(unchecked_value)
+    legacy_tag("input", hidden) + legacy_tag("input", options)
+  end
+
+  # `form.fields_for(:settings)`: a builder for `object_name[settings]`.
+  def fields_for(name : String) : FormWith
+    FormWith.new(@action, @method, "#{@object_name || ""}[#{name}]", @id, @class, @data, @multipart)
+  end
+
+  # `Tags::Base#tag_name`; a model-less `form_with` names fields after the
+  # method alone.
+  private def tag_name(method : String) : String
+    object_name = @object_name || ""
+    object_name.empty? ? method : "#{object_name}[#{method}]"
+  end
+
+  # `Tags::Base#tag_id`: the sanitized object name and method joined by "_".
+  private def tag_id(method : String) : String
+    object_name = @object_name || ""
+    object_name.empty? ? method : "#{sanitize_object_name(object_name)}_#{method}"
+  end
+
+  private def add_default_name_and_id(method : String, options : Attrs) : Nil
+    options.fetch_or_set("name", tag_name(method))
+    options.fetch_or_set("id", tag_id(method))
+  end
+
+  # `Tags::TextField#render`.
+  private def input_field(field_type : String, method : String, value : String?, options : Attrs) : Html
+    options = options.dup
+    @multipart.on = true if field_type == "file"
+    options.set("size", options.get("maxlength")) unless options.has?("size")
+    options.set_default("type", field_type)
+    options.fetch_or_set("value", value) unless field_type == "file"
+    add_default_name_and_id(method, options)
+    legacy_tag("input", options)
+  end
+end
+
+pub def form_with(url : String) : FormWith
+  FormWith.new(url)
+end
+
+# `object_name.gsub(/\]\[|[^-a-zA-Z0-9:.]/, "_").delete_suffix("_")`.
+pub def sanitize_object_name(name : String) : String
+  sanitized = String.build do |io|
+    name.gsub("][", "_").each_char do |c|
+      io << (c.ascii_alphanumeric? || c == '-' || c == ':' || c == '.' ? c : '_')
+    end
+  end
+  sanitized.ends_with?("_") ? sanitized[0, sanitized.bytesize - 1] : sanitized
+end
+
+# `button_tag`'s attributes: `{ name: "button", type: "submit" }` merged
+# with the options.
+pub def button_options(options : Attrs) : Attrs
+  attrs.name("button").type("submit").merge(options)
+end
+
+# `form.button(options) { ... }` / `button_tag`.
+pub def button_tag(options : Attrs, content : Html) : Html
+  content_tag("button", button_options(options), content)
+end
+
+pub def button_tag(options : Attrs, & : -> Html) : Html
+  button_tag(options, yield)
+end
+
+# `hidden_field_tag(name, value, options)`.
+pub def hidden_field_tag(name : String, value : String?, options : Attrs = Attrs.new) : Html
+  base = attrs.type("hidden").name(name).id(sanitize_to_id(name)).attr("value", value)
+  legacy_tag("input", base.merge(options))
+end
+
+# `sanitize_to_id`: `]` removed, other non-id characters become "_".
+def sanitize_to_id(name : String) : String
+  String.build do |io|
+    name.delete(']').each_char do |c|
+      io << (c.ascii_alphanumeric? || c == '-' || c == '_' || c == ':' || c == '.' ? c : '_')
+    end
+  end
+end
+
+# `button_to(url, options) { content }`. *options* may carry `method`
+# ("delete", "put", "patch", "post" or "get"), `form_class`, and the
+# button's own attributes.
+pub def button_to(url : String, options : Attrs, content : Html) : Html
+  options = options.dup
+  method_value = options.remove("method")
+  method = method_value.nil? ? "post" : value_to_s(method_value)
+  class_value = options.remove("form_class")
+  form_class = class_value.nil? ? "button_to" : value_to_s(class_value)
+  form_method = method == "get" ? "get" : "post"
+  form = attrs.attr("class", form_class).attr("method", form_method).attr("action", url)
+  Html.new(String.build do |io|
+    io << "<form"
+    form.render_into(io)
+    io << ">"
+    io << method_tag(method).to_s if method == "delete" || method == "patch" || method == "put"
+    io << content_tag("button", options.attr("type", "submit"), content).to_s
+    io << "</form>"
+  end)
+end
+
+# `button_to(url, options) do ... end`.
+pub def button_to(url : String, options : Attrs, & : -> Html) : Html
+  button_to(url, options, yield)
+end

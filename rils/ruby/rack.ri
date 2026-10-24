@@ -1,0 +1,94 @@
+# What Rack (3.2) does with request headers, where Ruby's string behaviour
+# shows through.
+module rils/ruby/rack
+
+import std/text
+import rils/ruby/integers::{to_i}
+
+# `Rack::Utils.get_byte_ranges(http_range, size)`: nil means "serve
+# everything" and an empty list means 416. The ranges are inclusive and
+# within *size*.
+pub def byte_ranges(header : String?, size : Int64) : Array(Tuple(Int64, Int64))?
+  return nil if size == 0
+  return nil unless header
+  spec = range_spec(header)
+  return nil unless spec
+  return nil if spec.count(',') >= 100
+  ranges = [] of Tuple(Int64, Int64)
+  ruby_split_comma(spec).each do |range_spec|
+    return nil unless range_spec.includes?("-")
+    # Split on "-" first, so neither end can be negative.
+    parts = ruby_split_dash(range_spec)
+    r0 = parts.size > 0 ? parts[0] : nil
+    r1 = parts.size > 1 ? parts[1] : nil
+    first = 0_i64
+    last = 0_i64
+    if r0.nil? || r0.empty?
+      return nil unless r1
+      first = size - to_i(r1)
+      first = 0_i64 if first < 0
+      last = size - 1
+    else
+      first = to_i(r0)
+      if r1
+        wanted = to_i(r1)
+        return nil if wanted < first
+        last = wanted < size - 1 ? wanted : size - 1
+      else
+        last = size - 1
+      end
+    end
+    ranges << {first, last} if first <= last
+  end
+  total = 0_i64
+  ranges.each { |range| total += range[1] - range[0] + 1 }
+  return [] of Tuple(Int64, Int64) if total > size
+  ranges
+end
+
+# `http_range =~ /bytes=([^;]+)/`: after the first `bytes=` that something
+# other than `;` follows, up to the next `;`.
+def range_spec(header : String) : String?
+  offset = 0
+  while found = header.byte_index("bytes=", offset)
+    start = found + 6
+    stop = header.byte_index(";", start) || header.bytesize
+    return header[start, stop - start] if stop > start
+    offset = found + 1
+  end
+  nil
+end
+
+# `String#split` on `/,[ \t]*/`: trailing empty fields are dropped.
+def ruby_split_comma(s : String) : Array(String)
+  fields = [] of String
+  bytes = s.as_tape
+  start = 0
+  i = 0
+  while i < s.bytesize
+    if bytes[i] == ','.ord
+      fields << s[start, i - start]
+      i += 1
+      while i < s.bytesize && (bytes[i] == ' '.ord || bytes[i] == '\t'.ord)
+        i += 1
+      end
+      start = i
+    else
+      i += 1
+    end
+  end
+  fields << s[start, s.bytesize - start]
+  drop_trailing_empty(fields)
+end
+
+# `String#split("-")`: trailing empty fields are dropped.
+def ruby_split_dash(s : String) : Array(String)
+  drop_trailing_empty(s.split('-'))
+end
+
+def drop_trailing_empty(fields : Array(String)) : Array(String)
+  while fields.size > 0 && fields.last.empty?
+    fields.pop
+  end
+  fields
+end

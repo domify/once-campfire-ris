@@ -1,0 +1,27 @@
+# `searches/index` against the reference's renders (vectors/views_b),
+# region by region.
+module test/views/searches_test
+
+import std/text
+import rils/template/recorded::{Fragment}
+import views/messages/messages::{MessagePartial}
+import views/searches::{Index, search_path}
+import test/views/golden_b::*
+import web/web/spec::*
+
+describe "searches/index" do
+  it "renders results and recent searches, and an empty search" do
+    ["searches_index", "searches_index_empty"].each do |name|
+      golden = GoldenB.new(name)
+      ctx = golden.context
+      input = golden.input
+      messages = input["messages"].as_a.map { |message| Fragment.new(MessagePartial.new(ctx, message_view(message)).render.to_s) }
+      page = Index.new(ctx, input["query"].as_s?, input["q"].as_s?, messages, input["recent_searches"].as_a.map(&.as_s), input["return_to_room_id"].as_i64).page
+      golden.assert_dom(page.to_s)
+    end
+  end
+
+  it "escapes the query as CGI.escape does" do
+    assert search_path(%(pizza & "pie" *~)) == "/searches?q=pizza+%26+%22pie%22+%2A~"
+  end
+end

@@ -1,0 +1,13 @@
+<%# reference/app/views/users/profiles/_membership.html.erb -%>
+<li class="flex align-center gap margin-none min-width membership-item">
+  <%= link_to(room_path(membership.room_id), attrs.class("overflow-ellipsis fill-shade txt-primary txt-undecorated")) do %>
+    <strong><%= membership.room_display_name %></strong>
+<% end %>
+  <hr class="separator" aria-hidden="true">
+
+  <span class="txt-small">
+    <%= turbo_frame_tag(dom_id(membership.room_param_key, membership.room_id, "involvement"), attrs) do %>
+      <%= button_to_change_involvement(ctx, membership.involvement_room, membership.involvement) %>
+<% end %>  </span>
+</li>
+

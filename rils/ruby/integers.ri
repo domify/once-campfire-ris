@@ -1,0 +1,87 @@
+# `String#to_i`, and how Active Record binds a string to an integer column.
+module rils/ruby/integers
+
+import rils/ruby/text::{space?, skip_space}
+
+# What `String#to_i` reads: the sign and the magnitude, saturated at
+# `18446744073709551615_u64`, which tells every Int64 and every file size from what is
+# past it.
+pub struct Digits
+  getter negative : Bool
+  getter magnitude : UInt64
+
+  def initialize(@negative : Bool, @magnitude : UInt64)
+  end
+
+  # The value, or nil where Ruby's Bignum doesn't fit in an Int64.
+  pub def checked : Int64?
+    limit = 9223372036854775807_u64
+    if @negative
+      return -9223372036854775808_i64 if @magnitude == limit + 1
+      @magnitude > limit ? nil : -@magnitude.to_i64
+    else
+      @magnitude > limit ? nil : @magnitude.to_i64
+    end
+  end
+
+  # The value, saturated at the Int64 bounds.
+  pub def saturated : Int64
+    checked || (@negative ? -9223372036854775808_i64 : 9223372036854775807_i64)
+  end
+end
+
+# `String#to_i`: optional leading whitespace and sign, an optional `0d`,
+# then digits (an underscore allowed between two).
+pub def to_i_digits(s : String) : Digits
+  s = skip_space(s)
+  bytes = s.as_tape
+  size = s.bytesize
+  i = 0
+  negative = false
+  if size > 0 && (bytes[0] == '-'.ord || bytes[0] == '+'.ord)
+    negative = bytes[0] == '-'.ord
+    i = 1
+  end
+  i += 2 if i + 1 < size && bytes[i] == '0'.ord && (bytes[i + 1] == 'd'.ord || bytes[i + 1] == 'D'.ord)
+  number = 0_u64
+  previous_digit = false
+  while i < size
+    byte = bytes[i]
+    if byte >= 48 && byte <= 57
+      digit = (byte - 48).to_u64
+      number = number > (18446744073709551615_u64 - digit) // 10 ? 18446744073709551615_u64 : number * 10 + digit
+      previous_digit = true
+    elsif byte == '_'.ord && previous_digit
+      previous_digit = false
+    else
+      break
+    end
+    i += 1
+  end
+  Digits.new(negative, number)
+end
+
+# `String#to_i`, saturating at the Int64 bounds where Ruby goes on to a
+# Bignum.
+pub def to_i(s : String) : Int64
+  to_i_digits(s).saturated
+end
+
+# `String#to_i`, or nil where Ruby's answer doesn't fit in an Int64.
+pub def to_i_checked(s : String) : Int64?
+  to_i_digits(s).checked
+end
+
+# A string as Active Record binds it for an integer column (`find`,
+# `find_by(id:)`, `where`): `ActiveModel::Type::Integer#serialize`, with the
+# SQLite adapter's 8-byte limit. nil unless it starts like a number
+# (`/\A\s*[+-]?\d/`), then `to_i`, and nil out of range, where Rails raises
+# (activemodel's `type/integer.rb`).
+pub def integer_cast(s : String) : Int64?
+  unsigned = skip_space(s)
+  bytes = unsigned.as_tape
+  i = 0
+  i = 1 if unsigned.bytesize > 0 && (bytes[0] == '+'.ord || bytes[0] == '-'.ord)
+  return nil unless i < unsigned.bytesize && bytes[i] >= 48 && bytes[i] <= 57
+  to_i_checked(s)
+end

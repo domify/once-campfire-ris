@@ -1,0 +1,116 @@
+# What the controller tests share: requests through the drawn routes, on
+# the fixtures, without a server.
+module test/testing
+
+import std/text
+import rils/rails_compat/key_generator::{Secrets}
+import test/models/testing::*
+import rils/record/sqlite::{SqlValue}
+import models/session::{Session}
+import models/user::{User}
+import rils/kit/app::{Stack, KitConfig}
+import rils/kit/cookies::{CookieJar, Cookie}
+import rils/kit/ctx::{Ctx}
+import rils/kit/params::{ParamMap, RawPair, from_query_string, from_pairs}
+import rils/kit/request::{Request, ProxyConfig}
+import rils/kit/response::{Response, HeaderList}
+import rils/storage/disk::{make_tempdir}
+import config/app::{App}
+import models/action_text::{CampfireRichText}
+import jobs/jobs::{Job}
+import jobs/perform::{perform}
+import config/routes::{campfire_router}
+
+pub class Client
+  getter app : App
+  getter t : TestDb
+
+  def initialize(secret_key_base : String = "a" * 128)
+    @t = TestDb.new
+    @app = App.new(Stack.new(KitConfig.new, Secrets.new(secret_key_base), @t.clock), @t.db, storage_root: make_tempdir("campfire-test-storage"))
+    @app.pubsub.recorded = [] of Tuple(String, String)
+    @t.db.env.rich_text = CampfireRichText.new(@app.secrets, @t.clock)
+    app = @app
+    @app.jobs.performer = ->(job : Job) { perform(app, job) }
+  end
+
+  # What went out on the pubsub: stream and message.
+  pub def broadcasts : Array(Tuple(String, String))
+    @app.pubsub.recorded || [] of Tuple(String, String)
+  end
+
+  # A form submission, from this site unless *site* says otherwise.
+  pub def submit(method : String, path : String, form : String, cookie : String? = nil, site : String? = "same-origin", ip : String = "10.0.0.1", accept : String? = nil) : Response
+    params = from_query_string(form)
+    dispatch(method, path, form, params.is_a?(ParamMap) ? params : ParamMap.new, cookie, site, ip, accept)
+  end
+
+  # A multipart submission: its parameters, files among them, as pairs.
+  pub def submit_pairs(method : String, path : String, pairs : Array(RawPair), cookie : String? = nil) : Response
+    params = from_pairs(pairs)
+    dispatch(method, path, "", params.is_a?(ParamMap) ? params : ParamMap.new, cookie, "same-origin", "10.0.0.1")
+  end
+
+  def dispatch(method : String, path : String, form : String, params : ParamMap, cookie : String?, site : String?, ip : String, accept : String? = nil) : Response
+    headers = HeaderList.new
+    headers.append("accept", accept) if accept
+    headers.append("host", "once.campfire.test")
+    headers.append("content-type", "application/x-www-form-urlencoded")
+    headers.append("sec-fetch-site", site) if site
+    headers.append("x-forwarded-for", ip)
+    headers.append("cookie", cookie) if cookie
+    found = campfire_router(@app).find(method, path) || raise "no route for #{method} #{path}"
+    request = Request.new(method, method, path, "", headers, nil, form, ProxyConfig.new)
+    jar = CookieJar.from_headers(headers.all("cookie"), @app.secrets, @t.clock)
+    c = Ctx.new(@app.stack, request, found[1], ParamMap.new, params, jar)
+    c.keep_page(c.finish(found[0].action.call(c)))
+  end
+
+  # `sign_in :user`'s cookie, for a session of the user's.
+  pub def cookie(email_address : String) : String
+    user = @t.read { |conn| User.find_by_email_address(conn, email_address) } || raise "no #{email_address}"
+    session = Session.for_user(@t.conn, user.id).first? || @t.write { |tx| Session.start(tx, user.id, nil, nil) }
+    jar = CookieJar.from_headers([] of String, @app.secrets, @t.clock)
+    jar.set_signed("session_token", Cookie.new(session.token, permanent: true, httponly: true))
+    jar.set_cookie_headers(false, "once.campfire.test").first.split(';').first
+  end
+
+  pub def sessions_of(email_address : String) : Int64
+    user = @t.read { |conn| User.find_by_email_address(conn, email_address) } || raise "no #{email_address}"
+    Session.count_for_user(@t.conn, user.id)
+  end
+
+  pub def get(path : String, query : String = "", frame : String? = nil, cookie : String? = nil, user_agent : String? = nil) : Response
+    headers = HeaderList.new
+    headers.append("host", "once.campfire.test")
+    headers.append("user-agent", user_agent) if user_agent
+    headers.append("turbo-frame", frame) if frame
+    headers.append("cookie", cookie) if cookie
+    found = campfire_router(@app).find("GET", path) || raise "no route for #{path}"
+    params = from_query_string(query)
+    request = Request.new("GET", "GET", path, query, headers, nil, "", ProxyConfig.new)
+    jar = CookieJar.from_headers(headers.all("cookie"), @app.secrets, @t.clock)
+    c = Ctx.new(@app.stack, request, found[1], params.is_a?(ParamMap) ? params : ParamMap.new, ParamMap.new, jar)
+    c.keep_page(c.finish(found[0].action.call(c)))
+  end
+end
+
+def body(response : Response) : String
+  response.body_text || ""
+end
+
+pub def body(response : Response) : String
+  response.body_text || ""
+end
+
+pub def set_cookies(response : Response) : Array(String)
+  response.headers.all("set-cookie")
+end
+
+# Every row gone, as before the first run.
+pub def empty_database(client : Client) : Nil
+  conn = client.t.conn
+  tables = conn.query_all("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('schema_migrations', 'ar_internal_metadata')", [] of SqlValue) { |row| row.text(0) }
+  # Outside a transaction, where the pragma takes.
+  conn.execute_batch("PRAGMA foreign_keys = OFF; #{tables.map { |table| %(DELETE FROM "#{table}";) }.join(" ")} PRAGMA foreign_keys = ON;")
+end

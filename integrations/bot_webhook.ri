@@ -1,0 +1,225 @@
+# `Webhook#deliver` (reference/app/models/webhook.rb) and `Bot::WebhookJob`
+# (reference/app/jobs/bot/webhook_job.rb): a bot's webhook gets the message
+# as JSON, and its answer becomes the bot's reply in the room.
+#
+# Unguarded, unlike `Opengraph::Fetch`: only an administrator sets this
+# URL and it may point at internal services. The request has 7 seconds
+# to connect and each read (`ENDPOINT_TIMEOUT`); one that runs out is
+# itself answered with a text reply.
+module integrations/bot_webhook
+
+import std/text
+import models/message::{Message, NewMessage, webhook_payload}
+import models/room::{Room}
+import models/user::{User}
+import models/webhook::{Webhook, ENDPOINT_TIMEOUT_SECONDS}
+import rils/record/errors::{RecordNotFound}
+import rils/routes/paths::{room_bot_messages_path, room_at_message_path}
+import rils/ruby/text::{strip}
+import rils/ruby/uri_parser::{Uri, UriError, parse_uri}
+import rils/storage/filename::{Filename}
+import config/app::{App}
+import integrations/net::{Http, HttpAnswer, NetError}
+import controllers/messages::{canonicalize_body, save_staged, process_attachment, broadcast_create}
+
+# `Mime::LOOKUP` in the reference app: Action Dispatch's registrations
+# plus turbo-rails', as string, symbol and registered string.
+MIME_LOOKUP = [
+  {"text/html", "html", "text/html"},
+  {"application/xhtml+xml", "html", "text/html"},
+  {"text/plain", "text", "text/plain"},
+  {"text/javascript", "js", "text/javascript"},
+  {"application/javascript", "js", "text/javascript"},
+  {"application/x-javascript", "js", "text/javascript"},
+  {"text/css", "css", "text/css"},
+  {"text/calendar", "ics", "text/calendar"},
+  {"text/csv", "csv", "text/csv"},
+  {"text/vcard", "vcf", "text/vcard"},
+  {"text/vtt", "vtt", "text/vtt"},
+  {"vtt", "vtt", "text/vtt"},
+  {"text/markdown", "md", "text/markdown"},
+  {"image/png", "png", "image/png"},
+  {"image/jpeg", "jpeg", "image/jpeg"},
+  {"image/gif", "gif", "image/gif"},
+  {"image/bmp", "bmp", "image/bmp"},
+  {"image/tiff", "tiff", "image/tiff"},
+  {"image/svg+xml", "svg", "image/svg+xml"},
+  {"image/webp", "webp", "image/webp"},
+  {"video/mpeg", "mpeg", "video/mpeg"},
+  {"audio/mpeg", "mp3", "audio/mpeg"},
+  {"audio/ogg", "ogg", "audio/ogg"},
+  {"audio/aac", "m4a", "audio/aac"},
+  {"audio/mp4", "m4a", "audio/aac"},
+  {"video/webm", "webm", "video/webm"},
+  {"video/mp4", "mp4", "video/mp4"},
+  {"font/otf", "otf", "font/otf"},
+  {"font/ttf", "ttf", "font/ttf"},
+  {"font/woff", "woff", "font/woff"},
+  {"font/woff2", "woff2", "font/woff2"},
+  {"application/xml", "xml", "application/xml"},
+  {"text/xml", "xml", "application/xml"},
+  {"application/x-xml", "xml", "application/xml"},
+  {"application/rss+xml", "rss", "application/rss+xml"},
+  {"application/atom+xml", "atom", "application/atom+xml"},
+  {"application/x-yaml", "yaml", "application/x-yaml"},
+  {"text/yaml", "yaml", "application/x-yaml"},
+  {"multipart/form-data", "multipart_form", "multipart/form-data"},
+  {"application/x-www-form-urlencoded", "url_encoded_form", "application/x-www-form-urlencoded"},
+  {"application/json", "json", "application/json"},
+  {"text/x-json", "json", "application/json"},
+  {"application/jsonrequest", "json", "application/json"},
+  {"application/problem+json", "json", "application/json"},
+  {"application/pdf", "pdf", "application/pdf"},
+  {"application/zip", "zip", "application/zip"},
+  {"application/gzip", "gzip", "application/gzip"},
+  {"application/x-gzip", "gzip", "application/gzip"},
+  {"text/vnd.turbo-stream.html", "turbo_stream", "text/vnd.turbo-stream.html"},
+]
+
+# What the bot says back: nothing, a text, or an attachment.
+pub class WebhookReply
+  getter text : String?
+  getter data : String?
+  # `"attachment.#{mime_type.symbol}"`: "attachment." for unregistered types.
+  getter filename : String
+  # `mime_type.to_s`: the registered type, which for a synonym differs.
+  getter content_type : String
+
+  def initialize(@text : String? = nil, @data : String? = nil, @filename : String = "", @content_type : String = "")
+  end
+
+  pub def none? : Bool
+    @text.nil? && @data.nil?
+  end
+end
+
+# Raised out of `deliver`: a bad URL, a failed connection other than a
+# timeout, or a reply content type Rails can't parse.
+pub class WebhookError
+  getter message : String
+
+  def initialize(@message : String)
+  end
+end
+
+# `Net::HTTPHeader#content_type`: each part stripped, the case kept; nil
+# without a header.
+pub def net_http_content_type(headers : Hash(String, String)) : String?
+  header = headers["content-type"]? || return nil
+  main, slash, sub = header.partition(';')[0].partition('/')
+  slash.empty? ? strip(main) : "#{strip(main)}/#{strip(sub)}"
+end
+
+# `extract_text_from`, else `extract_attachment_from`.
+pub def webhook_reply(status : Int32, content_type : String?, body : String) : WebhookReply | WebhookError
+  return WebhookReply.new unless content_type
+  return WebhookReply.new(text: body) if status == 200 && (content_type == "text/html" || content_type == "text/plain")
+  found = mime_lookup(content_type)
+  return found if found.is_a?(WebhookError)
+  symbol, registered = found
+  WebhookReply.new(data: body, filename: "attachment.#{symbol || ""}", content_type: registered)
+end
+
+def registered(string : String) : Tuple(String?, String)?
+  row = MIME_LOOKUP.find { |entry| entry[0] == string } || return nil
+  {row[1].as(String?), row[2]}
+end
+
+# `Mime::Type.lookup(string)`: a registered type (by its string or a
+# synonym), else a new unregistered one, which must be a valid MIME type.
+def mime_lookup(string : String) : Tuple(String?, String) | WebhookError
+  if found = registered(string)
+    return found
+  end
+  bare = string.partition(';')[0]
+  while !bare.empty? && [' ', '\t', '\n', '\v', '\f', '\r', '\0'].includes?(bare[bare.size - 1])
+    bare = bare[0, bare.size - 1]
+  end
+  if found = registered(bare)
+    return found
+  end
+  mime_type?(bare) ? {nil.as(String?), bare} : WebhookError.new("#{bare.inspect} is not a valid MIME type")
+end
+
+def name_char?(char : Char, first : Bool) : Bool
+  return true if char.ascii_letter? || char.ascii_number?
+  !first && "!#$&-^_.+".includes?(char.to_s)
+end
+
+# `Mime::Type::MIME_REGEXP` for a type without parameters: `*/*`, or a
+# name, `/`, and `*` or a name, then trailing whitespace.
+def mime_type?(text : String) : Bool
+  return true if text == "*/*"
+  main, slash, sub = text.partition('/')
+  return false if slash.empty? || !mime_name?(main)
+  sub = sub.rstrip(" \t\n\v\f\r")
+  sub == "*" || mime_name?(sub)
+end
+
+def mime_name?(text : String) : Bool
+  return false if text.empty? || text.size > 127
+  first = true
+  text.each_char do |char|
+    return false unless name_char?(char, first)
+    first = false
+  end
+  true
+end
+
+# `post(payload)`: the status, content type and body; nil status when it
+# timed out.
+pub def post_payload(http : Http, url : String, payload : String) : HttpAnswer | NetError | WebhookError
+  uri = parse_uri(url)
+  return WebhookError.new("bad URI (is not URI?): #{url.inspect}") if uri.is_a?(UriError)
+  return WebhookError.new("not an HTTP URI") unless uri.http?
+  return WebhookError.new("no host component for URI") if (uri.host || "").empty?
+  http.request("POST", uri.to_s, nil, [{"Content-Type", "application/json"}], payload, timeout_ms: ENDPOINT_TIMEOUT_SECONDS * 1000, max_bytes: 100_i64 * 1024 * 1024)
+end
+
+# `Webhook#deliver(message)`: the reply, the timeout text, or what raised.
+pub def deliver(http : Http, url : String, payload : String) : WebhookReply | WebhookError
+  answer = post_payload(http, url, payload)
+  return answer if answer.is_a?(WebhookError)
+  if answer.is_a?(NetError)
+    return WebhookReply.new(text: "Failed to respond within #{ENDPOINT_TIMEOUT_SECONDS} seconds") if answer.timed_out
+    return WebhookError.new(answer.message)
+  end
+  webhook_reply(answer.status, net_http_content_type(answer.headers), answer.body)
+end
+
+# `Bot::WebhookJob#perform(bot, message)`: `bot.deliver_webhook(message)`,
+# then the reply posted as the bot and broadcast.
+pub def deliver_webhook(app : App, bot_id : Int64, message_id : Int64) : Nil
+  found = app.db.read do |conn|
+    bot = User.find_by_id(conn, bot_id)
+    message = Message.find_by_id(conn, message_id)
+    room = message ? Room.find_by_id(conn, message.room_id) : nil
+    webhook = Webhook.find_by_user(conn, bot_id)
+    if bot && message && room && webhook
+      payload = webhook_payload(conn, app.db.env.rich_text, webhook, message, room_bot_messages_path(room.id, bot.bot_key), room_at_message_path(room.id, message.id))
+      payload.is_a?(RecordNotFound) ? nil : {bot, room, webhook.url || "", payload}
+    end
+  end
+  return unless found
+  bot, room, url, payload = found
+  reply = deliver(app.http, url, payload)
+  if reply.is_a?(WebhookError)
+    STDERR.puts "Bot::WebhookJob failed: #{reply.message}"
+    return
+  end
+  return if reply.none?
+  message = if text = reply.text
+              # `room.messages.create!(body: text, creator: bot)`
+              body = canonicalize_body(app, text, nil)
+              app.db.write { |tx| Message.create(tx, NewMessage.new(room.id, bot.id, nil, body)) }
+            else
+              # `create_and_upload!`, then `create_with_attachment!`
+              staged = app.storage.stage_bytes(reply.data || "", Filename.new(reply.filename), reply.content_type)
+              blob = app.db.write { |tx| save_staged(tx, staged) }
+              staged.discard
+              created = app.db.write { |tx| Message.create(tx, NewMessage.new(room.id, bot.id, nil, nil, blob.id)) }
+              process_attachment(app, blob)
+              app.db.read { |conn| Message.find_by_id(conn, created.id) } || created
+            end
+  broadcast_create(app, app.detached_view_context, room, message)
+end

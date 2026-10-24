@@ -1,0 +1,77 @@
+# Side effects that leave the database. Models emit these at the point Rails
+# performs them; the caller supplies the `EventSink` that turns them into
+# jobs, cable disconnects and so on. The sink must hand work off (queue it)
+# rather than do it inline.
+module rils/record/events
+
+# `Room::PushMessageJob.perform_later(room, message)`, from `Room#receive`
+# after a message's create commits (`reference/app/models/room.rb`).
+pub struct PushMessage
+  getter room_id : Int64
+  getter message_id : Int64
+
+  def initialize(@room_id : Int64, @message_id : Int64)
+  end
+end
+
+# `ActionCable.server.remote_connections.where(current_user: user)
+# .disconnect(reconnect:)` (`reference/app/models/user.rb`).
+# `reconnect: true` comes from `reset_remote_connections` (membership
+# destroyed, sign out); `false` from deactivate and ban, which emit it
+# inside their transaction, before anything is deleted.
+pub struct DisconnectUser
+  getter user_id : Int64
+  getter reconnect : Bool
+
+  def initialize(@user_id : Int64, @reconnect : Bool)
+  end
+end
+
+# `RemoveBannedContentJob.perform_later(user)` (`User::Bannable#apply_ban`).
+pub struct RemoveBannedContent
+  getter user_id : Int64
+
+  def initialize(@user_id : Int64)
+  end
+end
+
+# `Bot::WebhookJob.perform_later(bot, message)`
+# (`User::Bot#deliver_webhook_later`).
+pub struct DeliverWebhook
+  getter bot_id : Int64
+  getter message_id : Int64
+
+  def initialize(@bot_id : Int64, @message_id : Int64)
+  end
+end
+
+# `ActiveStorage::Blob#purge_later`: the blob lost its attachment when its
+# record was destroyed (`has_one_attached` defaults to
+# `dependent: :purge_later`).
+pub struct PurgeBlob
+  getter blob_id : Int64
+
+  def initialize(@blob_id : Int64)
+  end
+end
+
+pub alias Event = PushMessage | DisconnectUser | RemoveBannedContent | DeliverWebhook | PurgeBlob
+
+# Where events go. The app subclasses it; the base drops them.
+pub class EventSink
+  pub def emit(event : Event) : Nil
+  end
+end
+
+# Keeps every event, for tests.
+pub class RecordingSink < EventSink
+  getter events : Array(Event)
+
+  def initialize
+    @events = [] of Event
+  end
+
+  pub def emit(event : Event) : Nil
+    @events << event
+  end
+end

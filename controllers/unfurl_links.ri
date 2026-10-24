@@ -1,0 +1,26 @@
+# `UnfurlLinksController` (reference/app/controllers/unfurl_links_controller.rb):
+# the composer asks for a pasted URL's OpenGraph metadata.
+module controllers/unfurl_links
+
+import std/text
+import rils/kit/ctx::{Ctx, ActionResult}
+import rils/kit/errors::{HttpError}
+import rils/kit/response::{Response}
+import config/app::{App}
+import integrations/opengraph::{unfurl, UnfurlError}
+import controllers/concerns::{before_actions}
+
+# `create`: `render json: opengraph` when it's valid, else no content.
+pub def create_unfurl_link(app : App, c : Ctx) : ActionResult
+  passed = before_actions(app, c)
+  return passed if passed.is_a?(HttpError)
+  param = c.require("url")
+  return param if param.is_a?(HttpError)
+  # A hash or an array passes `require`, but `URI.parse` can't take it
+  # (rescued): no title, so not valid.
+  url = param.as_s? || return c.head(204)
+  app.db.release
+  json = unfurl(app.http, url)
+  return HttpError.internal(json.message) if json.is_a?(UnfurlError)
+  json ? c.render_as(200, "application/json; charset=utf-8", json) : c.head(204)
+end

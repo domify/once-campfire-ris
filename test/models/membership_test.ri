@@ -1,0 +1,149 @@
+# `test/models/membership_test.rb`
+module test/models/membership_test
+
+import rils/record/sqlite::{SqlValue}
+import rils/record/events::{DisconnectUser}
+import test/models/testing::*
+import models/room::{Membership}
+import web/web/spec::*
+
+TTL_PLUS_ONE = 61_i64
+
+def membership(t : TestDb) : Membership
+  found(Membership.find(t.conn, id("david_watercooler")))
+end
+
+def connected(t : TestDb, m : Membership) : Membership
+  t.write { |tx| m.connected(tx) }
+  m
+end
+
+def disconnected(t : TestDb, m : Membership) : Membership
+  t.write { |tx| m.disconnected(tx) }
+  m
+end
+
+def connected_exists?(t : TestDb, m : Membership) : Bool
+  Membership.connected_exists?(t.conn, m.id, t.now)
+end
+
+def disconnected_exists?(t : TestDb, m : Membership) : Bool
+  Membership.disconnected_exists?(t.conn, m.id, t.now)
+end
+
+describe "membership" do
+  it "has a connected scope" do
+    t = TestDb.new
+    m = connected(t, membership(t))
+    assert connected_exists?(t, m)
+    m = disconnected(t, m)
+    assert !connected_exists?(t, m)
+    t.travel(TTL_PLUS_ONE)
+    assert !connected_exists?(t, m)
+  end
+
+  it "has a disconnected scope" do
+    t = TestDb.new
+    m = disconnected(t, membership(t))
+    assert disconnected_exists?(t, m)
+    m = connected(t, m)
+    assert !disconnected_exists?(t, m)
+    t.travel(TTL_PLUS_ONE)
+    assert disconnected_exists?(t, m)
+  end
+
+  it "isn't connected when the connection is stale" do
+    t = TestDb.new
+    m = connected(t, membership(t))
+    t.travel(TTL_PLUS_ONE)
+    assert !m.connected?(t.now)
+  end
+
+  it "counts connections" do
+    t = TestDb.new
+    m = connected(t, membership(t))
+    assert m.connected?(t.now)
+    assert m.connections == 1
+    m = connected(t, m)
+    assert m.connections == 2
+    assert found(Membership.find(t.conn, m.id)).connections == 2
+  end
+
+  it "resets a stale connection count on connecting" do
+    t = TestDb.new
+    m = connected(t, connected(t, membership(t)))
+    assert m.connections == 2
+    t.travel(TTL_PLUS_ONE)
+    m = connected(t, m)
+    assert m.connections == 1
+  end
+
+  it "disconnects" do
+    t = TestDb.new
+    m = connected(t, connected(t, membership(t)))
+    m = disconnected(t, m)
+    assert m.connected?(t.now)
+    assert m.connections == 1
+    m = disconnected(t, m)
+    assert !m.connected?(t.now)
+    assert m.connections == 0
+    assert found(Membership.find(t.conn, m.id)).connected_at.nil?
+  end
+
+  it "resets a stale connection count on disconnecting" do
+    t = TestDb.new
+    m = connected(t, connected(t, membership(t)))
+    assert m.connections == 2
+    t.travel(TTL_PLUS_ONE)
+    m = disconnected(t, m)
+    assert m.connections == 0
+  end
+
+  it "refreshes the connection" do
+    t = TestDb.new
+    m = connected(t, membership(t))
+    t.travel(TTL_PLUS_ONE)
+    assert !m.connected?(t.now)
+    t.write { |tx| m.refresh_connection(tx) }
+    assert m.connected?(t.now)
+  end
+
+  it "marks read and counts connections when present" do
+    t = TestDb.new
+    m = t.write do |tx|
+      tx.conn.execute("UPDATE memberships SET unread_at = '2026-01-01 00:00:00' WHERE id = ?", [id("david_watercooler")] of SqlValue)
+      found_membership = found(Membership.find(tx.conn, id("david_watercooler")))
+      found_membership.present(tx)
+      found_membership
+    end
+    reloaded = found(Membership.find(t.conn, m.id))
+    assert reloaded.connections == 1
+    assert reloaded.unread_at.nil?
+    assert reloaded.updated_at == m.updated_at, "Membership.connect doesn't touch updated_at"
+  end
+
+  it "resets connected memberships with disconnect_all" do
+    t = TestDb.new
+    m = connected(t, membership(t))
+    t.write { |tx| Membership.disconnect_all(tx) }
+    reloaded = found(Membership.find(t.conn, m.id))
+    assert reloaded.connections == 0 && reloaded.connected_at.nil?
+  end
+
+  it "resets the user's connections when removed" do
+    t = TestDb.new
+    m = membership(t)
+    t.write { |tx| m.destroy(tx) }
+    assert t.events.size == 1
+    event = t.events[0]
+    assert event.is_a?(DisconnectUser) && event.user_id == id("david") && event.reconnect
+  end
+
+  it "doesn't write when reading what's already read" do
+    t = TestDb.new
+    m = membership(t)
+    before = m.updated_at
+    t.write { |tx| m.read(tx) }
+    assert found(Membership.find(t.conn, m.id)).updated_at == before
+  end
+end

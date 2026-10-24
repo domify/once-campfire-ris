@@ -1,0 +1,71 @@
+# `Rails.application.key_generator`: an `ActiveSupport::CachingKeyGenerator`
+# over PBKDF2-HMAC. Rails builds it with 1000 iterations (railties
+# `Rails::Application#key_generator`), and `load_defaults` 7.0+ sets its
+# digest to SHA256 (`key_generator_hash_digest_class`). The default key
+# length is 64 bytes; encrypted cookies ask for 32.
+module rils/rails_compat/key_generator
+
+import std/time::{Time}
+import rils/rails_compat/crypto::{pbkdf2, Digest, HmacKey}
+
+pub ITERATIONS         = 1000
+pub DEFAULT_KEY_LENGTH =   64
+
+pub class KeyGenerator
+  @secret : String
+  @cache : Hash(String, String)
+
+  def initialize(@secret : String)
+    @cache = {} of String => String
+  end
+
+  pub def generate_key(salt : String, length : Int32 = DEFAULT_KEY_LENGTH) : String
+    entry = "#{length}:#{salt}"
+    if key = @cache[entry]?
+      return key
+    end
+    key = pbkdf2(Digest::Sha256, @secret, salt, ITERATIONS, length)
+    @cache[entry] = key
+    key
+  end
+end
+
+# Everything derived from `secret_key_base`, built once at boot and shared.
+VERIFIED_COOKIES = 1024
+
+# A signed cookie's value as its verification found it, under its name,
+# good until it expires.
+pub class VerifiedCookie
+  getter name : String
+  getter token : String
+  getter expires : Time?
+
+  def initialize(@name : String, @token : String, @expires : Time?)
+  end
+end
+
+pub class Secrets
+  getter key_generator : KeyGenerator
+  # The signed cookie jar's key, kept once worked out: `generate_key` names
+  # its cache entry with a new string on every call.
+  property signed_cookie_secret : String?
+  # Its HMAC pads, worked out once from the key.
+  property signed_cookie_hmac : HmacKey?
+  # Signed cookies seen verified, by their raw value: a client sends the
+  # same one on every request. Each thread has its own `Secrets`.
+  getter verified_cookies : Hash(String, VerifiedCookie)
+
+  def initialize(secret_key_base : String)
+    @key_generator = KeyGenerator.new(secret_key_base)
+    @signed_cookie_secret = nil
+    @signed_cookie_hmac = nil
+    @verified_cookies = {} of String => VerifiedCookie
+  end
+
+  # Keeps *cookie* under *raw*; the oldest go when there are
+  # `VERIFIED_COOKIES` of them.
+  def keep_verified(raw : String, cookie : VerifiedCookie) : Nil
+    @verified_cookies.delete(@verified_cookies.first_key) if @verified_cookies.size >= VERIFIED_COOKIES
+    @verified_cookies[raw] = cookie
+  end
+end

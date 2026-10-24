@@ -1,0 +1,41 @@
+# `SearchesController`: recording, showing and clearing searches.
+module test/controllers/searches_test
+
+import std/text
+import test/models/testing::{id}
+import models/search::{Search}
+import controllers/searches::{sanitize_query}
+import test/testing::*
+import web/web/spec::*
+
+describe "searches" do
+  it "records a search, shows its results and clears the recent ones" do
+    client = Client.new
+    cookie = client.cookie("david@37signals.com")
+    empty = client.get("/searches", cookie: cookie)
+    assert empty.status == 200
+    assert body(empty).includes?("<title>Search</title>")
+    recorded = client.submit("POST", "/searches", "q=hello%2C+world", cookie)
+    assert recorded["location"] == "http://once.campfire.test/searches?q=hello++world"
+    results = client.get("/searches", "q=hello++world", cookie: cookie)
+    assert results.status == 200
+    assert body(results).includes?("“hello  world”")
+    cleared = client.submit("DELETE", "/searches/clear", "", cookie)
+    assert cleared["location"] == "http://once.campfire.test/searches"
+    assert client.t.read { |conn| Search.count_for_user(conn, id("david")) } == 0
+    assert client.submit("POST", "/searches", "", cookie).status == 500
+  end
+
+  it "finds a message by its words" do
+    client = Client.new
+    cookie = client.cookie("david@37signals.com")
+    client.submit("POST", "/rooms/#{id("watercooler")}/messages.turbo_stream", "message[body]=Zanzibar+at+sunrise", cookie)
+    found = client.get("/searches", "q=zanzibar", cookie: cookie)
+    assert body(found).includes?("Zanzibar at sunrise")
+  end
+
+  it "keeps only word characters, as Ruby does" do
+    assert sanitize_query("a-b_c ö!") == "a b_c ö "
+    assert sanitize_query(nil).nil?
+  end
+end

@@ -1,0 +1,240 @@
+# `test/controllers/users_controller_test.rb`, `users/*_controller_test.rb`,
+# `sessions/transfers_controller_test.rb` and the autocompletable users,
+# through the drawn routes.
+module test/controllers/users_test
+
+import std/text
+import std/file::{File}
+import std/dir::{Dir}
+import std/uri::{URI}
+import rils/rails_compat/signed_id::{generate_signed_id}
+import test/models/testing::{id}
+import rils/record/sqlite::{SqlValue}
+import models/account::{Account}
+import models/ban::{Ban}
+import models/message::{Message, NewMessage}
+import models/room::{Room, RoomType}
+import models/session::{Session}
+import models/user::{User}
+import models/push_subscription::{PushSubscription}
+import rils/record/events::{RemoveBannedContent}
+import rils/kit/params::{RawPair, UploadedFile}
+import rils/storage/blob::{Blob}
+import integrations/net::{Http}
+import integrations/vapid::{Vapid}
+import controllers/users::{transfer_id}
+import test/testing::*
+import web/web/spec::*
+
+DAVID = "david@37signals.com"
+KEVIN = "kevin@37signals.com"
+
+def join_code(client : Client) : String
+  (client.t.read { |conn| Account.first(conn) } || raise "no account").join_code
+end
+
+def user(client : Client, label : String) : User
+  client.t.read { |conn| User.find_by_id(conn, id(label)) } || raise "no #{label}"
+end
+
+def upload(name : String, content_type : String) : UploadedFile
+  path = "#{Dir.tempdir}/campfire-#{name}"
+  File.write(path, File.read("#{__DIR__}/../../reference/test/fixtures/files/#{name}"))
+  UploadedFile.new(name, content_type, "", File.size(path), path)
+end
+
+describe "users" do
+  it "shows a user" do
+    client = Client.new
+    assert client.get("/users/#{id("david")}", cookie: client.cookie(DAVID)).status == 200
+  end
+
+  it "shows the join page, but not to the signed in or without the code" do
+    client = Client.new
+    code = join_code(client)
+    assert client.get("/join/#{code}").status == 200
+    assert client.get("/join/#{code}", cookie: client.cookie(DAVID))["location"] == "http://once.campfire.test/"
+    assert client.get("/join/not").status == 404
+  end
+
+  it "creates a user in every open room, signed in" do
+    client = Client.new
+    before = client.t.read { |conn| User.count(conn) }
+    response = client.submit("POST", "/join/#{join_code(client)}", "user[name]=New+Person&user[email_address]=new%4037signals.com&user[password]=secret123456")
+    assert response["location"] == "http://once.campfire.test/"
+    assert client.t.read { |conn| User.count(conn) } == before + 1
+    created = client.t.read { |conn| User.find_by_email_address(conn, "new@37signals.com") } || raise "no user"
+    opens = client.t.read { |conn| Room.of_type(conn, RoomType::Open).map(&.id).sorted }
+    assert client.t.read { |conn| Room.for_user(conn, created.id).map(&.id).sorted } == opens
+    assert set_cookies(response).any?(&.starts_with?("session_token="))
+  end
+
+  it "sends a taken email address to sign in" do
+    client = Client.new
+    before = client.t.read { |conn| User.count(conn) }
+    response = client.submit("POST", "/join/#{join_code(client)}", "user[name]=Another+David&user[email_address]=david%4037signals.com&user[password]=secret123456")
+    assert response["location"] == "http://once.campfire.test/session/new?email_address=david%4037signals.com"
+    assert client.t.read { |conn| User.count(conn) } == before
+  end
+end
+
+describe "users/avatars" do
+  it "shows initials, an uploaded image, and initials for one that can't be resized" do
+    client = Client.new
+    cookie = client.cookie(DAVID)
+    token = generate_signed_id(client.app.secrets, "User", id("kevin"), "avatar")
+    initials = client.get("/users/#{token}/avatar", cookie: cookie)
+    assert initials.status == 200
+    assert body(initials).includes?("      K\n    </text>")
+    assert (initials["content-type"] || "").starts_with?("image/svg+xml")
+
+    client.submit_pairs("PATCH", "/users/me/profile", [RawPair.new("user[avatar]", upload("moon.jpg", "image/jpeg"))], client.cookie(KEVIN))
+    image = client.get("/users/#{token}/avatar", cookie: cookie)
+    assert image.status == 200
+    assert image["content-type"] == "image/webp"
+
+    client.submit_pairs("PATCH", "/users/me/profile", [RawPair.new("user[avatar]", upload("pixel.bmp", "image/bmp"))], client.cookie(KEVIN))
+    fallback = client.get("/users/#{token}/avatar", cookie: cookie)
+    assert (fallback["content-type"] || "").starts_with?("image/svg+xml")
+  end
+
+  it "answers 404 for a bad token" do
+    client = Client.new
+    assert client.get("/users/not-a-valid-token/avatar", cookie: client.cookie(DAVID)).status == 404
+  end
+end
+
+describe "users/bans" do
+  it "bans a user: bans their session addresses, ends their sessions, removes their content later" do
+    client = Client.new
+    kevin = user(client, "kevin")
+    client.t.write do |tx|
+      Session.start(tx, kevin.id, "Test", "203.0.113.1")
+      Session.start(tx, kevin.id, "Test", "203.0.113.2")
+    end
+    response = client.submit("POST", "/users/#{kevin.id}/ban", "", client.cookie(DAVID))
+    assert response["location"] == "http://once.campfire.test/users/#{kevin.id}"
+    addresses = client.t.read { |conn| Ban.for_user(conn, kevin.id).map(&.ip_address).sorted }
+    assert addresses.includes?("203.0.113.1") && addresses.includes?("203.0.113.2")
+    assert client.t.read { |conn| Session.count_for_user(conn, kevin.id) } == 0
+    assert client.app.jobs.pending.any? { |job| job.is_a?(RemoveBannedContent) && job.user_id == kevin.id }
+    assert user(client, "kevin").banned?
+  end
+
+  it "unbans" do
+    client = Client.new
+    kevin = user(client, "kevin")
+    client.t.write { |tx| Session.start(tx, kevin.id, "Test", "203.0.113.1") }
+    client.t.write { |tx| kevin.ban(tx) }
+    response = client.submit("DELETE", "/users/#{kevin.id}/ban", "", client.cookie(DAVID))
+    assert response["location"] == "http://once.campfire.test/users/#{kevin.id}"
+    assert user(client, "kevin").active?
+    assert client.t.read { |conn| Ban.for_user(conn, kevin.id).size } == 0
+  end
+
+  it "is for administrators" do
+    client = Client.new
+    assert client.submit("POST", "/users/#{id("jz")}/ban", "", client.cookie(KEVIN)).status == 403
+    assert client.submit("DELETE", "/users/#{id("jz")}/ban", "", client.cookie(KEVIN)).status == 403
+  end
+end
+
+describe "users/profiles" do
+  it "shows and updates the user's own profile" do
+    client = Client.new
+    cookie = client.cookie(DAVID)
+    assert client.get("/users/me/profile", cookie: cookie).status == 200
+    response = client.submit("PUT", "/users/me/profile", "user[name]=John+Doe&user[bio]=Acrobat", cookie)
+    assert response["location"] == "http://once.campfire.test/users/me/profile"
+    david = user(client, "david")
+    assert david.name == "John Doe"
+    assert david.bio == "Acrobat"
+    assert david.email_address == DAVID
+  end
+end
+
+describe "users/push_subscriptions" do
+  it "creates a subscription, touches an existing one, and refuses bad endpoints" do
+    client = Client.new
+    client.app.http = Http.new(->(host : String) { ["142.250.185.206"].as(Array(String)?) })
+    cookie = client.cookie(DAVID)
+    before = client.t.read { |conn| PushSubscription.count(conn) }
+    response = client.submit("POST", "/users/me/push_subscriptions", "push_subscription[endpoint]=https%3A%2F%2Ffcm.googleapis.com%2Ffcm%2Fsend%2Fabc123&push_subscription[p256dh_key]=123&push_subscription[auth_key]=456", cookie)
+    assert response.status == 200
+    assert client.t.read { |conn| PushSubscription.count(conn) } == before + 1
+    again = client.submit("POST", "/users/me/push_subscriptions", "push_subscription[endpoint]=https%3A%2F%2Ffcm.googleapis.com%2Ffcm%2Fsend%2Fabc123&push_subscription[p256dh_key]=123&push_subscription[auth_key]=456", cookie)
+    assert again.status == 200
+    assert client.t.read { |conn| PushSubscription.count(conn) } == before + 1
+    bad = client.submit("POST", "/users/me/push_subscriptions", "push_subscription[endpoint]=https%3A%2F%2Fattacker.example.com%2Fsteal&push_subscription[p256dh_key]=123&push_subscription[auth_key]=456", cookie)
+    assert bad.status == 422
+    client.app.http = Http.new(->(host : String) { ["169.254.169.254"].as(Array(String)?) })
+    refused = client.submit("POST", "/users/me/push_subscriptions", "push_subscription[endpoint]=https%3A%2F%2Ffcm.googleapis.com%2Ffcm%2Fsend%2Fxyz&push_subscription[p256dh_key]=1&push_subscription[auth_key]=2", cookie)
+    assert refused.status == 422
+    assert client.t.read { |conn| PushSubscription.count(conn) } == before + 1
+  end
+
+  it "lists and destroys the user's subscriptions" do
+    client = Client.new
+    cookie = client.cookie(DAVID)
+    assert client.get("/users/me/push_subscriptions", cookie: cookie).status == 200
+    before = client.t.read { |conn| PushSubscription.count(conn) }
+    response = client.submit("DELETE", "/users/me/push_subscriptions/#{id("david_chrome")}", "", cookie)
+    assert response["location"] == "http://once.campfire.test/users/me/push_subscriptions"
+    assert client.t.read { |conn| PushSubscription.count(conn) } == before - 1
+  end
+end
+
+describe "users/sidebars" do
+  it "shows the user's rooms, the unread ones marked" do
+    client = Client.new
+    client.t.write { |tx| Message.create(tx, NewMessage.new(id("david_and_jason"), id("jason"), "999", "Hello")) }
+    response = client.get("/users/me/sidebar", cookie: client.cookie(DAVID))
+    assert response.status == 200
+    html = body(response)
+    client.t.read { |conn| Room.for_user_of_type(conn, id("david"), RoomType::Open) }.each { |room| assert html.includes?(room.name || "") }
+    assert html.includes?("direct unread")
+  end
+end
+
+describe "sessions/transfers" do
+  it "shows the form signed out, and signs in with a valid transfer id" do
+    client = Client.new
+    assert client.get("/session/transfers/some-token").status == 200
+    response = client.submit("PUT", "/session/transfers/#{transfer_id(client.app, id("david"), client.t.clock.now)}", "")
+    assert response["location"] == "http://once.campfire.test/"
+    assert set_cookies(response).any?(&.starts_with?("session_token="))
+    assert client.submit("PUT", "/session/transfers/bogus", "").status == 400
+  end
+
+  it "shows no current user, signed in or not (`allow_unauthenticated_access`)" do
+    client = Client.new
+    html = body(client.get("/session/transfers/some-token", cookie: client.cookie(DAVID)))
+    assert !html.includes?("current-user-id")
+    assert html.includes?(%(<body class=""))
+  end
+end
+
+describe "the layout" do
+  it "links back to the last room visited, titles the page and carries the VAPID key as configured" do
+    client = Client.new
+    client.app.vapid = Vapid.new("secret", "point", "BEncodedKey=")
+    room = client.t.read { |conn| Room.for_user_of_type(conn, id("david"), RoomType::Open) }.last
+    html = body(client.get("/users/me/push_subscriptions", cookie: "#{client.cookie(DAVID)}; last_room=#{room.id}"))
+    assert html.includes?(%(<a class="btn" href="/rooms/#{room.id}">))
+    assert html.includes?("<title>Push notification subscriptions</title>")
+    assert html.includes?(%(<meta name="vapid-public-key" content="BEncodedKey=">))
+  end
+end
+
+describe "autocompletable/users" do
+  it "finds matching active users, as prompt items or JSON" do
+    client = Client.new
+    cookie = client.cookie(DAVID)
+    html = client.get("/autocompletable/users", "query=jas", cookie: cookie)
+    assert html.status == 200
+    assert body(html).includes?("Jason")
+    assert !body(html).includes?("Kevin")
+    json = client.get("/autocompletable/users.json", "filter=kev", cookie: cookie)
+    assert body(json).includes?("\"name\":\"Kevin\"")
+  end
+end

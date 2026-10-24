@@ -1,0 +1,145 @@
+# `has_one_attached` as `User::Avatar` (`:avatar`) and `Account` (`:logo`)
+# use it (reference/app/models/user/avatar.rb, account.rb, and Active
+# Storage's `Attached::Changes::CreateOne` / `Attachment`).
+#
+# Assigning an uploaded file and saving the record, in the record's
+# transaction: the old attachment is destroyed (its blob purged after
+# commit), then the new blob and attachment rows are inserted, and each
+# change touches the record (`belongs_to :record, touch: true`). A fresh
+# blob isn't analyzed, so `ActiveStorage::AnalyzeJob` runs after commit.
+#
+# Unlike Rails, which uploads after commit, the file is copied into
+# storage before the transaction, so the writer never waits on it.
+module models/attachments
+
+import std/text
+import rils/record/database::{Tx}
+import rils/record/sqlite::{Connection, SqlValue}
+import rils/record/events::{PurgeBlob}
+import rils/kit/params::{ParamMap, UploadedFile}
+import rils/storage/blob::{Blob, insert_attachment, attachment_records}
+import rils/storage/storage::{Staged}
+import rils/storage/filename::{Filename}
+import rils/storage/variation::{Variation}
+import rils/storage/errors::{StorageError}
+import config/app::{App}
+import jobs/jobs::{AnalyzeBlob}
+
+# The record an attachment belongs to: its polymorphic type and its table.
+pub struct Record
+  getter record_type : String
+  getter table : String
+  getter id : Int64
+
+  def initialize(@record_type : String, @table : String, @id : Int64)
+  end
+
+  pub def self.user(id : Int64) : Record
+    Record.new("User", "users", id)
+  end
+
+  pub def self.account(id : Int64) : Record
+    Record.new("Account", "accounts", id)
+  end
+end
+
+# What assigning a permitted param does: an upload replaces the attachment,
+# nil or "" destroys it, anything else raises; nil when the key wasn't
+# given.
+pub class AttachmentChange
+  getter upload : UploadedFile?
+  getter delete : Bool
+  getter invalid : Bool
+
+  def initialize(@upload : UploadedFile? = nil, @delete : Bool = false, @invalid : Bool = false)
+  end
+
+  pub def self.from_params(params : ParamMap, key : String) : AttachmentChange?
+    return nil unless params.has_key?(key)
+    param = params[key]? || return AttachmentChange.new(delete: true)
+    return AttachmentChange.new(delete: true) if param.null? || param.as_s? == ""
+    file = param.as_file?
+    file ? AttachmentChange.new(upload: file) : AttachmentChange.new(invalid: true)
+  end
+end
+
+# The upload's file, copied into storage ahead of the write that saves it.
+pub def stage_upload(app : App, upload : UploadedFile) : Staged
+  app.storage.stage_file(upload.path, Filename.from_bytes(upload.original_filename), upload.content_type)
+end
+
+# `record.touch`
+pub def touch_record(tx : Tx, table : String, id : Int64) : Nil
+  tx.conn.execute(%(UPDATE "#{table}" SET "updated_at" = ? WHERE "#{table}"."id" = ?), [tx.now, id] of SqlValue)
+end
+
+# `record.<name> = staged; record.save`: replaces any attachment. Returns
+# the new blob, to analyze after commit.
+pub def attach(tx : Tx, record : Record, name : String, staged : Staged) : Blob
+  destroy_attachment(tx, record, name)
+  blob = staged.insert(tx.conn, tx.now)
+  tx.after_commit { |_| staged.keep }
+  insert_attachment(tx.conn, name, record.record_type, record.id, blob.id, tx.now)
+  touch_record(tx, record.table, record.id)
+  blob
+end
+
+# `record.<name>.destroy`: the attachment row goes, the record is touched
+# and the blob purged after commit. Nothing happens without one.
+pub def destroy_attachment(tx : Tx, record : Record, name : String) : Bool
+  found = tx.conn.query_all(%(SELECT "id", "blob_id" FROM "active_storage_attachments" WHERE "record_type" = ? AND "record_id" = ? AND "name" = ? LIMIT 1), [record.record_type, record.id, name] of SqlValue) { |row| {row.int(0), row.int(1)} }
+  attachment = found.first? || return false
+  tx.conn.execute(%(DELETE FROM "active_storage_attachments" WHERE "id" = ?), [attachment[0]] of SqlValue)
+  touch_record(tx, record.table, record.id)
+  tx.emit_after_commit(PurgeBlob.new(attachment[1]))
+  true
+end
+
+# A staged change, applied in the record's write: the blob to analyze, if
+# one was attached.
+pub def apply_change(tx : Tx, record : Record, name : String, change : AttachmentChange?, staged : Staged?) : Blob?
+  return nil unless change
+  if staged
+    attach(tx, record, name, staged)
+  elsif change.delete
+    destroy_attachment(tx, record, name)
+    nil
+  end
+end
+
+# After commit: `analyze_blob_later`.
+pub def analyze_later(app : App, blob : Blob?) : Nil
+  app.jobs.perform_later(AnalyzeBlob.new(blob.id)) if blob
+end
+
+# `ActiveStorage::AnalyzeJob`: `blob.analyze`, then each attached record is
+# touched (a message also touches its room, through `Message#touch`).
+pub def analyze(app : App, blob_id : Int64, & : Tx, String, Int64 -> Nil) : Nil
+  blob = app.db.read { |conn| Blob.find(conn, blob_id) } || return
+  metadata = app.storage.analyzed_metadata(blob)
+  return if metadata.is_a?(StorageError)
+  app.db.write do |tx|
+    blob.update_metadata(tx.conn, metadata)
+    attachment_records(tx.conn, blob_id).each { |record_type, record_id| yield tx, record_type, record_id }
+  end
+end
+
+# `record.<name>.attached?`'s blob.
+pub def attached_blob(conn : Connection, record : Record, name : String) : Blob?
+  Blob.attached(conn, record.record_type, record.id, name)
+end
+
+# `record.<name>.variant(...).processed if record.<name>.variable?`: the
+# processed variant's blob, or nil without an attachment or for one that
+# can't be transformed.
+pub def processed_variant(app : App, record : Record, name : String, transformations : Variation) : Blob?
+  blob = app.db.read { |conn| attached_blob(conn, record, name) } || return nil
+  return nil unless blob.variable?
+  variation = app.storage.variation_for(blob, transformations)
+  return nil if variation.is_a?(StorageError)
+  if existing = app.db.read { |conn| app.storage.existing_variant(conn, blob, variation) }
+    return existing
+  end
+  processed = app.db.write { |tx| app.storage.process_variant(tx.conn, blob, variation, tx.now) }
+  processed.is_a?(StorageError) ? nil : processed
+end

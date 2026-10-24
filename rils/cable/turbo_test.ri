@@ -1,0 +1,23 @@
+# The stream tags as turbo-rails writes them, and broadcasting them.
+module rils/cable/turbo_test
+
+import rils/cable/turbo::*
+import rils/cable/pubsub::{PubSub}
+import web/web/spec::*
+
+describe "turbo stream tags" do
+  it "put extra attributes first and leave remove without a template" do
+    assert action_tag(Action::Append, "messages_rooms_open_1", "<p>x</p>") == %(<turbo-stream action="append" target="messages_rooms_open_1"><template><p>x</p></template></turbo-stream>)
+    assert action_tag(Action::Replace, "a&b", "", [{"maintain_scroll", "true".as(String?)}]) == %(<turbo-stream maintain_scroll="true" action="replace" target="a&amp;b"><template></template></turbo-stream>)
+    assert action_tag(Action::Remove, "message_1") == %(<turbo-stream action="remove" target="message_1"></turbo-stream>)
+  end
+
+  it "broadcast to the stream named by the streamables, JSON-encoded" do
+    pubsub = PubSub.new
+    got = [] of String
+    pubsub.subscribe("room:messages", ->(message : String) { got << message; nil })
+    assert broadcast_action_to(pubsub, ["room", "messages"], Action::Remove, "m") == 1
+    assert got == [%("\\u003cturbo-stream action=\\"remove\\" target=\\"m\\"\\u003e\\u003c/turbo-stream\\u003e")]
+    assert broadcast_action_to(pubsub, ["", " "], Action::Remove, "m") == 0
+  end
+end

@@ -1,0 +1,30 @@
+# Views for `reference/app/views/first_runs`.
+module views/first_runs
+
+import std/text
+import rils/routes/paths::{first_run_path}
+import rils/template/html::{Html}
+import rils/template/recorded::{RecordedPage}
+import rils/template/template::{Template, Buffer}
+import views/context::{ViewContext}
+import views/layouts::{render_in_layout}
+import views/helpers/tag::*
+import views/helpers/assets::{image_tag}
+import views/helpers/forms::{form_with, button_tag}
+import views/helpers/translations::{translation_button}
+
+PAGE_TITLE = "Set up Campfire"
+
+# `first_runs/show.html.erb`: setting up the account, until it exists.
+pub class Show
+  getter ctx : ViewContext
+
+  def initialize(@ctx : ViewContext)
+  end
+
+  Template.def_page("first_runs/show.html.erb")
+
+  pub def page(frame : Bool = false) : RecordedPage
+    render_in_layout(@ctx, PAGE_TITLE, "signup", frame) { |buffer| render_into(buffer) }
+  end
+end

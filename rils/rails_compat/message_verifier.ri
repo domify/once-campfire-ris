@@ -1,0 +1,104 @@
+# `ActiveSupport::MessageVerifier`:
+# `<base64 payload>--<hex HMAC of the base64 payload>`. Each use in Rails
+# configures it differently; the callers name them.
+module rils/rails_compat/message_verifier
+
+import std/time::{Time}
+import std/text
+import rils/rails_compat/json::{Value}
+import rils/rails_compat/crypto::{hmac, hex, constant_time_eq?, Digest}
+import rils/rails_compat/encoding::{strict_encode, urlsafe_encode_unpadded, urlsafe_encode_padded, urlsafe_decode}
+import rils/rails_compat/metadata::{Failure, Serializer, serialize_with_metadata, serialize_dumped_with_metadata, deserialize_with_metadata}
+
+# How the payload is Base64-encoded when generating. Reading is lenient in
+# every case: `MessageVerifier#decode` retries with the other alphabet, and
+# `GlobalID::Verifier` uses `urlsafe_decode64`, which accepts both.
+pub enum Encoding
+  # `Base64.strict_encode64` (the default, `url_safe: false`).
+  Strict
+  # `url_safe: true`: URL-safe alphabet without padding.
+  UrlSafe
+  # `GlobalID::Verifier`: URL-safe alphabet *with* padding.
+  UrlSafePadded
+end
+
+pub class MessageVerifier
+  @secret : String
+  @digest : Digest
+  @encoding : Encoding
+  @serializer : Serializer
+  # `rotate`/`fall_back_to`: tried in order when this verifier can't read a
+  # message.
+  @rotations : Array(MessageVerifier)
+
+  def initialize(@secret : String, @digest : Digest, @encoding : Encoding, @serializer : Serializer)
+    @rotations = [] of MessageVerifier
+  end
+
+  pub def fall_back_to(rotation : MessageVerifier) : MessageVerifier
+    @rotations << rotation
+    self
+  end
+
+  pub def generate(value : Value, purpose : String? = nil, expires_at : Time? = nil) : String
+    sign(serialize_with_metadata(@serializer, value, purpose, expires_at))
+  end
+
+  # `generate` for data the caller already encoded as JSON (in this
+  # verifier's serializer, e.g. `ActiveSupport::JSON` escaping for app
+  # verifiers), so key order is under the caller's control:
+  # `{"_rails":{"data":<data_json>,"exp":..,"pur":..}}`.
+  pub def generate_raw(data_json : String, purpose : String? = nil, expires_at : Time? = nil) : String
+    sign(serialize_dumped_with_metadata(@serializer, data_json, purpose, expires_at))
+  end
+
+  # `verified`, returning the data re-encoded as JSON in this verifier's
+  # serializer. Key order is kept; escapes and number formatting are
+  # normalized, which only matters if the caller re-signs the result.
+  pub def verify_raw(message : String, purpose : String?, now : Time) : String | Failure
+    value = verify(message, purpose, now)
+    value.is_a?(Failure) ? value : @serializer.encode_json(value)
+  end
+
+  # `verified`/`verify`: the value, or why it couldn't be read.
+  pub def verify(message : String, purpose : String?, now : Time) : Value | Failure
+    result = read_message(message, purpose, now)
+    return result unless result.is_a?(Failure) && result.rotates?
+    @rotations.each do |rotation|
+      attempt = rotation.read_message(message, purpose, now)
+      return attempt unless attempt.is_a?(Failure) && attempt.rotates?
+    end
+    result
+  end
+
+  protected def read_message(message : String, purpose : String?, now : Time) : Value | Failure
+    encoded = extract_encoded(message)
+    return Failure::InvalidSignature unless encoded
+    decoded = urlsafe_decode(encoded)
+    return Failure::InvalidSignature unless decoded
+    deserialize_with_metadata(@serializer, decoded, purpose, now, true)
+  end
+
+  def sign(serialized : String) : String
+    encoded = case @encoding
+              when Encoding::Strict  then strict_encode(serialized)
+              when Encoding::UrlSafe then urlsafe_encode_unpadded(serialized)
+              else                        urlsafe_encode_padded(serialized)
+              end
+    "#{encoded}--#{hex(hmac(@digest, @secret, encoded))}"
+  end
+
+  # `extract_encoded`: the digest is the last `2 * digest_length`
+  # characters, preceded by `--`.
+  def extract_encoded(signed : String) : String?
+    digest_length = @digest.sha1? ? 40 : 64
+    index = signed.bytesize - digest_length - 2
+    return nil if index < 0
+    return nil unless signed.as_tape[index] == '-'.ord && signed.as_tape[index + 1] == '-'.ord
+    encoded = signed[0, index]
+    digest = signed[index + 2, digest_length]
+    # `data.present? && digest.present?`
+    return nil if encoded.blank? || digest.blank?
+    constant_time_eq?(digest, hex(hmac(@digest, @secret, encoded))) ? encoded : nil
+  end
+end

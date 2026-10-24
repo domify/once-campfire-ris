@@ -1,0 +1,17 @@
+<%# reference/app/views/rooms/layouts/_form.html.erb, up to the room-access section the form's content fills -%>
+<form action="<%= room.action(kind) %>" accept-charset="UTF-8" method="post"><% if room.id %><input type="hidden" name="_method" value="patch" /><% end %>
+  <div class="flex align-center gap">
+<% if can_administer %>      <%= translation_button(ctx, "room_name") %>
+
+      <label class="flex-item-grow txt-large">
+        <input name="room[name]" id="room_name" class="input full-width" required="required" autofocus="autofocus" placeholder="Name the room" data-turbo-permanent="true" data-action="keydown.enter-&gt;form#submit:prevent" type="text"<% if name = room.name %> value="<%= name %>"<% end %> />
+        <span class="for-screen-reader">Name this room</span>
+      </label>
+<% else %>      <h1 class="flex-item-grow txt-x-large">
+        <%= room.display_name %>
+      </h1>
+<% end %>  </div>
+
+  <hr class="margin-block borderless">
+
+  <section class="room-access margin-block pad-inline fill-shade border-radius">

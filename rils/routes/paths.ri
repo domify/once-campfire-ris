@@ -1,0 +1,302 @@
+# Path helpers mirroring `reference/config/routes.rb`, named as Rails' `*_path`
+# helpers. Shared by controllers (redirects) and views (links).
+module rils/routes/paths
+
+pub def root_path : String
+  "/"
+end
+
+pub def first_run_path : String
+  "/first_run"
+end
+
+pub def session_path : String
+  "/session"
+end
+
+pub def new_session_path : String
+  "/session/new"
+end
+
+pub def session_transfer_path(id : String | Int64) : String
+  "/session/transfers/#{id}"
+end
+
+pub def account_path : String
+  "/account"
+end
+
+pub def edit_account_path : String
+  "/account/edit"
+end
+
+pub def account_users_path : String
+  "/account/users"
+end
+
+pub def account_user_path(id : String | Int64) : String
+  "/account/users/#{id}"
+end
+
+pub def edit_account_user_path(id : String | Int64) : String
+  "/account/users/#{id}/edit"
+end
+
+pub def account_bots_path : String
+  "/account/bots"
+end
+
+pub def new_account_bot_path : String
+  "/account/bots/new"
+end
+
+pub def account_bot_path(id : String | Int64) : String
+  "/account/bots/#{id}"
+end
+
+pub def edit_account_bot_path(id : String | Int64) : String
+  "/account/bots/#{id}/edit"
+end
+
+pub def account_bot_key_path(bot_id : String | Int64) : String
+  "/account/bots/#{bot_id}/key"
+end
+
+pub def account_join_code_path : String
+  "/account/join_code"
+end
+
+pub def account_logo_path : String
+  "/account/logo"
+end
+
+pub def account_custom_styles_path : String
+  "/account/custom_styles"
+end
+
+pub def edit_account_custom_styles_path : String
+  "/account/custom_styles/edit"
+end
+
+pub def join_path(join_code : String | Int64) : String
+  "/join/#{join_code}"
+end
+
+pub def qr_code_path(id : String | Int64) : String
+  "/qr_code/#{id}"
+end
+
+pub def user_path(id : String | Int64) : String
+  "/users/#{id}"
+end
+
+pub def user_avatar_path(user_id : String | Int64) : String
+  "/users/#{user_id}/avatar"
+end
+
+pub def user_ban_path(user_id : String | Int64) : String
+  "/users/#{user_id}/ban"
+end
+
+pub def user_sidebar_path : String
+  "/users/me/sidebar"
+end
+
+pub def user_profile_path : String
+  "/users/me/profile"
+end
+
+pub def edit_user_profile_path : String
+  "/users/me/profile/edit"
+end
+
+pub def user_push_subscriptions_path : String
+  "/users/me/push_subscriptions"
+end
+
+pub def user_push_subscription_path(id : String | Int64) : String
+  "/users/me/push_subscriptions/#{id}"
+end
+
+pub def user_push_subscription_test_notifications_path(push_subscription_id : String | Int64) : String
+  "/users/me/push_subscriptions/#{push_subscription_id}/test_notifications"
+end
+
+pub def autocompletable_users_path : String
+  "/autocompletable/users"
+end
+
+pub def rooms_path : String
+  "/rooms"
+end
+
+pub def new_room_path : String
+  "/rooms/new"
+end
+
+pub def room_path(id : String | Int64) : String
+  "/rooms/#{id}"
+end
+
+pub def edit_room_path(id : String | Int64) : String
+  "/rooms/#{id}/edit"
+end
+
+pub def room_messages_path(room_id : String | Int64) : String
+  "/rooms/#{room_id}/messages"
+end
+
+pub def new_room_message_path(room_id : String | Int64) : String
+  "/rooms/#{room_id}/messages/new"
+end
+
+pub def room_message_path(room_id : String | Int64, id : String | Int64) : String
+  "/rooms/#{room_id}/messages/#{id}"
+end
+
+pub def edit_room_message_path(room_id : String | Int64, id : String | Int64) : String
+  "/rooms/#{room_id}/messages/#{id}/edit"
+end
+
+pub def room_bot_messages_path(room_id : String | Int64, bot_key : String | Int64) : String
+  "/rooms/#{room_id}/#{bot_key}/messages"
+end
+
+pub def room_bot_message_path(room_id : String | Int64, bot_key : String | Int64, id : String | Int64) : String
+  "/rooms/#{room_id}/#{bot_key}/messages/#{id}"
+end
+
+pub def room_bot_message_boosts_path(room_id : String | Int64, bot_key : String | Int64, message_id : String | Int64) : String
+  "/rooms/#{room_id}/#{bot_key}/messages/#{message_id}/boosts"
+end
+
+pub def room_bot_message_boost_path(room_id : String | Int64, bot_key : String | Int64, message_id : String | Int64, id : String | Int64) : String
+  "/rooms/#{room_id}/#{bot_key}/messages/#{message_id}/boosts/#{id}"
+end
+
+pub def room_refresh_path(room_id : String | Int64) : String
+  "/rooms/#{room_id}/refresh"
+end
+
+pub def room_settings_path(room_id : String | Int64) : String
+  "/rooms/#{room_id}/settings"
+end
+
+pub def room_involvement_path(room_id : String | Int64) : String
+  "/rooms/#{room_id}/involvement"
+end
+
+pub def room_at_message_path(room_id : String | Int64, message_id : String | Int64) : String
+  "/rooms/#{room_id}/@#{message_id}"
+end
+
+pub def rooms_opens_path : String
+  "/rooms/opens"
+end
+
+pub def new_rooms_open_path : String
+  "/rooms/opens/new"
+end
+
+pub def rooms_open_path(id : String | Int64) : String
+  "/rooms/opens/#{id}"
+end
+
+pub def edit_rooms_open_path(id : String | Int64) : String
+  "/rooms/opens/#{id}/edit"
+end
+
+pub def rooms_closeds_path : String
+  "/rooms/closeds"
+end
+
+pub def new_rooms_closed_path : String
+  "/rooms/closeds/new"
+end
+
+pub def rooms_closed_path(id : String | Int64) : String
+  "/rooms/closeds/#{id}"
+end
+
+pub def edit_rooms_closed_path(id : String | Int64) : String
+  "/rooms/closeds/#{id}/edit"
+end
+
+pub def rooms_directs_path : String
+  "/rooms/directs"
+end
+
+pub def new_rooms_direct_path : String
+  "/rooms/directs/new"
+end
+
+pub def rooms_direct_path(id : String | Int64) : String
+  "/rooms/directs/#{id}"
+end
+
+pub def edit_rooms_direct_path(id : String | Int64) : String
+  "/rooms/directs/#{id}/edit"
+end
+
+pub def messages_path : String
+  "/messages"
+end
+
+pub def message_path(id : String | Int64) : String
+  "/messages/#{id}"
+end
+
+pub def edit_message_path(id : String | Int64) : String
+  "/messages/#{id}/edit"
+end
+
+pub def message_boosts_path(message_id : String | Int64) : String
+  "/messages/#{message_id}/boosts"
+end
+
+pub def new_message_boost_path(message_id : String | Int64) : String
+  "/messages/#{message_id}/boosts/new"
+end
+
+pub def message_boost_path(message_id : String | Int64, id : String | Int64) : String
+  "/messages/#{message_id}/boosts/#{id}"
+end
+
+pub def searches_path : String
+  "/searches"
+end
+
+pub def clear_searches_path : String
+  "/searches/clear"
+end
+
+pub def unfurl_link_path : String
+  "/unfurl_link"
+end
+
+pub def webmanifest_path : String
+  "/webmanifest"
+end
+
+pub def service_worker_path : String
+  "/service-worker"
+end
+
+pub def rails_health_check_path : String
+  "/up"
+end
+
+# `direct :fresh_user_avatar`: cache-busting avatar URL keyed by the signed
+# avatar token.
+pub def fresh_user_avatar_path(avatar_token : String, updated_at_number : String) : String
+  "/users/#{avatar_token}/avatar?v=#{updated_at_number}"
+end
+
+# `direct :fresh_account_logo`: `v` is the account's
+# `updated_at.to_fs(:number)`, when present.
+pub def fresh_account_logo_path(v : String?, size : String?) : String
+  query = [] of String
+  query << "size=#{size}" if size
+  query << "v=#{v}" if v
+  query.empty? ? account_logo_path : "#{account_logo_path}?#{query.join("&")}"
+end

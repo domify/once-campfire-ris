@@ -1,0 +1,496 @@
+# `reference/app/models/message.rb` and `message/*.rb` (Attachment,
+# Mentionee, Pagination, Searchable; Broadcasts belong to the app). Also
+# what touches a message from below it: boosts, a room's destruction and a
+# banned user's content, and the webhook payload.
+module models/message
+
+import std/json::{Any}
+import std/text
+import rils/rails_compat/json::{encode}
+import rils/record/sqlite::{Connection, Row, SqlValue, placeholders}
+import rils/record/timestamp::{Timestamp}
+import rils/record/database::{Tx, RichText}
+import rils/record/errors::{RecordNotFound}
+import rils/record/events::{PushMessage, PurgeBlob}
+import rils/record/random::{uuid}
+import models/user::{User, USER_SELECT}
+import models/room::{Room}
+import models/boost::{Boost}
+import models/rich_text_record::{RichTextRecord}
+import models/active_storage::{Attachment, Blob}
+import models/sound::{Sound}
+import models/webhook::{Webhook}
+
+# `Message::Pagination::PAGE_SIZE`
+pub PAGE_SIZE = 40
+
+RECORD_TYPE = "Message"
+
+pub MESSAGE_COLUMNS = %("messages"."id", "messages"."room_id", "messages"."creator_id", "messages"."client_message_id", "messages"."created_at", "messages"."updated_at")
+
+SELECT_IN_ROOM = %(SELECT #{MESSAGE_COLUMNS} FROM "messages" WHERE "messages"."room_id" = ?)
+
+SELECT_REACHABLE = %(SELECT #{MESSAGE_COLUMNS} FROM "messages" INNER JOIN "rooms" ON "messages"."room_id" = "rooms"."id" INNER JOIN "memberships" ON "rooms"."id" = "memberships"."room_id")
+
+# How many of the newest global matches `search_reachable` probes before
+# letting SQLite plan the room-first search instead.
+SEARCH_PROBE_LIMIT = 1000
+
+pub enum ContentType
+  Attachment
+  Sound
+  Text
+
+  def name : String
+    case self
+    when ContentType::Attachment then "attachment"
+    when ContentType::Sound      then "sound"
+    else                              "text"
+    end
+  end
+end
+
+# Attributes for `room.messages.create!` / `create_with_attachment!`.
+pub class NewMessage
+  property room_id : Int64
+  property creator_id : Int64
+  # Defaults to a random UUID (`before_create`; "Bots don't care").
+  property client_message_id : String?
+  # The stored Action Text body, if one was assigned.
+  property body : String?
+  # An already-saved blob to attach as `attachment`.
+  property attachment_blob_id : Int64?
+
+  def initialize(@room_id : Int64, @creator_id : Int64, @client_message_id : String? = nil, @body : String? = nil, @attachment_blob_id : Int64? = nil)
+  end
+end
+
+pub class Message
+  getter id : Int64
+  getter room_id : Int64
+  getter creator_id : Int64
+  getter client_message_id : String
+  getter created_at : Timestamp
+  getter updated_at : Timestamp
+
+  def initialize(@id : Int64, @room_id : Int64, @creator_id : Int64, @client_message_id : String, @created_at : Timestamp, @updated_at : Timestamp)
+  end
+
+  pub def self.from_row(row : Row, offset : Int32 = 0) : Message
+    Message.new(row.int(offset), row.int(offset + 1), row.int(offset + 2), row.text(offset + 3), row.time(offset + 4), row.time(offset + 5))
+  end
+
+  def self.many(conn : Connection, sql : String, args : Array(SqlValue)) : Array(Message)
+    conn.query_all(sql, args) { |row| Message.from_row(row) }
+  end
+
+  def self.one(conn : Connection, sql : String, args : Array(SqlValue)) : Message?
+    conn.query_one(sql, args) { |row| Message.from_row(row) }
+  end
+
+  pub def self.find(conn : Connection, id : Int64) : Message | RecordNotFound
+    find_by_id(conn, id) || RecordNotFound.new("Message")
+  end
+
+  pub def self.find_by_id(conn : Connection, id : Int64) : Message?
+    one(conn, %(SELECT #{MESSAGE_COLUMNS} FROM "messages" WHERE "messages"."id" = ? LIMIT 1), [id] of SqlValue)
+  end
+
+  # `Message.last`
+  pub def self.last(conn : Connection) : Message?
+    one(conn, %(SELECT #{MESSAGE_COLUMNS} FROM "messages" ORDER BY "messages"."id" DESC LIMIT 1), [] of SqlValue)
+  end
+
+  pub def self.count(conn : Connection) : Int64
+    conn.count(%(SELECT COUNT(*) FROM "messages"))
+  end
+
+  # `user.messages`
+  pub def self.by_creator(conn : Connection, creator_id : Int64) : Array(Message)
+    many(conn, %(SELECT #{MESSAGE_COLUMNS} FROM "messages" WHERE "messages"."creator_id" = ?), [creator_id] of SqlValue)
+  end
+
+  # `room.messages`
+  pub def self.for_room(conn : Connection, room_id : Int64) : Array(Message)
+    many(conn, SELECT_IN_ROOM, [room_id] of SqlValue)
+  end
+
+  # `room.messages.find(id)`
+  pub def self.find_in_room(conn : Connection, room_id : Int64, id : Int64) : Message | RecordNotFound
+    one(conn, %(#{SELECT_IN_ROOM} AND "messages"."id" = ? LIMIT 1), [room_id, id] of SqlValue) || RecordNotFound.new("Message")
+  end
+
+  # `room.messages.count`
+  pub def self.count_in_room(conn : Connection, room_id : Int64) : Int64
+    conn.count(%(SELECT COUNT(*) FROM "messages" WHERE "messages"."room_id" = ?), [room_id] of SqlValue)
+  end
+
+  # `Current.user.reachable_messages.find(id)`
+  pub def self.find_reachable(conn : Connection, user_id : Int64, id : Int64) : Message | RecordNotFound
+    one(conn, %(#{SELECT_REACHABLE} WHERE "memberships"."user_id" = ? AND "messages"."id" = ? LIMIT 1), [user_id, id] of SqlValue) || RecordNotFound.new("Message")
+  end
+
+  # `room.messages.last_page`: the newest 40, oldest first.
+  pub def self.last_page(conn : Connection, room_id : Int64) : Array(Message)
+    many(conn, %(#{SELECT_IN_ROOM} ORDER BY "messages"."created_at" DESC LIMIT #{PAGE_SIZE}), [room_id] of SqlValue).reversed
+  end
+
+  # `room.messages.first_page`
+  pub def self.first_page(conn : Connection, room_id : Int64) : Array(Message)
+    many(conn, %(#{SELECT_IN_ROOM} ORDER BY "messages"."created_at" ASC LIMIT #{PAGE_SIZE}), [room_id] of SqlValue)
+  end
+
+  # `room.messages.page_before(message)`
+  pub def self.page_before(conn : Connection, room_id : Int64, message : Message) : Array(Message)
+    many(conn, %(#{SELECT_IN_ROOM} AND (created_at < ?) ORDER BY "messages"."created_at" DESC LIMIT #{PAGE_SIZE}), [room_id, message.created_at] of SqlValue).reversed
+  end
+
+  # `room.messages.page_after(message)`
+  pub def self.page_after(conn : Connection, room_id : Int64, message : Message) : Array(Message)
+    many(conn, %(#{SELECT_IN_ROOM} AND (created_at > ?) ORDER BY "messages"."created_at" ASC LIMIT #{PAGE_SIZE}), [room_id, message.created_at] of SqlValue)
+  end
+
+  # `room.messages.page_around(message)`: up to 40 before, the message, up to
+  # 40 after.
+  pub def self.page_around(conn : Connection, room_id : Int64, message : Message) : Array(Message)
+    page = page_before(conn, room_id, message)
+    page << message
+    page.concat(page_after(conn, room_id, message))
+  end
+
+  # `room.messages.page_created_since(time)`
+  pub def self.page_created_since(conn : Connection, room_id : Int64, time : Timestamp) : Array(Message)
+    many(conn, %(#{SELECT_IN_ROOM} AND (created_at > ?) ORDER BY "messages"."created_at" ASC LIMIT #{PAGE_SIZE}), [room_id, time] of SqlValue)
+  end
+
+  # `room.messages.without(excluding).page_updated_since(time)`
+  pub def self.page_updated_since(conn : Connection, room_id : Int64, time : Timestamp, excluding : Array(Int64)) : Array(Message)
+    values = [room_id] of SqlValue
+    excluding.each { |id| values << id }
+    values << time
+    many(conn, page_updated_since_sql(excluding.size), values).reversed
+  end
+
+  # `room.messages.before(message).exists?`
+  pub def self.exists_before?(conn : Connection, room_id : Int64, message : Message) : Bool
+    conn.exists?(%(SELECT 1 FROM "messages" WHERE "messages"."room_id" = ? AND (created_at < ?) LIMIT 1), [room_id, message.created_at] of SqlValue)
+  end
+
+  # `room.messages.after(message).exists?`
+  pub def self.exists_after?(conn : Connection, room_id : Int64, message : Message) : Bool
+    conn.exists?(%(SELECT 1 FROM "messages" WHERE "messages"."room_id" = ? AND (created_at > ?) LIMIT 1), [room_id, message.created_at] of SqlValue)
+  end
+
+  # `room.messages.paged?`: more than a page (`count > PAGE_SIZE`). Asks
+  # whether a row exists past the first page rather than counting the whole
+  # room, which grows without bound.
+  pub def self.paged?(conn : Connection, room_id : Int64) : Bool
+    conn.exists?(%(SELECT 1 FROM "messages" WHERE "messages"."room_id" = ? LIMIT 1 OFFSET #{PAGE_SIZE}), [room_id] of SqlValue)
+  end
+
+  # `room.messages.search(query)`: FTS5 `MATCH`, in message order.
+  pub def self.search_in_room(conn : Connection, room_id : Int64, query : String) : Array(Message)
+    terms = match_terms(query)
+    return [] of Message if terms.empty?
+    many(conn, %(SELECT #{MESSAGE_COLUMNS} FROM "messages" join message_search_index idx on messages.id = idx.rowid WHERE "messages"."room_id" = ? AND (idx.body match ?) ORDER BY "messages"."created_at" ASC), [room_id, terms] of SqlValue)
+  end
+
+  # `Current.user.reachable_messages.search(query).last(100)`
+  pub def self.search_reachable(conn : Connection, user_id : Int64, query : String) : Array(Message)
+    terms = match_terms(query)
+    return [] of Message if terms.empty?
+    page = search_index_page(conn, user_id, terms)
+    return page if page
+    # A sparse membership set can miss most global matches. Let SQLite
+    # choose the room-first plan instead of scanning the remaining
+    # inaccessible history.
+    many(conn, %(#{SELECT_REACHABLE} join message_search_index idx on messages.id = idx.rowid WHERE "memberships"."user_id" = ? AND (idx.body match ?) ORDER BY "messages"."id" DESC LIMIT 100), [user_id, terms] of SqlValue).reversed
+  end
+
+  # The newest global matches, ordered by the index's rowid (the message
+  # id), so SQLite walks them newest first and stops at the page; nil when
+  # the probe ran out before a complete page.
+  def self.search_index_page(conn : Connection, user_id : Int64, terms : String) : Array(Message)?
+    rows = conn.query_all(%(SELECT #{MESSAGE_COLUMNS}, memberships.user_id IS NOT NULL AS reachable FROM messages INNER JOIN rooms ON messages.room_id = rooms.id LEFT JOIN memberships ON rooms.id = memberships.room_id AND memberships.user_id = ? JOIN message_search_index idx ON messages.id = idx.rowid WHERE idx.body MATCH ? ORDER BY idx.rowid DESC LIMIT #{SEARCH_PROBE_LIMIT}), [user_id, terms] of SqlValue) { |row| {Message.from_row(row), row.bool(6)} }
+    messages = [] of Message
+    rows.each do |pair|
+      next unless pair[1]
+      messages << pair[0]
+      return messages.reversed if messages.size == 100
+    end
+    # Exhausting the global matches also proves that a short page is
+    # complete.
+    rows.size < SEARCH_PROBE_LIMIT ? messages.reversed : nil
+  end
+
+  # `room.messages.create!` (or `create_with_attachment!` given a blob).
+  # Inside the transaction: the message, its body (which touches the
+  # message), its attachment, and the room touch. After commit: the search
+  # index, then `room.receive` (unread memberships and the push job).
+  pub def self.create(tx : Tx, attributes : NewMessage) : Message
+    now = tx.now
+    client_message_id = attributes.client_message_id || uuid
+    id = tx.conn.query_one(%(INSERT INTO "messages" ("client_message_id", "created_at", "creator_id", "room_id", "updated_at") VALUES (?, ?, ?, ?, ?) RETURNING "id"), [client_message_id, now, attributes.creator_id, attributes.room_id, now] of SqlValue) { |row| row.int(0) }
+    raise "insert into messages returned no id" unless id
+    updated_at = now
+    touched = false
+    if body = attributes.body
+      RichTextRecord.create(tx, RECORD_TYPE, id, "body", body)
+      touched = true
+    end
+    if blob_id = attributes.attachment_blob_id
+      Attachment.create(tx, RECORD_TYPE, id, "attachment", blob_id)
+      touched = true
+    end
+    updated_at = touch_row(tx, id) if touched
+    Room.touch(tx, attributes.room_id)
+    message = Message.new(id, attributes.room_id, attributes.creator_id, client_message_id, now, updated_at)
+    tx.after_commit do |after|
+      message.create_in_index(after)
+      Room.unread_memberships(after, message.room_id, message.created_at, message.creator_id)
+      after.emit_after_commit(PushMessage.new(message.room_id, message.id))
+    end
+    message
+  end
+
+  # `message.update!(body:)`: the body changes, which touches the message
+  # and its room; the search index follows after commit.
+  pub def update_body(tx : Tx, body : String) : Nil
+    record = RichTextRecord.find_for(tx.conn, RECORD_TYPE, @id, "body")
+    if record
+      return if record.body == body
+      record.update_body(tx, body)
+    else
+      RichTextRecord.create(tx, RECORD_TYPE, @id, "body", body)
+    end
+    touch(tx)
+  end
+
+  # `touch` (from a boost, or the body): the message, then its room, then a
+  # reindex after commit.
+  pub def touch(tx : Tx) : Nil
+    @updated_at = Message.touch_row(tx, @id)
+    Room.touch(tx, @room_id)
+    id = @id
+    tx.after_commit do |after|
+      found = Message.find_by_id(after.conn, id)
+      found.update_in_index(after) if found
+    end
+  end
+
+  def self.touch_row(tx : Tx, id : Int64) : Timestamp
+    now = tx.now
+    tx.conn.execute(%(UPDATE "messages" SET "updated_at" = ? WHERE "messages"."id" = ?), [now, id] of SqlValue)
+    now
+  end
+
+  # `update!(attachment: blob or nil)`: `has_one_attached` replaces the
+  # attachment. The old one is destroyed (its blob purged after commit,
+  # `dependent: :purge_later`) and each attachment change touches the
+  # message (`belongs_to :record, touch: true`), and so its room.
+  pub def replace_attachment(tx : Tx, blob_id : Int64?) : Nil
+    if attachment = Attachment.find_for(tx.conn, RECORD_TYPE, @id, "attachment")
+      attachment.delete(tx)
+      tx.emit_after_commit(PurgeBlob.new(attachment.blob_id))
+      touch(tx)
+    end
+    if blob_id
+      Attachment.create(tx, RECORD_TYPE, @id, "attachment", blob_id)
+      touch(tx)
+    end
+  end
+
+  # `destroy`: its attachment (blob purged later), boosts and body, then the
+  # message, and the room is touched. The search index entry goes after
+  # commit.
+  pub def destroy(tx : Tx) : Nil
+    if attachment = Attachment.find_for(tx.conn, RECORD_TYPE, @id, "attachment")
+      attachment.delete(tx)
+      tx.emit_after_commit(PurgeBlob.new(attachment.blob_id))
+    end
+    Boost.for_message(tx.conn, @id).each(&.delete_row(tx))
+    if body = RichTextRecord.find_for(tx.conn, RECORD_TYPE, @id, "body")
+      body.delete(tx)
+    end
+    tx.conn.execute(%(DELETE FROM "messages" WHERE "messages"."id" = ?), [@id] of SqlValue)
+    Room.touch(tx, @room_id)
+    id = @id
+    tx.after_commit { |after| after.conn.execute("delete from message_search_index where rowid = ?", [id] of SqlValue) }
+  end
+
+  def create_in_index(tx : Tx) : Nil
+    tx.conn.execute("insert into message_search_index(rowid, body) values (?, ?)", [@id, plain_text_body(tx.conn, tx.rich_text)] of SqlValue)
+  end
+
+  def update_in_index(tx : Tx) : Nil
+    tx.conn.execute("update message_search_index set body = ? where rowid = ?", [plain_text_body(tx.conn, tx.rich_text), @id] of SqlValue)
+  end
+
+  pub def room(conn : Connection) : Room | RecordNotFound
+    Room.find(conn, @room_id)
+  end
+
+  pub def creator(conn : Connection) : User | RecordNotFound
+    User.find(conn, @creator_id)
+  end
+
+  pub def boosts(conn : Connection) : Array(Boost)
+    Boost.for_message_ordered(conn, @id)
+  end
+
+  pub def body(conn : Connection) : RichTextRecord?
+    RichTextRecord.find_for(conn, RECORD_TYPE, @id, "body")
+  end
+
+  # `message.body.body` as stored HTML, if any.
+  pub def body_html(conn : Connection) : String?
+    record = body(conn)
+    record ? record.body : nil
+  end
+
+  # The attachment and its blob, if attached.
+  pub def attachment(conn : Connection) : Tuple(Attachment, Blob)?
+    attachment = Attachment.find_for(conn, RECORD_TYPE, @id, "attachment")
+    return nil unless attachment
+    blob = attachment.blob(conn)
+    blob.is_a?(Blob) ? {attachment, blob} : nil
+  end
+
+  # `plain_text_body`:
+  # `body.to_plain_text.presence || attachment&.filename&.to_s || ""`
+  pub def plain_text_body(conn : Connection, rich_text : RichText) : String
+    if html = body_html(conn)
+      text = rich_text.to_plain_text(conn, html)
+      return text unless text.blank?
+    end
+    attached = attachment(conn)
+    attached ? attached[1].filename : ""
+  end
+
+  # `content_type`
+  pub def content_type(conn : Connection, rich_text : RichText) : ContentType
+    return ContentType::Attachment if attachment(conn)
+    return ContentType::Sound if sound(conn, rich_text)
+    ContentType::Text
+  end
+
+  # `sound`: a body of exactly `/play <name>` naming a built-in sound.
+  pub def sound(conn : Connection, rich_text : RichText) : Sound?
+    sound_in(plain_text_body(conn, rich_text))
+  end
+
+  # `mentionees`: mentioned users who are members of the room.
+  pub def mentionees(conn : Connection, rich_text : RichText) : Array(User)
+    html = body_html(conn)
+    ids = html ? rich_text.mentioned_user_ids(conn, html) : [] of Int64
+    mentionees_in_room(conn, @room_id, ids)
+  end
+end
+
+# `room.users.where(id: ids)`
+pub def mentionees_in_room(conn : Connection, room_id : Int64, user_ids : Array(Int64)) : Array(User)
+  return [] of User if user_ids.empty?
+  values = [room_id] of SqlValue
+  user_ids.each { |id| values << id }
+  User.find_by_sql(conn, %(#{USER_SELECT} INNER JOIN "memberships" ON "users"."id" = "memberships"."user_id" WHERE "memberships"."room_id" = ? AND "users"."id" IN (#{placeholders(user_ids.size)})), values)
+end
+
+# `plain_text_body.match(/\A\/play (?<name>\w+)\z/)` then
+# `Sound.find_by_name`. `\z` allows no trailing newline; `\w` is ASCII word
+# characters.
+pub def sound_in(plain_text : String) : Sound?
+  return nil unless plain_text.starts_with?("/play ")
+  name = plain_text[6, plain_text.bytesize - 6]
+  return nil if name.empty?
+  name.each_byte do |byte|
+    word = (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == '_'.ord
+    return nil unless word
+  end
+  Sound.find_by_name(name)
+end
+
+# `Message.page_updated_since`'s query, leaving out *excluding* ids: the
+# room's id, those ids, then the time. Sorting on `+created_at`, which no
+# index covers, has SQLite find the messages updated since through
+# `(room_id, updated_at)` and sort just those, instead of walking the whole
+# room by `(room_id, created_at)` looking for them.
+pub def page_updated_since_sql(excluding : Int32) : String
+  without = excluding == 0 ? "" : %( AND "messages"."id" NOT IN (#{placeholders(excluding)}))
+  %(#{SELECT_IN_ROOM}#{without} AND (updated_at > ?) ORDER BY +"messages"."created_at" DESC LIMIT #{PAGE_SIZE})
+end
+
+# Each word of a search as an FTS5 string, so every word must appear and
+# none is read as query syntax. Rails passes the words straight to `MATCH`,
+# where `NOT`, `AND`, `OR` or `NEAR` in the wrong place is a syntax error (a
+# 500). NULs separate words too: SQLite would end the query string at one.
+pub def match_terms(query : String) : String
+  words = [] of String
+  current = String::Builder.new
+  query.each_char do |c|
+    if c.whitespace? || c == '\0'
+      words << current.to_s unless current.empty?
+      current = String::Builder.new
+    else
+      current << c
+    end
+  end
+  words << current.to_s unless current.empty?
+  words.map { |word| %("#{word.gsub("\"", "\"\"")}") }.join(" ")
+end
+
+# `message.boosts.create!(content:, booster:)`: touches the message (and so
+# the room).
+pub def create_boost(tx : Tx, message : Message, booster_id : Int64, content : String) : Boost
+  boost = Boost.insert(tx, message.id, booster_id, content)
+  message.touch(tx)
+  boost
+end
+
+# `boost.destroy!`: touches the message (and so the room).
+pub def destroy_boost(tx : Tx, boost : Boost) : Nil
+  boost.delete_row(tx)
+  message = Message.find_by_id(tx.conn, boost.message_id)
+  message.touch(tx) if message
+end
+
+# `room.destroy`: memberships are deleted without callbacks, messages are
+# destroyed.
+pub def destroy_room(tx : Tx, room : Room) : Nil
+  tx.conn.execute(%(DELETE FROM "memberships" WHERE "memberships"."room_id" = ?), [room.id] of SqlValue)
+  Message.for_room(tx.conn, room.id).each(&.destroy(tx))
+  tx.conn.execute(%(DELETE FROM "rooms" WHERE "rooms"."id" = ?), [room.id] of SqlValue)
+end
+
+# `user.remove_banned_content`: destroys every message the user wrote.
+# Returns them so the caller can `broadcast_remove` each one.
+pub def remove_banned_content(tx : Tx, user : User) : Array(Message)
+  messages = Message.by_creator(tx.conn, user.id)
+  messages.each(&.destroy(tx))
+  messages
+end
+
+# The JSON body `Webhook#deliver` posts. *room_bot_messages_path* and
+# *message_path* come from the route helpers
+# (`room_bot_messages_path(room, bot_key)`,
+# `room_at_message_path(room, message)`).
+pub def webhook_payload(conn : Connection, rich_text : RichText, webhook : Webhook, message : Message, room_bot_messages_path : String, message_path : String) : String | RecordNotFound
+  creator = message.creator(conn)
+  return creator if creator.is_a?(RecordNotFound)
+  room = Room.find(conn, message.room_id)
+  return room if room.is_a?(RecordNotFound)
+  recipient = User.find(conn, webhook.user_id)
+  return recipient if recipient.is_a?(RecordNotFound)
+  html = message.body_html(conn)
+  plain = without_recipient_mentions(message.plain_text_body(conn, rich_text), recipient)
+  # Hash order as written in `Webhook#payload`.
+  user_hash = {"id" => Any.new(creator.id), "name" => Any.new(creator.name)}
+  room_hash = {"id" => Any.new(room.id), "name" => Any.new(room.name), "path" => Any.new(room_bot_messages_path)}
+  body_hash = {"html" => Any.new(html), "plain" => Any.new(plain)}
+  message_hash = {"id" => Any.new(message.id), "body" => Any.new(body_hash), "path" => Any.new(message_path)}
+  encode(Any.new({"user" => Any.new(user_hash), "room" => Any.new(room_hash), "message" => Any.new(message_hash)}))
+end
+
+# Removes `@Recipient` mentions and leading/trailing (Unicode) whitespace.
+def without_recipient_mentions(body : String, recipient : User) : String
+  body.gsub(recipient.attachable_plain_text_representation, "").strip
+end

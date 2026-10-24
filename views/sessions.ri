@@ -1,0 +1,82 @@
+# Views for `reference/app/views/sessions`.
+module views/sessions
+
+import std/text
+import rils/routes/paths::{session_path}
+import rils/template/html::{Html, empty_html}
+import rils/template/recorded::{RecordedPage}
+import rils/template/template::{Template, Buffer}
+import views/context::{ViewContext}
+import views/layouts::{render_in_layout}
+import views/helpers/tag::*
+import views/helpers/assets::{image_tag}
+import views/helpers/forms::{form_with, button_tag}
+import views/helpers/links::{link_to}
+import views/helpers/users::{account_logo_tag}
+import views/helpers/translations::{translation_button}
+import views/helpers/turbo::{turbo_page_requires_reload_tag}
+import views/helpers/application::{version_badge}
+
+# What `accounts/_help_contact` shows of `User.administrator.first`.
+pub class HelpContact
+  getter name : String
+  getter email_address : String
+
+  def initialize(@name : String, @email_address : String)
+  end
+end
+
+# `sessions/new.html.erb`.
+pub class New
+  getter ctx : ViewContext
+  # `params[:email_address]`.
+  getter email_address : String?
+  getter help_contact : HelpContact?
+
+  def initialize(@ctx : ViewContext, @email_address : String?, @help_contact : HelpContact?)
+  end
+
+  Template.def_page("sessions/new.html.erb")
+
+  pub def page(frame : Bool = false) : RecordedPage
+    render_in_layout(@ctx, "Sign in", nil, frame) { |buffer| render_into(buffer) }
+  end
+end
+
+# `AllowBrowser::VERSIONS` the page lists: those with a version (not `ie`).
+SUPPORTED_BROWSERS = [{"safari", "17.2"}, {"chrome", "120"}, {"firefox", "121"}, {"opera", "104"}]
+
+# `sessions/incompatible_browser.html.erb`, which `allow_browser` renders
+# for a browser too old.
+pub class IncompatibleBrowser
+  getter ctx : ViewContext
+
+  def initialize(@ctx : ViewContext)
+  end
+
+  Template.def_page("sessions/incompatible_browser.html.erb")
+
+  pub def page_title : String
+    @ctx.platform.apple_messages ? "Campfire" : "Unsupported browser"
+  end
+
+  pub def page(frame : Bool = false) : RecordedPage
+    render_in_layout(@ctx, page_title, nil, frame) { |buffer| render_into(buffer) }
+  end
+end
+
+# `sessions/transfers/show.html.erb`: the form that submits a transfer token
+# on load (`auto_submit_form_with method: :put`), `action` the transfer's path.
+pub class TransferShow
+  getter ctx : ViewContext
+  getter action : String
+
+  def initialize(@ctx : ViewContext, @action : String)
+  end
+
+  Template.def_page("sessions/transfers/show.html.erb")
+
+  pub def page(frame : Bool = false) : RecordedPage
+    render_in_layout(@ctx, nil, nil, frame) { |buffer| render_into(buffer) }
+  end
+end

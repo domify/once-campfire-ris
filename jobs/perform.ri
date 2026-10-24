@@ -1,0 +1,83 @@
+# What each job does when the queue gets to it
+# (reference/app/jobs, and Active Storage's own). Nothing retries
+# (`retry_on` is commented out in `ApplicationJob`).
+module jobs/perform
+
+import std/text
+import rils/record/sqlite::{SqlValue}
+import rils/record/events::{PushMessage, DeliverWebhook, RemoveBannedContent, PurgeBlob, DisconnectUser}
+import models/message::{Message}
+import models/room::{Room}
+import rils/storage/blob::{Blob}
+import config/app::{App}
+import jobs/jobs::{Job, AnalyzeBlob}
+import models/attachments::{analyze, touch_record}
+import integrations/web_push::{push_message}
+import integrations/bot_webhook::{deliver_webhook}
+
+pub def perform(app : App, job : Job) : Nil
+  case job
+  when AnalyzeBlob         then analyze_blob(app, job.blob_id)
+  when PurgeBlob           then purge(app, job.blob_id)
+  when RemoveBannedContent then remove_banned_content(app, job.user_id)
+  when PushMessage         then push_message(app, job.room_id, job.message_id)
+  when DeliverWebhook      then deliver_webhook(app, job.bot_id, job.message_id)
+  when DisconnectUser      then nil
+  end
+end
+
+# `ActiveStorage::AnalyzeJob`: the attached records are touched (a message
+# also touches its room).
+def analyze_blob(app : App, blob_id : Int64) : Nil
+  analyze(app, blob_id) do |tx, record_type, record_id|
+    case record_type
+    when "Message"
+      if message = Message.find_by_id(tx.conn, record_id)
+        message.touch(tx)
+      end
+    when "User"    then touch_record(tx, "users", record_id)
+    when "Account" then touch_record(tx, "accounts", record_id)
+    end
+  end
+end
+
+# `RemoveBannedContentJob`: `user.remove_banned_content`, each message
+# destroyed in its own transaction and its removal broadcast.
+def remove_banned_content(app : App, user_id : Int64) : Nil
+  app.db.read { |conn| Message.by_creator(conn, user_id) }.each do |message|
+    app.db.write { |tx| message.destroy(tx) }
+    if room = app.db.read { |conn| Room.find_by_id(conn, message.room_id) }
+      app.broadcasts.message_remove(room, message)
+    end
+  end
+end
+
+# `ActiveStorage::PurgeJob`: a blob nothing is attached to goes, with its
+# variants and preview image (purged in turn), then its file.
+def purge(app : App, blob_id : Int64) : Nil
+  destroyed = app.db.write do |tx|
+    conn = tx.conn
+    blob = Blob.find(conn, blob_id)
+    if blob.nil? || !conn.query_all(%(SELECT 1 FROM "active_storage_attachments" WHERE "blob_id" = ? LIMIT 1), [blob_id] of SqlValue) { |row| row.int(0) }.empty?
+      nil
+    else
+      dependents = [] of Int64
+      conn.query_all(%(SELECT "id" FROM "active_storage_variant_records" WHERE "blob_id" = ?), [blob_id] of SqlValue) { |row| row.int(0) }.each do |record_id|
+        dependents.concat(destroy_attachment_rows(conn, "ActiveStorage::VariantRecord", record_id, "image"))
+        conn.execute(%(DELETE FROM "active_storage_variant_records" WHERE "id" = ?), [record_id] of SqlValue)
+      end
+      dependents.concat(destroy_attachment_rows(conn, "ActiveStorage::Blob", blob_id, "preview_image"))
+      conn.execute(%(DELETE FROM "active_storage_blobs" WHERE "id" = ?), [blob_id] of SqlValue)
+      dependents.each { |dependent| tx.emit_after_commit(PurgeBlob.new(dependent)) }
+      blob
+    end
+  end
+  app.storage.delete_files(destroyed) if destroyed
+end
+
+# Deletes an attachment's rows, returning their blob ids.
+def destroy_attachment_rows(conn, record_type : String, record_id : Int64, name : String) : Array(Int64)
+  found = conn.query_all(%(SELECT "id", "blob_id" FROM "active_storage_attachments" WHERE "record_type" = ? AND "record_id" = ? AND "name" = ?), [record_type, record_id, name] of SqlValue) { |row| {row.int(0), row.int(1)} }
+  found.each { |id, _| conn.execute(%(DELETE FROM "active_storage_attachments" WHERE "id" = ?), [id] of SqlValue) }
+  found.map(&.[1])
+end

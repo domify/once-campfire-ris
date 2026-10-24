@@ -1,0 +1,99 @@
+# Blob keys and checksums.
+@[Ffi]
+module rils/storage/key
+
+import std/text
+import std/int
+import rils/rails_compat/crypto::{random_bytes}
+import rils/rails_compat/encoding::{strict_encode}
+
+# MD5 from libcrypto, which `rails_compat/crypto` already links: a 48 MB
+# upload is hashed in pieces rather than read whole.
+@[Link("crypto")]
+lib LibDigest
+  fun md5 = EVP_md5 : Void*
+  fun by_name = EVP_get_digestbyname(name : UInt8*) : Void*
+  fun context_new = EVP_MD_CTX_new : Void*
+  fun context_free = EVP_MD_CTX_free(context : Void*) : Void
+  fun init = EVP_DigestInit_ex(context : Void*, digest : Void*, engine : Void*) : Int32
+  fun update = EVP_DigestUpdate(context : Void*, data : UInt8*, size : UInt64) : Int32
+  fun final = EVP_DigestFinal_ex(context : Void*, output : UInt8*, size : UInt32*) : Int32
+end
+
+# `ActiveStorage::Blob::MINIMUM_TOKEN_LENGTH`.
+pub KEY_LENGTH = 28
+
+BASE36 = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+# `SecureRandom.base36(28)` (`has_secure_token :key, length: 28`). Random
+# bytes of 252 and up are drawn again, so every character is equally likely.
+pub def generate_key : String
+  String.build(KEY_LENGTH) do |io|
+    written = 0
+    while written < KEY_LENGTH
+      random_bytes(KEY_LENGTH).each_byte do |byte|
+        if written < KEY_LENGTH && byte < 252
+          io.write_byte(BASE36.as_tape[(byte % 36).to_i32])
+          written += 1
+        end
+      end
+    end
+  end
+end
+
+# An MD5 (or, named, another digest) in progress (`OpenSSL::Digest::MD5`).
+pub class Md5
+  @context : Void*
+  @size : UInt32
+
+  def initialize
+    @context = LibDigest.context_new
+    @size = 16_u32
+    LibDigest.init(@context, LibDigest.md5, Pointer(Void).new(0_u64))
+  end
+
+  def initialize(name : String, @size : UInt32)
+    @context = LibDigest.context_new
+    LibDigest.init(@context, LibDigest.by_name(name.to_unsafe), Pointer(Void).new(0_u64))
+  end
+
+  pub def update(data : String) : Nil
+    LibDigest.update(@context, data.to_unsafe, data.bytesize.to_u64)
+  end
+
+  # `base64digest`; the digest can't be updated after.
+  pub def base64digest : String
+    size = 0_u32
+    digest = String.new(@size.to_i32) { |output| LibDigest.final(@context, output, pointerof(size)) }
+    LibDigest.context_free(@context)
+    strict_encode(digest)
+  end
+end
+
+# `OpenSSL::Digest::MD5.base64digest` of the whole content
+# (`compute_checksum_in_chunks`).
+pub def checksum(data : String) : String
+  md5 = Md5.new
+  md5.update(data)
+  md5.base64digest
+end
+
+CHUNK = 1 << 20
+
+# `checksum` of a file on disk, read a megabyte at a time.
+pub def checksum_file(path : String) : String
+  md5 = Md5.new
+  File.open(path, "r", CHUNK) do |io|
+    while !(chunk = io.read_bytes(CHUNK)).empty?
+      md5.update(chunk)
+    end
+  end
+  md5.base64digest
+end
+
+# `OpenSSL::Digest::SHA1.base64digest(data)`.
+pub def sha1_base64digest(data : String) : String
+  sha1 = Md5.new("SHA1", 20_u32)
+  sha1.update(data)
+  sha1.base64digest
+end

@@ -1,0 +1,329 @@
+# `ActionDispatch::Cookies::CookieJar` with its plain, permanent, signed and
+# encrypted jars.
+#
+# Semantics follow `action_dispatch/middleware/cookies.rb`:
+# - setting a cookie only emits `Set-Cookie` when the value changed or an
+#   expiry was given;
+# - every cookie gets `path=/` and `samesite=lax` unless told otherwise
+#   (`cookies_same_site_protection = :lax` from `load_defaults 6.1`);
+# - `permanent` means an `expires` 20 calendar years out, embedded in
+#   signed/encrypted metadata;
+# - deleting only emits a header when the cookie was present;
+# - secure cookies are dropped on plain-HTTP requests;
+# - signed/encrypted values over 4096 bytes (name included) raise
+#   `CookieOverflow`.
+#
+# Header formatting is `Rack::Utils.set_cookie_header` (Rack 3.2).
+module rils/kit/cookies
+
+import std/time::{Time}
+import std/json::{Any}
+import std/text
+import rils/rails_compat/clock::{Clock, add_years}
+import rils/rails_compat/key_generator::{Secrets}
+import rils/rails_compat/cookies::{escape, sign, verify_signed, encrypt, decrypt}
+import web/web/http_date::{http_date}
+import rils/kit/params::{decode_www_form_component, valid_utf8?}
+import rils/kit/errors::{HttpError, HttpErrorKind}
+import rils/kit/request::{RequestFields, same_name?}
+
+pub MAX_COOKIE_SIZE = 4096
+PERMANENT_YEARS     =   20
+
+pub enum SameSite
+  Lax
+  Strict
+  None
+end
+
+# A cookie to set, with Rails' option names.
+pub class Cookie
+  property value : String
+  property path : String
+  property domain : String?
+  property expires : Time?
+  property permanent : Bool
+  property secure : Bool
+  property httponly : Bool
+  property same_site : SameSite?
+  property partitioned : Bool
+
+  def initialize(@value : String, @path : String = "/", @domain : String? = nil, @expires : Time? = nil, @permanent : Bool = false, @secure : Bool = false, @httponly : Bool = false, @same_site : SameSite? = SameSite::Lax, @partitioned : Bool = false)
+  end
+end
+
+# Options for `cookies.delete(name, options)`.
+pub class DeleteOptions
+  getter path : String
+  getter domain : String?
+  getter same_site : SameSite?
+
+  def initialize(@path : String = "/", @domain : String? = nil, @same_site : SameSite? = SameSite::Lax)
+  end
+end
+
+# The request's `Cookie` fields, read where they lie when a cookie is asked
+# for: a request reads one or two of its cookies, and parsing them all into
+# a hash cost more than the rest of the jar. What sets and deletes change
+# is in a `JarState` on the heap the jar's copies share.
+@[OnTape]
+pub struct CookieJar
+  @headers : RequestFields | Array(String)
+  @state : JarState
+
+  def initialize(@headers : RequestFields | Array(String), secrets : Secrets, clock : Clock)
+    @state = JarState.new(secrets, clock)
+  end
+
+  # The jar of the request's fields.
+  pub def self.from_fields(fields : RequestFields, secrets : Secrets, clock : Clock) : CookieJar
+    CookieJar.new(fields, secrets, clock)
+  end
+
+  # The jar of `Cookie` header values given as strings: a socket's, a
+  # test's.
+  pub def self.from_headers(headers : Array(String), secrets : Secrets, clock : Clock) : CookieJar
+    CookieJar.new(headers, secrets, clock)
+  end
+
+  pub def secrets : Secrets
+    @state.secrets
+  end
+
+  pub def clock : Clock
+    @state.clock
+  end
+
+  # The first cookie named *name* in the `Cookie` fields, copied out.
+  private def find(name : String) : String?
+    headers = @headers
+    case headers
+    in RequestFields
+      headers.size.times do |i|
+        next unless same_name?(headers.name_at(i), "cookie")
+        if value = cookie_in_header(headers.value_at(i), name)
+          return value
+        end
+      end
+    in Array(String)
+      found = nil.as(String?)
+      tape do
+        headers.each do |header|
+          found ||= cookie_in_header(header.as_tape, name)
+        end
+      end
+      return found
+    end
+    nil
+  end
+
+  # `cookies[name]`.
+  pub def [](name : String) : String?
+    if (changed = @state.changed) && changed.has_key?(name)
+      return changed[name]
+    end
+    find(name)
+  end
+
+  pub def has_key?(name : String) : Bool
+    if (changed = @state.changed) && changed.has_key?(name)
+      return !changed[name].nil?
+    end
+    !find(name).nil?
+  end
+
+  # `cookies.signed[name]`.
+  pub def signed(name : String) : String?
+    raw = self[name]
+    raw ? verify_signed(@state.secrets, name, raw, @state.clock.now) : nil
+  end
+
+  # `cookies.encrypted[name]`.
+  pub def encrypted(name : String) : Any?
+    raw = self[name]
+    raw ? decrypt(@state.secrets, name, raw, @state.clock.now) : nil
+  end
+
+  # `cookies[name] = value` (or `cookies.permanent[name] = ...` with
+  # `permanent`).
+  pub def set(name : String, cookie : Cookie) : Nil
+    write_value(name, resolve_expiry(cookie))
+  end
+
+  pub def set(name : String, value : String) : Nil
+    set(name, Cookie.new(value))
+  end
+
+  # `cookies.signed[name] = value`.
+  pub def set_signed(name : String, cookie : Cookie) : HttpError?
+    cookie = resolve_expiry(cookie)
+    cookie.value = sign(@state.secrets, name, cookie.value, cookie.expires)
+    overflow = check_for_overflow(name, cookie.value)
+    return overflow if overflow
+    write_value(name, cookie)
+    nil
+  end
+
+  # `cookies.encrypted[name] = value`; *cookie*'s value is ignored in favor
+  # of *value*.
+  pub def set_encrypted(name : String, value : Any, cookie : Cookie) : HttpError?
+    cookie = resolve_expiry(cookie)
+    cookie.value = encrypt(@state.secrets, name, value, cookie.expires)
+    overflow = check_for_overflow(name, cookie.value)
+    return overflow if overflow
+    write_value(name, cookie)
+    nil
+  end
+
+  # `cookies.delete(name)`: a no-op unless the cookie is present.
+  pub def delete(name : String, options : DeleteOptions = DeleteOptions.new) : Nil
+    return unless has_key?(name)
+    (@state.changed ||= {} of String => String?)[name] = nil
+    (@state.delete_cookies ||= {} of String => DeleteOptions)[name] = options
+  end
+
+  # `cookies.deleted?(name)`.
+  pub def deleted?(name : String) : Bool
+    deletes = @state.delete_cookies
+    !deletes.nil? && deletes.has_key?(name)
+  end
+
+  # The `Set-Cookie` header values Rails would write, in order.
+  pub def set_cookie_headers(ssl : Bool, host : String) : Array(String)
+    headers = [] of String
+    if sets = @state.set_cookies
+      sets.each do |name, cookie|
+        headers << set_cookie_header(name, cookie) if ssl || !cookie.secure || host.ends_with?(".onion")
+      end
+    end
+    if deletes = @state.delete_cookies
+      deletes.each { |name, options| headers << delete_cookie_header(name, options) }
+    end
+    headers
+  end
+
+  def resolve_expiry(cookie : Cookie) : Cookie
+    cookie.expires = add_years(@state.clock.now, PERMANENT_YEARS) if cookie.permanent
+    cookie
+  end
+
+  def write_value(name : String, cookie : Cookie) : Nil
+    return unless self[name] != cookie.value || !cookie.expires.nil?
+    (@state.changed ||= {} of String => String?)[name] = cookie.value
+    (@state.set_cookies ||= {} of String => Cookie)[name] = cookie
+    if deletes = @state.delete_cookies
+      deletes.delete(name)
+    end
+  end
+end
+
+# What a `CookieJar`'s sets and deletes changed, shared by its copies.
+class JarState
+  getter secrets : Secrets
+  getter clock : Clock
+  # The new value, or nil once deleted. Made by the first change.
+  property changed : Hash(String, String?)?
+  property set_cookies : Hash(String, Cookie)?
+  property delete_cookies : Hash(String, DeleteOptions)?
+
+  def initialize(@secrets : Secrets, @clock : Clock)
+    @changed = nil
+    @set_cookies = nil
+    @delete_cookies = nil
+  end
+end
+
+def check_for_overflow(name : String, value : String) : HttpError?
+  total = name.bytesize + value.bytesize
+  return nil if total <= MAX_COOKIE_SIZE
+  HttpError.new(HttpErrorKind::CookieOverflow, "#{name} cookie overflowed with size #{total} bytes")
+end
+
+# `Rack::Utils.parse_cookies_header`: split on `/; */`, first occurrence
+# wins, values unescaped (kept raw when unescaping fails).
+pub def parse_cookie_header(header : String) : Array(Tuple(String, String))
+  cookies = [] of Tuple(String, String)
+  seen = {} of String => Bool
+  header.split(';').each_with_index do |part, i|
+    part = part.lstrip(' ') if i > 0
+    next if part.empty?
+    key, _, value = part.partition('=')
+    next if seen.has_key?(key)
+    seen[key] = true
+    decoded = decode_www_form_component(value)
+    value = decoded if decoded.is_a?(String) && valid_utf8?(decoded)
+    cookies << {key, value}
+  end
+  cookies
+end
+
+# The value of the first cookie named *name* in *header*, as
+# `parse_cookie_header` reads it, read where it lies; only that cookie's
+# value is copied out.
+def cookie_in_header(header : Str, name : String) : String?
+  start = 0
+  first = true
+  while start <= header.bytesize
+    stop = start
+    while stop < header.bytesize && header[stop] != ';'.ord
+      stop += 1
+    end
+    from = start
+    while !first && from < stop && header[from] == ' '.ord
+      from += 1
+    end
+    first = false
+    if from < stop
+      equals = from
+      while equals < stop && header[equals] != '='.ord
+        equals += 1
+      end
+      if equals - from == name.bytesize && header[from, name.bytesize] == name
+        value = equals < stop ? header[equals + 1, stop - equals - 1] : "".as_tape
+        decoded = decode_www_form_component(value)
+        return decoded.is_a?(String) && valid_utf8?(decoded) ? decoded : value.to_heap
+      end
+    end
+    start = stop + 1
+  end
+  nil
+end
+
+def same_site_attribute(same_site : SameSite?) : String
+  case same_site
+  when SameSite::Lax    then "; samesite=lax"
+  when SameSite::Strict then "; samesite=strict"
+  when SameSite::None   then "; samesite=none"
+  else                       ""
+  end
+end
+
+# `Rack::Utils.set_cookie_header(key, value_hash)`.
+pub def set_cookie_header(name : String, cookie : Cookie) : String
+  String.build do |io|
+    io << name << '=' << escape(cookie.value)
+    if domain = cookie.domain
+      io << "; domain=" << domain
+    end
+    io << "; path=" << cookie.path
+    if expires = cookie.expires
+      io << "; expires=" << http_date(expires)
+    end
+    io << "; secure" if cookie.secure
+    io << "; httponly" if cookie.httponly
+    io << same_site_attribute(cookie.same_site)
+    io << "; partitioned" if cookie.partitioned
+  end
+end
+
+# `Rack::Utils.delete_set_cookie_header(key, options)`.
+pub def delete_cookie_header(name : String, options : DeleteOptions) : String
+  String.build do |io|
+    io << name << '='
+    if domain = options.domain
+      io << "; domain=" << domain
+    end
+    io << "; path=" << options.path << "; max-age=0; expires=" << http_date(Time.unix(0))
+    io << same_site_attribute(options.same_site)
+  end
+end

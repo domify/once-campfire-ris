@@ -1,0 +1,129 @@
+# Marcel 1.1.0 content type identification (`Marcel::MimeType.for`), over
+# the tables in `storage/tables`.
+module rils/storage/marcel
+
+import std/text
+import std/enumerable
+import rils/storage/tables::{EXTENSIONS, TYPE_EXTS, TYPE_PARENTS, MAGIC, Match}
+import rils/storage/filename::{extname}
+
+pub BINARY = "application/octet-stream"
+
+# `Marcel::MimeType.for(io, name:, declared_type:)`, as
+# `ActiveStorage::Blob#extract_content_type` calls it on upload.
+pub def identify(data : String, name : String?, declared_type : String?) : String
+  by_name = name ? by_path(name) : nil
+  most_specific_type([by_magic(data), for_declared_type(declared_type), by_name])
+end
+
+# `Marcel::MimeType.for(extension:)`.
+pub def for_extension(extension : String) : String
+  most_specific_type([by_extension(extension)])
+end
+
+# `Marcel::Magic.by_extension`: case-insensitive, with or without the dot.
+pub def by_extension(extension : String) : String?
+  ext = extension.downcase
+  ext = ext[1, ext.bytesize - 1] if ext.starts_with?('.')
+  EXTENSIONS[ext]?
+end
+
+# `Marcel::Magic.by_path`: the extension per Ruby's `File.extname`.
+pub def by_path(path : String) : String?
+  by_extension(extname(path))
+end
+
+# `Marcel::Magic.new(type).extensions`.
+pub def extensions(content_type : String) : Array(String)
+  TYPE_EXTS[content_type]? || [] of String
+end
+
+# `Marcel::Magic.child?`.
+pub def child?(child : String, parent : String) : Bool
+  return true if child == parent
+  parents = TYPE_PARENTS[child]?
+  return false unless parents
+  parents.any? { |p| child?(p, parent) }
+end
+
+def reach(matches : Array(Match)) : Int32
+  best = 0
+  matches.each do |m|
+    value = m.value
+    size = value ? value.bytesize : 0
+    stop = m.range_end
+    own = stop ? stop + size : m.offset + size
+    deeper = reach(m.children)
+    own = deeper if deeper > own
+    best = own if own > best
+  end
+  best
+end
+
+MAGIC_PREFIX = reach(MAGIC.flat_map { |entry| entry[1] })
+
+# How many leading bytes `by_magic` looks at: identifying the first this
+# many bytes of a file answers as identifying all of it.
+pub def magic_prefix_len : Int32
+  MAGIC_PREFIX
+end
+
+# `Marcel::Magic.by_magic`: the first table entry whose matches hit.
+pub def by_magic(data : String) : String?
+  MAGIC.each do |entry|
+    return entry[0].downcase if matches_any?(data, entry[1])
+  end
+  nil
+end
+
+def matches_any?(data : String, matches : Array(Match)) : Bool
+  matches.any? do |m|
+    value = m.value
+    hit = false
+    if value
+      stop = m.range_end
+      if stop
+        # `io.read(offset.begin); io.read(offset.end - offset.begin + value.bytesize).include?(value)`
+        window = read(data, m.offset, stop - m.offset + value.bytesize)
+        hit = !window.nil? && (value.empty? || !window.byte_index(value).nil?)
+      else
+        hit = read(data, m.offset, value.bytesize) == value
+      end
+    end
+    hit && (m.children.empty? || matches_any?(data, m.children))
+  end
+end
+
+# `IO#read(length)` after skipping `offset` bytes: nil at EOF, otherwise up
+# to `length` bytes.
+def read(data : String, offset : Int32, length : Int32) : String?
+  return "" if length == 0
+  return nil if offset >= data.bytesize
+  data[offset, length < data.bytesize - offset ? length : data.bytesize - offset]
+end
+
+DECLARED_STOPS = ";, \t\n\r\v\f"
+
+# Declared types are downcased, stripped of parameters, and ignored when
+# binary.
+def for_declared_type(declared_type : String?) : String?
+  return nil unless declared_type
+  declared = declared_type.downcase
+  stop = 0
+  while stop < declared.bytesize && !DECLARED_STOPS.byte_index(declared.as_tape[stop].unsafe_chr.to_s)
+    stop += 1
+  end
+  media_type = declared[0, stop]
+  media_type.includes?("/") && media_type != BINARY ? media_type : nil
+end
+
+# `most_specific_type(*candidates, BINARY)`: later candidates win only when
+# they are children of the current pick.
+def most_specific_type(candidates : Array(String?)) : String
+  unique = [] of String
+  candidates.each { |c| unique << c if c && !unique.includes?(c) }
+  unique << BINARY unless unique.includes?(BINARY)
+  pick = unique[0]
+  unique.each_with_index { |c, i| pick = c if i > 0 && child?(c, pick) }
+  pick
+end

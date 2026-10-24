@@ -1,0 +1,29 @@
+<%# reference/app/views/accounts/custom_styles/edit.html.erb %>
+<% content_for "nav" do %>  <div class="flex-item-justify-start">
+    <%= link_back_to(ctx, edit_account_path) %>
+  </div>
+<% end %>
+<section class="panel panel--wide txt-align-center flex flex-column position-relative" style="view-transition-name: custom-styles">
+  <% form = form_with(ctx.url(account_custom_styles_path)).model("account").method("patch").class("flex flex-column gap").data("controller", "form").data("action", "keydown.ctrl+enter->form#submit keydown.meta+enter->form#submit") %><%= form.wrap do %>
+    <div class="panel__button">
+      <%= translation_button(ctx, "custom_styles") %>
+    </div>
+
+    <div class="pad-inline-double margin-inline">
+      <h1 class="margin-none">Custom CSS</h1>
+      <p class="flex flex-wrap align-center justify-center gap margin-none-block-start" style="--column-gap: 0.5ch; --row-gap: 0">
+        <span>Add custom CSS styles.</span>
+        <%= image_tag(ctx, "alert.svg", attrs.class("flex-inline colorize--black").size(16).aria_hidden) %>
+        <span>Use Caution: you could break things.</span>
+      </p>
+    </div>
+
+    <label class="flex align-start gap flex-item-grow">
+      <%= form.text_area("custom_styles", custom_styles, attrs.class("input input--code txt--small").placeholder("Add CSS styles…").autocomplete("off").attr("spellcheck", "false").attr("autocorrect", "off").attr("autocapitalize", "off").rows(16).required(false)) %>
+    </label>
+
+    <%= button_tag(attrs.class("btn btn--reversed center txt-large").type("submit")) do %>
+      <%= image_tag(ctx, "check.svg", attrs.aria_hidden.size(20)) %>
+      <span class="for-screen-reader">Save changes</span>
+<% end %><% end %></section>
+

@@ -1,0 +1,39 @@
+# `image_tag` and asset resolution (`AssetTagHelper`, `AssetUrlHelper`).
+module views/helpers/assets
+
+import std/text
+import rils/template/html::{Html}
+import views/context::{ViewContext}
+import views/helpers/tag::*
+
+# `asset_path(source)`: URLs and absolute paths pass through; logical asset
+# paths are digested.
+pub def asset_path(ctx : ViewContext, source : String) : String
+  url?(source) ? source : ctx.asset(source)
+end
+
+def url?(source : String) : Bool
+  return true if source.starts_with?("/") || source.starts_with?("data:") || source.starts_with?("cid:")
+  scheme, separator, _ = source.partition("://")
+  return false if separator.empty? || scheme.empty?
+  scheme.each_char do |c|
+    return false unless c.ascii_letter? || c == '-'
+  end
+  true
+end
+
+# `image_tag(source, options)`: the options in order, then `src`, then
+# `width`/`height` from `size:` ("20" or "20x30").
+pub def image_tag(ctx : ViewContext, source : String, options : Attrs = Attrs.new) : Html
+  options = options.dup
+  size = options.remove("size")
+  options.set("src", asset_path(ctx, source))
+  unless size.nil?
+    size = value_to_s(size)
+    width, x, height = size.partition('x')
+    height = width if x.empty?
+    options.set("width", width)
+    options.set("height", height)
+  end
+  legacy_tag("img", options)
+end

@@ -1,0 +1,23 @@
+# The Rust port's naming tests (`crates/cable/src/naming.rs`).
+module rils/cable/naming_test
+
+import rils/rails_compat/global_id::{GlobalId}
+import rils/cable/naming::*
+import web/web/spec::*
+
+describe "naming" do
+  it "names channels like Channel::Naming" do
+    assert channel_name("RoomChannel") == "room"
+    assert channel_name("TypingNotificationsChannel") == "typing_notifications"
+    assert channel_name("Turbo::StreamsChannel") == "turbo:streams"
+    assert channel_name("HTMLChannel") == "html"
+    assert channel_name("HTMLParserChannel") == "html_parser"
+  end
+
+  it "names broadcastings and Turbo streams" do
+    room = gid_param(GlobalId.new("campfire", "Rooms::Open", "1"))
+    assert room == "Z2lkOi8vY2FtcGZpcmUvUm9vbXM6Ok9wZW4vMQ"
+    assert broadcasting_for("PresenceChannel", [room]) == "presence:#{room}"
+    assert stream_name_from([room, "messages"]) == "#{room}:messages"
+  end
+end

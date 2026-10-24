@@ -1,0 +1,128 @@
+# `SessionsController` (reference/app/controllers/sessions_controller.rb):
+# signing in and out.
+module controllers/sessions
+
+import std/text
+import std/time::{Span}
+import rils/record/sqlite::{Connection, SqlValue}
+import models/user::{User, USER_COLUMNS}
+import models/session::{Session}
+import models/push_subscription::{PushSubscription}
+import rils/routes/paths::{first_run_path, root_path}
+import rils/kit/ctx::{Ctx, ActionResult}
+import rils/kit/cookies::{Cookie}
+import rils/kit/response::{Response}
+import rils/kit/errors::{HttpError, halt}
+import rils/kit/format::{HTML}
+import views/sessions::{New, HelpContact}
+import config/app::{App}
+import models/application_platform::{ApplicationPlatform}
+import controllers/concerns::{Current, allow_browser, set_version_headers, require_authentication, start_new_session_for}
+
+# `new` (`allow_unauthenticated_access`, `before_action
+# :ensure_user_exists`).
+pub def new_session(app : App, c : Ctx) : ActionResult
+  platform = allow_browser(app, c)
+  return platform if platform.is_a?(HttpError)
+  set_version_headers(app, c)
+  none = app.db.read { |conn| User.count(conn) == 0 }
+  # `ensure_user_exists`: `redirect_to first_run_url if User.none?`.
+  return c.redirect_to(c.url_for(first_run_path)) if none
+  render_new(app, c, 200, platform)
+end
+
+# `rate_limit to: 10, within: 3.minutes, only: :create`
+RATE_LIMIT_TO     = 10
+RATE_LIMIT_WITHIN = Span.new(minutes: 3)
+
+REJECTION = "Too many requests or unauthorized."
+
+# `create` (`allow_unauthenticated_access`, `rate_limit`): sign in, and
+# back to where the sign-in was asked for.
+pub def create_session(app : App, c : Ctx) : ActionResult
+  forged = c.verify_authenticity_token
+  return forged if forged
+  platform = allow_browser(app, c)
+  return platform if platform.is_a?(HttpError)
+  set_version_headers(app, c)
+  limited = rate_limit(app, c, platform)
+  return limited if limited
+
+  email_address = c.param_str("email_address")
+  password = c.param_str("password")
+  user = nil.as(User?)
+  # `User.active.authenticate_by(email_address:, password:)`: nil for a
+  # missing or blank password, before looking anyone up.
+  if email_address && password && !password.empty?
+    user = User.authenticated(app.db.read { |conn| User.find_active_by_email_address(conn, email_address) }, password)
+  end
+  return render_rejection(app, c, 401, platform) unless user
+
+  start_new_session_for(app, c, user)
+  # `post_authenticating_url`
+  location = c.session.delete("return_to_after_authenticating")
+  c.redirect_to(location.is_a?(String) ? location : c.url_for(root_path))
+end
+
+# `destroy`: sign out.
+pub def destroy_session(app : App, c : Ctx) : ActionResult
+  platform = allow_browser(app, c)
+  return platform if platform.is_a?(HttpError)
+  current = require_authentication(app, c)
+  return current if current.is_a?(HttpError)
+  forged = c.verify_authenticity_token
+  return forged if forged
+  set_version_headers(app, c)
+  remove_push_subscription(app, c, current)
+  terminate_current_session(app, c, current)
+  c.redirect_to(c.url_for(root_path))
+end
+
+# `rate_limiting(to:, within:, by: -> { request.remote_ip }, with: ->
+# { render_rejection :too_many_requests })`: the rejection page, or nil
+# to go on.
+def rate_limit(app : App, c : Ctx, platform : ApplicationPlatform?) : ActionResult?
+  ip = c.request.remote_ip
+  return ip if ip.is_a?(HttpError)
+  count = app.rate_limits.increment("rate-limit:sessions:#{ip}", RATE_LIMIT_WITHIN, c.now)
+  count > RATE_LIMIT_TO ? render_rejection(app, c, 429, platform) : nil
+end
+
+# `flash.now[:alert] = "Too many requests or unauthorized."; render :new, status:`
+def render_rejection(app : App, c : Ctx, status : Int32, platform : ApplicationPlatform?) : ActionResult
+  c.flash.now("alert", REJECTION)
+  render_new(app, c, status, platform)
+end
+
+# `Push::Subscription.destroy_by(endpoint: params[:push_subscription_endpoint], user_id: Current.user.id)`
+def remove_push_subscription(app : App, c : Ctx, current : Current) : Nil
+  endpoint = c.param_str("push_subscription_endpoint") || return
+  app.db.write { |tx| PushSubscription.destroy_by_endpoint(tx, current.user.id, endpoint) }
+end
+
+# `terminate_current_session`: the session row, the Rails session, the
+# cookie, and the user's sockets, which reconnect and find the session gone.
+def terminate_current_session(app : App, c : Ctx, current : Current) : Nil
+  app.db.write do |tx|
+    current.session.destroy(tx)
+    current.user.reset_remote_connections(tx)
+  end
+  c.reset_session
+  c.cookies.delete("session_token")
+end
+
+# `render :new, status:`, also for a rejected sign-in.
+def render_new(app : App, c : Ctx, status : Int32, platform : ApplicationPlatform?) : ActionResult
+  format = c.respond_to([HTML])
+  return format if format.is_a?(HttpError)
+  help_contact = app.db.read { |conn| help_contact(conn) }
+  ctx = app.layout_context(c, platform: platform)
+  view = New.new(ctx, c.param_str("email_address"), help_contact)
+  app.render_layout(c, status, "Sign in", nil, ctx) { |buffer| view.render_into(buffer) }
+end
+
+# `User.administrator.first`, for `accounts/_help_contact`.
+pub def help_contact(conn : Connection) : HelpContact?
+  owner = User.find_by_sql(conn, %(SELECT #{USER_COLUMNS} FROM "users" WHERE "users"."role" = 1 ORDER BY "users"."id" ASC LIMIT 1), [] of SqlValue).first?
+  owner ? HelpContact.new(owner.name, owner.email_address || "") : nil
+end

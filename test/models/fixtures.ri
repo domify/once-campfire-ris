@@ -1,0 +1,256 @@
+# Loads `reference/test/fixtures/*.yml` the way `ActiveRecord::FixtureSet`
+# does, so tests run against the same rows as the Ruby tests:
+#
+# - ids are `Zlib.crc32(label) % (2**30 - 1)` unless given;
+# - `belongs_to` values are labels (`creator: :david`), polymorphic ones name
+#   the class (`record: first (Message)`);
+# - enum names become their stored values (`role: administrator` is 1);
+# - `created_at`/`updated_at` default to one `now` per fixture file;
+# - columns a fixture leaves out get the column default;
+# - each table is emptied, then filled, with foreign keys checked at commit.
+#
+# ERB is evaluated for the forms the fixtures use: `<%= N.<unit>.ago %>`,
+# `BCrypt::Password.create("...")` assigned to a local, and
+# `User.generate_bot_token`.
+module test/models/fixtures
+
+import std/yaml::{YAML, Any}
+import std/digest::{CRC32}
+import std/file::{File}
+import std/dir::{Dir}
+import std/time::{Span}
+import std/text
+import rils/record/sqlite::{Connection, SqlValue, placeholders}
+import rils/record/timestamp::{Timestamp}
+import models/user::{Role, Status, PasswordDigest, generate_bot_token}
+import models/room::{Involvement}
+
+# `ActiveRecord::FixtureSet::MAX_ID`
+pub FIXTURE_MAX_ID = (1_u32 << 30) - 1
+
+# `ActiveRecord::FixtureSet.identify(label)`
+pub def identify(label : String) : Int64
+  (CRC32.checksum(label) % FIXTURE_MAX_ID).to_i64
+end
+
+# The fixture directory in the reference checkout.
+pub def fixtures_dir : String
+  "#{__DIR__}/../../reference/test/fixtures"
+end
+
+# What was loaded: table -> label -> id.
+pub class Loaded
+  getter ids : Hash(String, Hash(String, Int64))
+
+  def initialize
+    @ids = {} of String => Hash(String, Int64)
+  end
+
+  pub def id(table : String, label : String) : Int64
+    labels = @ids[table]? || raise("no fixtures for #{table}")
+    labels[label]? || raise("no fixture #{table}.#{label}")
+  end
+end
+
+# A `belongs_to` in a fixture: the key, and the column it sets; a nil
+# column is polymorphic, setting the `_id`/`_type` pair.
+def associations(table : String) : Array(Tuple(String, String?))
+  case table
+  when "boosts"                     then [{"message", "message_id".as(String?)}, {"booster", "booster_id".as(String?)}]
+  when "memberships"                then [{"room", "room_id".as(String?)}, {"user", "user_id".as(String?)}]
+  when "messages"                   then [{"room", "room_id".as(String?)}, {"creator", "creator_id".as(String?)}]
+  when "rooms"                      then [{"creator", "creator_id".as(String?)}]
+  when "bans", "searches", "sessions", "webhooks", "push_subscriptions"
+    [{"user", "user_id".as(String?)}]
+  when "action_text_rich_texts"         then [{"record", nil.as(String?)}]
+  when "active_storage_attachments"     then [{"record", nil.as(String?)}, {"blob", "blob_id".as(String?)}]
+  when "active_storage_variant_records" then [{"blob", "blob_id".as(String?)}]
+  else                                       [] of Tuple(String, String?)
+  end
+end
+
+# Enum attributes: name -> stored value.
+def resolve_enum(table : String, column : String, value : String) : SqlValue?
+  if table == "users" && column == "role"
+    role = Role.from_name(value)
+    return role ? role.value.to_i64 : nil
+  end
+  if table == "users" && column == "status"
+    status = Status.from_name(value)
+    return status ? status.value.to_i64 : nil
+  end
+  if table == "memberships" && column == "involvement"
+    involvement = Involvement.from_name(value)
+    return involvement ? involvement.name : nil
+  end
+  nil
+end
+
+# Loads every `*.yml` under *dir* into *conn*, inside the caller's
+# transaction (a `Database#write`), which checks the foreign keys when it
+# commits.
+pub def load_fixtures(conn : Connection, dir : String, now : Timestamp, bcrypt_cost : Int32) : Loaded
+  files = Dir.glob("#{dir}/**/*.yml").reject(&.includes?("/files/")).sorted
+  conn.execute_batch("PRAGMA defer_foreign_keys = ON")
+  erb = FixtureErb.new(now, bcrypt_cost)
+  loaded = Loaded.new
+  files.each do |file|
+    table = file[dir.bytesize + 1, file.bytesize - dir.bytesize - 5].gsub("/", "_")
+    rows = YAML.parse(erb.render(File.read(file)))
+    conn.execute(%(DELETE FROM "#{table}"))
+    columns = conn.query_all(%(PRAGMA table_info("#{table}")), [] of SqlValue) { |row| row.text(1) }
+    raise "no table #{table}" if columns.empty?
+    labels = {} of String => Int64
+    loaded.ids[table] = labels
+    mapping = rows.as_h?
+    next unless mapping
+    mapping.each do |key, row|
+      label = scalar(key) || raise("bad label in #{table}")
+      next if label == "DEFAULTS" || label == "_fixture"
+      values = fixture_row(table, label, row, columns, now)
+      id = values["id"]
+      labels[label] = id.is_a?(Int64) ? id : identify(label)
+      names = values.keys.map { |column| %("#{column}") }.join(", ")
+      conn.execute(%(INSERT INTO "#{table}" (#{names}) VALUES (#{placeholders(values.size)})), values.values)
+    end
+  end
+  loaded
+end
+
+def fixture_row(table : String, label : String, row : Any, columns : Array(String), now : Timestamp) : Hash(String, SqlValue)
+  values = {} of String => SqlValue
+  mapping = row.as_h?
+  raise "fixture #{table}.#{label} is not a mapping" if mapping.nil? && !row.raw.nil?
+  if mapping
+    mapping.each do |key_node, value|
+      key = scalar(key_node) || raise("bad key in #{table}.#{label}")
+      association = associations(table).find { |pair| pair[0] == key }
+      if association
+        target = scalar(value) || raise("#{table}.#{label}.#{key}")
+        column = association[1]
+        if column
+          values[column] = identify(target.lchop(':'))
+        else
+          target = target.strip
+          open = target.rindex(" (")
+          raise "#{table}.#{label}.#{key} needs a (Class)" unless open && target.ends_with?(")")
+          values["#{key}_id"] = identify(target[0, open].lchop(':'))
+          values["#{key}_type"] = target[open + 2, target.bytesize - open - 3]
+        end
+      else
+        values[key] = yaml_to_sql(table, key, value)
+      end
+    end
+  end
+  values["id"] = identify(label) unless values.has_key?("id")
+  ["created_at", "updated_at"].each do |column|
+    values[column] = now.to_db if columns.includes?(column) && !values.has_key?(column)
+  end
+  values
+end
+
+def yaml_to_sql(table : String, column : String, value : Any) : SqlValue
+  raw = value.raw
+  case raw
+  when Nil     then nil
+  when Bool    then raw ? 1_i64 : 0_i64
+  when Int64   then raw
+  when Float64 then raw
+  when String
+    if enum_value = resolve_enum(table, column, raw)
+      enum_value
+    elsif column.ends_with?("_at")
+      # Time columns cast the text (e.g. ERB's "2026-09-26 11:24:38 UTC").
+      parsed = Timestamp.parse_db(raw)
+      parsed ? parsed.to_db : raw
+    else
+      raw
+    end
+  else
+    raise "unsupported fixture value in #{table}.#{column}"
+  end
+end
+
+def scalar(value : Any) : String?
+  raw = value.raw
+  case raw
+  when String then raw
+  when Int64  then raw.to_s
+  when Bool   then raw.to_s
+  else             nil
+  end
+end
+
+# The sliver of ERB the fixtures use.
+pub class FixtureErb
+  @now : Timestamp
+  @bcrypt_cost : Int32
+  @locals : Hash(String, String)
+  @digests : Hash(String, String)
+
+  def initialize(@now : Timestamp, @bcrypt_cost : Int32)
+    @locals = {} of String => String
+    @digests = {} of String => String
+  end
+
+  pub def render(source : String) : String
+    String.build do |io|
+      rest = source
+      while start = rest.byte_index("<%")
+        io << rest[0, start]
+        after = rest[start + 2, rest.bytesize - start - 2]
+        stop = after.byte_index("%>") || raise("unterminated ERB tag")
+        output = after.starts_with?("=")
+        code = output ? after[1, stop - 1] : after[0, stop]
+        value = evaluate(code.strip)
+        io << value if output
+        rest = after[stop + 2, after.bytesize - stop - 2]
+      end
+      io << rest
+    end
+  end
+
+  def evaluate(code : String) : String
+    if assignment = code.byte_index(" = ")
+      @locals[code[0, assignment].strip] = evaluate(code[assignment + 3, code.bytesize - assignment - 3].strip)
+      return ""
+    end
+    if local = @locals[code]?
+      return local
+    end
+    prefix = "BCrypt::Password.create("
+    if code.starts_with?(prefix) && code.ends_with?(")")
+      password = code[prefix.bytesize, code.bytesize - prefix.bytesize - 1].strip.strip('"')
+      if digest = @digests[password]?
+        return digest
+      end
+      digest = PasswordDigest.create(password, @bcrypt_cost).digest
+      @digests[password] = digest
+      return digest
+    end
+    return generate_bot_token if code == "User.generate_bot_token"
+    if span = parse_ago(code)
+      # `TimeWithZone#to_s` in UTC: whole seconds.
+      return "#{Timestamp.from_second(@now.as_second).ago(span).to_db} UTC"
+    end
+    raise "unsupported ERB in fixture: #{code}"
+  end
+end
+
+# `1.hour.ago`, `36.minutes.ago`, `2.days.ago`...
+def parse_ago(code : String) : Span?
+  parts = code.split('.')
+  return nil unless parts.size == 3 && parts[2] == "ago"
+  count = parts[0].strip.to_i64?
+  return nil unless count
+  unit = parts[1].rstrip('s')
+  seconds = case unit
+            when "second" then 1_i64
+            when "minute" then 60_i64
+            when "hour"   then 3600_i64
+            when "day"    then 86_400_i64
+            when "week"   then 604_800_i64
+            else               return nil
+            end
+  Span.seconds(count * seconds)
+end

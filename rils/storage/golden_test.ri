@@ -1,0 +1,392 @@
+# Golden-vector checks against `vectors/storage.json` and
+# `vectors/storage/` (the Rust repo's `reference-tools/storage/generate.rb`
+# run on the reference app). Each check lists every case it gets wrong.
+# Processed media is compared byte for byte only when the local libvips
+# and ffmpeg are the versions that made the vectors; otherwise that is
+# noted and those checks are skipped, unless CAMPFIRE_REQUIRE_MEDIA_VECTORS
+# is set.
+module rils/storage/golden_test
+
+import std/traits
+import std/file
+import std/text
+import std/json::{JSON, Any}
+import std/time::{Time}
+import std/process::{ProcessResult}
+import rils/record/sqlite::{Connection}
+import rils/record/timestamp::{Timestamp}
+import rils/rails_compat/crypto::{hex}
+import rils/rails_compat/clock::{parse_timestamp}
+import rils/rails_compat/json::{encode}
+import rils/rails_compat/key_generator::{Secrets}
+import rils/rails_compat/app_verifier::{app_verifier}
+import rils/rails_compat/message_verifier::{MessageVerifier}
+import rils/rails_compat/metadata::{Failure}
+import rils/storage/blob::{Blob, insert_attachment, find_variant_record}
+import rils/storage/content_types::{forced_disposition, for_serving}
+import rils/storage/disk::{DiskService, decode_verified_key, decode_verified_token, make_tempdir, remove_tree}
+import rils/storage/disposition::{escape_path}
+import rils/storage/errors::{StorageError}
+import rils/storage/filename::{Filename, scrub}
+import rils/storage/json::{json_parse}
+import rils/storage/key::{checksum, checksum_file}
+import rils/storage/marcel::{identify}
+import rils/storage/marshal::{Value}
+import rils/storage/paths::*
+import rils/storage/storage::{Storage, Staged}
+import rils/storage/variation::{Variation}
+import rils/storage/vips::{version}
+import web/web/spec::*
+
+VECTORS_PATH = Program.env("CAMPFIRE_STORAGE_VECTORS") || "#{__DIR__}/../../vectors/storage.json"
+VECTORS = JSON.parse(File.read(VECTORS_PATH))
+FILES = "#{File.dirname(VECTORS_PATH)}/storage"
+# The reference app's test-only `SECRET_KEY_BASE` (the Rust repo's
+# `parity/.env.reference`); the vectors record its prefix.
+SECRET_KEY_BASE = "5335c3b1ad35b4ad170c3413bd651ef3b6ed64e257261871a6de3f978cf3868ee417a927040935fb30b0f7debdedb34a2a403e9f34b16cf594c917c2ecd4a995"
+VERIFIER = app_verifier(Secrets.new(SECRET_KEY_BASE), "ActiveStorage")
+
+SCHEMA = <<-SQL
+  CREATE TABLE active_storage_attachments (id integer PRIMARY KEY AUTOINCREMENT NOT NULL, blob_id bigint NOT NULL, created_at datetime(6) NOT NULL, name varchar NOT NULL, record_id bigint NOT NULL, record_type varchar NOT NULL);
+  CREATE UNIQUE INDEX index_active_storage_attachments_uniqueness ON active_storage_attachments (record_type, record_id, name, blob_id);
+  CREATE TABLE active_storage_blobs (id integer PRIMARY KEY AUTOINCREMENT NOT NULL, byte_size bigint NOT NULL, checksum varchar, content_type varchar, created_at datetime(6) NOT NULL, filename varchar NOT NULL, key varchar NOT NULL, metadata text, service_name varchar NOT NULL);
+  CREATE UNIQUE INDEX index_active_storage_blobs_on_key ON active_storage_blobs (key);
+  CREATE TABLE active_storage_variant_records (id integer PRIMARY KEY AUTOINCREMENT NOT NULL, blob_id bigint NOT NULL, variation_digest varchar NOT NULL);
+  CREATE UNIQUE INDEX index_active_storage_variant_records_uniqueness ON active_storage_variant_records (blob_id, variation_digest);
+  SQL
+
+class Mismatches
+  getter lines : Array(String)
+
+  def initialize
+    @lines = [] of String
+  end
+
+  def check(label : String, ours : String?, theirs : String?) : Nil
+    @lines << "#{label}: ours #{ours.inspect}, Rails' #{theirs.inspect}" unless ours == theirs
+  end
+
+  def check(label : String, ok : Bool) : Nil
+    @lines << label unless ok
+  end
+
+  def done : Nil
+    raise "#{@lines.size} mismatches:\n#{@lines.join("\n")}" unless @lines.empty?
+  end
+end
+
+def fixture(name : String) : String
+  "#{__DIR__}/../../reference/test/fixtures/files/#{name}"
+end
+
+def time(text : String) : Time
+  parse_timestamp(text) || raise "not a time: #{text}"
+end
+
+NOW = time("2026-09-26T12:00:00Z")
+STAMP = Timestamp.from_time(NOW)
+
+def s(value : Any, key : String) : String
+  value[key].as_s
+end
+
+def s?(value : Any, key : String) : String?
+  field = value.as_h[key]?
+  field ? field.as_s? : nil
+end
+
+def typed(value : Any) : Value
+  raw = value.raw
+  case raw
+  when Nil   then Value.none
+  when Bool  then Value.bool(raw)
+  when Int64 then Value.int(raw)
+  when Array(Any) then Value.list(raw.map { |item| typed(item) })
+  when Hash(String, Any)
+    if sym = raw["sym"]?
+      Value.sym(sym.as_s)
+    elsif str = raw["str"]?
+      Value.str(str.as_s)
+    else
+      Value.map(raw["hash"].as_a.map { |pair| {pair[0].as_s, typed(pair[1])} })
+    end
+  else
+    raise "untyped #{value.inspect}"
+  end
+end
+
+def variation(value : Any) : Variation
+  Variation.new(typed(value).entries)
+end
+
+def unhex(text : String) : String
+  String.build(text.bytesize // 2) do |io|
+    (text.bytesize // 2).times { |i| io.write_byte(text[i * 2, 2].to_i(16).to_u8) }
+  end
+end
+
+def ok(result : T | StorageError) : T forall T
+  raise result.message if result.is_a?(StorageError)
+  result
+end
+
+def blob_from(row : Any) : Blob
+  Blob.new(row["id"].as_i64, s(row, "key"), Filename.new(s(row, "filename")), s?(row, "content_type"),
+    json_parse(s(row, "metadata")) || raise("metadata"), s(row, "service_name"), row["byte_size"].as_i64,
+    s?(row, "checksum"), "")
+end
+
+def path_segment(path : String, index : Int32) : String
+  path.split('/')[index]
+end
+
+def first_line(text : String) : String
+  text.split('\n')[0].strip
+end
+
+describe "storage vectors" do
+  it "digest and sign variations" do
+    failures = Mismatches.new
+    VECTORS["variations"].as_a.each do |v|
+      label = s(v, "inspect")
+      ours = variation(v["typed"])
+      failures.check("#{label} marshal", hex(ours.marshal), s(v, "marshal_hex"))
+      failures.check("#{label} digest", ours.digest, s(v, "digest"))
+      failures.check("#{label} key", ours.key(VERIFIER), s(v, "key"))
+      decoded = Variation.decode(VERIFIER, s(v, "key"), NOW)
+      if decoded.is_a?(StorageError)
+        failures.check("#{label} decodes", false)
+      else
+        failures.check("#{s(v, "decoded_inspect")} decoded", decoded == variation(v["decoded_typed"]))
+        failures.check("#{label} decoded marshal", hex(decoded.marshal), s(v, "decoded_marshal_hex"))
+        failures.check("#{label} decoded digest", decoded.digest, s(v, "decoded_digest"))
+      end
+    end
+    failures.done
+  end
+
+  it "sign verifier messages and disk URLs" do
+    assert SECRET_KEY_BASE.starts_with?(s(VECTORS, "secret_key_base_prefix"))
+    v = VECTORS["verifier"]
+    expires_at = time("2030-01-02T03:04:05.678Z")
+    assert VERIFIER.generate_raw("\"x\"", "p", expires_at) == s(v, "expiring")
+    assert VERIFIER.verify_raw(s(v, "expiring"), "p", NOW) == "\"x\""
+    assert VERIFIER.verify_raw(s(v, "expiring"), "p", expires_at).is_a?(Failure)
+    assert VERIFIER.verify_raw(s(v, "expiring"), "q", NOW).is_a?(Failure)
+
+    service = DiskService.new("/tmp/unused", "local")
+    weird = Filename.new("weird & <name> ünï.png")
+    key = "abcdefghijklmnopqrstuvwxyz12"
+    assert service.url_path(VERIFIER, key, nil, weird, "image/png", "inline") == s(v, "disk_url_path")
+    assert service.url_path(VERIFIER, key, nil, weird, nil, "attachment") == s(v, "disk_url_path_nil_type")
+
+    decoded = decode_verified_key(VERIFIER, path_segment(s(v, "disk_url_path"), 4), NOW) || raise "undecoded key"
+    assert decoded.key == key
+    assert decoded.content_type == "image/png"
+    assert decoded.service_name == "local"
+
+    token = s(v, "direct_upload_path").split('/').last
+    upload = decode_verified_token(VERIFIER, token, time("2020-01-01T00:00:00Z")) || raise "undecoded token"
+    assert upload.content_length == 42 && upload.checksum == "abc=="
+  end
+
+  it "identify content types like Marcel" do
+    failures = Mismatches.new
+    VECTORS["marcel"].as_a.each do |sample|
+      name = s?(sample, "fixture")
+      data = name ? File.read(fixture(name)) : unhex(s(sample, "data_hex"))
+      ours = identify(data, s?(sample, "name"), s?(sample, "declared_type"))
+      failures.check("#{s?(sample, "name").inspect} declared #{s?(sample, "declared_type").inspect}", ours, s(sample, "content_type"))
+    end
+    failures.done
+  end
+
+  # `rails_compat/content_disposition` checks the headers for these names.
+  it "sanitize and escape filenames" do
+    failures = Mismatches.new
+    VECTORS["filenames"].as_a.each do |f|
+      input = unhex(s(f, "input_hex"))
+      filename = Filename.from_bytes(input)
+      sanitized = filename.sanitized
+      failures.check("sanitized #{s(f, "input_hex")}", sanitized, s(f, "sanitized"))
+      # Invalid bytes are replaced on input, so base/extension only for
+      # valid names.
+      if scrub(input) == input
+        failures.check("#{sanitized} base", hex(filename.base), s(f, "base_hex"))
+        failures.check("#{sanitized} extension", hex(filename.extension), s(f, "extension_hex"))
+      end
+      failures.check("#{sanitized} escaped", escape_path(sanitized), s(f, "escaped_path"))
+    end
+    failures.done
+  end
+
+  it "build route paths" do
+    failures = Mismatches.new
+    service = DiskService.new("/tmp/unused", "local")
+    VECTORS["messages"].as_a.each do |m|
+      blob = blob_from(m["blob"])
+      name = s(m, "fixture")
+      failures.check("#{name} rails_blob_path", blob_redirect_path(VERIFIER, blob), s(m, "rails_blob_path"))
+      failures.check("#{name} download path", blob_redirect_path(VERIFIER, blob, "attachment"), s(m, "rails_blob_download_path"))
+      failures.check("#{name} proxy path", blob_proxy_path(VERIFIER, blob), s(m, "rails_blob_proxy_path"))
+      failures.check("#{name} signed id", verify_signed_blob_id(VERIFIER, path_segment(s(m, "rails_blob_path"), 5), NOW) == blob.id)
+
+      # `blob.url`: the disk URL, with the forced disposition for non-inline
+      # types.
+      content_type = blob.content_type_s
+      ["inline", "attachment"].each_with_index do |disposition, i|
+        d = forced_disposition(content_type) || disposition
+        url = "http://campfire.test#{service.url_path(VERIFIER, blob.key, nil, blob.filename, for_serving(content_type), d)}"
+        failures.check("#{name} service_url #{disposition}", url, s(m, i == 0 ? "service_url" : "service_url_attachment"))
+      end
+
+      if thumb_path = s?(m, "thumb_path")
+        thumb = variation(m["variants"][0]["transformations_typed"])
+        failures.check("#{name} thumb", representation_redirect_path(VERIFIER, blob, thumb), thumb_path)
+        failures.check("#{name} thumb proxy", representation_proxy_path(VERIFIER, blob, thumb), s(m, "thumb_proxy_path"))
+      end
+      if poster_path = s?(m, "poster_path")
+        poster = Variation.new([{"format", Value.sym("webp")}, {"resize_to_limit", Value.list([Value.int(1200_i64), Value.int(800_i64)])}] of Tuple(String, Value))
+        failures.check("#{name} poster", representation_redirect_path(VERIFIER, blob, poster), poster_path)
+        failures.check("#{name} poster proxy", representation_proxy_path(VERIFIER, blob, poster), s(m, "poster_proxy_path"))
+      end
+    end
+    failures.done
+  end
+
+  it "run the upload, analyze, variant and preview pipeline like the reference" do
+    root = make_tempdir("storage-golden")
+    storage = Storage.new(DiskService.new(root, "local"), VERIFIER)
+    conn = Connection.open(":memory:")
+    conn.execute_batch(SCHEMA)
+    comparison = Comparison.new(VECTORS["versions"])
+    failures = comparison.failures
+
+    VECTORS["messages"].as_a.each do |m|
+      name = s(m, "fixture")
+      blob = storage.create_and_upload(conn, File.read(fixture(name)), Filename.new(name), s?(m, "declared_type"), STAMP)
+      insert_attachment(conn, "attachment", "Message", 1_i64, blob.id, STAMP)
+      analyzed = storage.analyze(conn, blob)
+      raise analyzed.message if analyzed
+      comparison.blob(name, blob, m["blob"], false, false)
+      failures.check("#{name} variable?", blob.variable? == m["variable"].as_bool)
+      failures.check("#{name} previewable?", blob.previewable? == m["previewable"].as_bool)
+
+      if blob.video?
+        preview_image = ok(storage.preview_image(conn, blob, STAMP))
+        comparison.blob("#{name} preview_image", preview_image, m["preview_image"]["blob"], true, true)
+        m["variants"].as_a.each do |v|
+          image = ok(storage.process_preview(conn, blob, variation(v["transformations_typed"]), STAMP))
+          comparison.variant(storage, conn, preview_image, v, image, true)
+        end
+      elsif blob.variable?
+        v = m["variants"][0]
+        thumb = ok(storage.variation_for(blob, Variation.resize_to_limit(1200_i64, 800_i64)))
+        failures.check("#{name} thumb variation", thumb == variation(v["transformations_typed"]))
+        image = ok(storage.process_variant(conn, blob, thumb, STAMP))
+        # Processing again reuses the variant record.
+        failures.check("#{name} variant reused", ok(storage.process_variant(conn, blob, thumb, STAMP)).id == image.id)
+        comparison.variant(storage, conn, blob, v, image, false)
+      end
+    end
+
+    [{"avatars", "webp"}, {"logos", "png"}].each do |named|
+      VECTORS[named[0]].as_a.each do |entry|
+        row = entry["blob"]
+        blob = storage.create_and_upload(conn, File.read(fixture(s(entry, "fixture"))), Filename.new(s(row, "filename")), s?(row, "content_type"), STAMP)
+        analyzed = storage.analyze(conn, blob)
+        raise analyzed.message if analyzed
+        comparison.blob(s(row, "filename"), blob, row, false, false)
+        entry["variants"].as_a.each_with_index do |v, i|
+          transformations = i == 0 ? Variation.resize_to_limit(512_i64, 512_i64, named[1]) : Variation.resize_to_limit(192_i64, 192_i64, "png")
+          chosen = ok(storage.variation_for(blob, transformations))
+          failures.check("#{s(v, "label")} variation", chosen == variation(v["transformations_typed"]))
+          image = ok(storage.process_variant(conn, blob, chosen, STAMP))
+          comparison.variant(storage, conn, blob, v, image, false)
+        end
+      end
+    end
+
+    STDERR.puts "byte-identical: #{comparison.identical.inspect}" unless comparison.identical.empty?
+    conn.close
+    remove_tree(root)
+    failures.done
+  end
+
+  it "unfurl a staged file as its bytes would be" do
+    root = make_tempdir("storage-stage")
+    storage = Storage.new(DiskService.new(root, "local"), VERIFIER)
+    failures = Mismatches.new
+    VECTORS["messages"].as_a.each do |m|
+      name = s(m, "fixture")
+      declared = s?(m, "declared_type")
+      from_file = storage.stage_file(fixture(name), Filename.new(name), declared)
+      from_bytes = storage.stage_bytes(File.read(fixture(name)), Filename.new(name), declared)
+      a = from_file.blob
+      b = from_bytes.blob
+      failures.check("#{name} unfurled alike", a.content_type == b.content_type && a.checksum == b.checksum && a.byte_size == b.byte_size)
+      failures.check("#{name} copied", File.read(storage.service.path_for(a.key)) == File.read(fixture(name)))
+      # Staging doesn't read the copies back, so check what
+      # `DiskService#upload` would.
+      [a, b].each { |staged| failures.check("#{name} copy checksum", checksum_file(storage.service.path_for(staged.key)), staged.checksum) }
+      from_file.discard
+      from_bytes.discard
+    end
+    remove_tree(root)
+    failures.done
+  end
+end
+
+class Comparison
+  getter compare_images : Bool
+  getter compare_video : Bool
+  getter failures : Mismatches
+  getter identical : Array(String)
+
+  def initialize(versions : Any)
+    local_vips = version
+    local_vips = "unknown" if local_vips.is_a?(StorageError)
+    ffmpeg = Std::Process::Process.run("ffmpeg", ["-version"])
+    local_ffmpeg = ffmpeg.is_a?(ProcessResult) ? first_line(ffmpeg.stdout) : "none"
+    @compare_images = s(versions, "libvips") == local_vips
+    @compare_video = @compare_images && s(versions, "ffmpeg") == local_ffmpeg
+    @failures = Mismatches.new
+    @identical = [] of String
+    unless @compare_images && @compare_video
+      note = "vectors have libvips #{s(versions, "libvips")} / #{s(versions, "ffmpeg")}, local libvips #{local_vips} / #{local_ffmpeg}"
+      raise "byte comparisons would be skipped: #{note}" if Program.env("CAMPFIRE_REQUIRE_MEDIA_VECTORS")
+      STDERR.puts "note: skipping byte comparisons that depend on versions: #{note}"
+    end
+  end
+
+  # Row fields that don't depend on processing always match; checksum,
+  # size and dimensions of processed media only when the versions match.
+  def blob(label : String, actual : Blob, expected : Any, processed : Bool, video : Bool) : Nil
+    @failures.check("#{label} filename", actual.filename.raw, s(expected, "filename"))
+    @failures.check("#{label} content_type", actual.content_type, s?(expected, "content_type"))
+    @failures.check("#{label} service_name", actual.service_name, s(expected, "service_name"))
+    compare = !processed || (video ? @compare_video : @compare_images)
+    return unless compare
+    @failures.check("#{label} metadata", encode(actual.metadata), s(expected, "metadata"))
+    if actual.checksum == s?(expected, "checksum") && actual.byte_size == expected["byte_size"].as_i64
+      @identical << label
+    else
+      @failures.check("#{label}: #{actual.byte_size} bytes #{actual.checksum}, expected #{expected["byte_size"].as_i64} bytes #{s?(expected, "checksum")}", false)
+    end
+  end
+
+  def variant(storage : Storage, conn : Connection, source : Blob, v : Any, image : Blob, video : Bool) : Nil
+    label = s(v, "label")
+    @failures.check("#{label} digest", variation(v["transformations_typed"]).digest, s(v, "variation_digest"))
+    blob(label, image, v["blob"], true, video)
+    key = image.key
+    @failures.check("#{label} path", storage.path_for(image), "#{storage.service.root}/#{key[0, 2]}/#{key[2, 2]}/#{key}")
+    # The saved reference file is the variant blob's content, and ours is
+    # what we recorded.
+    @failures.check("#{label} vector file", checksum(File.read("#{FILES}/#{s(v, "file")}")), s(v["blob"], "checksum"))
+    @failures.check("#{label} stored file", checksum(File.read(storage.path_for(image))), image.checksum)
+    record_id = find_variant_record(conn, source.id, s(v, "variation_digest"))
+    attached = record_id ? Blob.attached(conn, "ActiveStorage::VariantRecord", record_id, "image") : nil
+    @failures.check("#{label} variant record attachment", !attached.nil? && attached.id == image.id)
+  end
+end

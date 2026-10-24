@@ -1,0 +1,519 @@
+# Views for `reference/app/views/messages`, plus `MessagesHelper` and the
+# boost partials. A message renders once per version into a `Fragment`
+# (`cache [ message, "presentation-v3" ]`); the page prints the fragments.
+module views/messages/messages
+
+import std/time::{Time}
+import rils/record/timestamp::{Timestamp}
+import std/text
+import rils/routes/paths::{user_path, room_message_path, room_at_message_path, edit_room_message_path, message_boosts_path, new_message_boost_path, message_boost_path}
+import rils/template/html::{Html, escape}
+import rils/ruby/floats::{float_to_s}
+import rils/template/recorded::{Fragment, RecordedPage}
+import views/layouts::{render_in_layout}
+import views/helpers/cache::{cache_fragment}
+import views/helpers/rooms::{mention_prompt_src}
+import rils/template/template::{Template, Buffer}
+import views/context::{ViewContext}
+import views/messages/support::{iso8601, epoch_ms}
+
+# `EmojiHelper::REACTIONS`.
+pub REACTIONS = [
+  {"👍", "Thumbs up"},
+  {"👏", "Clapping"},
+  {"👋", "Waving hand"},
+  {"💪", "Muscle"},
+  {"❤️", "Red heart"},
+  {"😂", "Face with tears of joy"},
+  {"🎉", "Party popper"},
+  {"🔥", "Fire"},
+]
+
+# What the message views show of a user: `avatar_tag` and the author
+# heading.
+pub class UserView
+  getter id : Int64
+  getter name : String
+  # `User#title`: name and bio joined by " – ".
+  getter title : String
+  # `fresh_user_avatar_path(user)`.
+  getter avatar_url : String
+
+  def initialize(@id : Int64, @name : String, @title : String, @avatar_url : String)
+  end
+
+  def path : String
+    user_path(@id)
+  end
+end
+
+pub class BoostView
+  getter id : Int64
+  getter message_id : Int64
+  getter content : String
+  # `boost.content.all_emoji?`.
+  getter all_emoji : Bool
+  getter booster : UserView
+
+  def initialize(@id : Int64, @message_id : Int64, @content : String, @all_emoji : Bool, @booster : UserView)
+  end
+
+  def dom_id : String
+    "boost_#{@id}"
+  end
+
+  def path : String
+    message_boost_path(@message_id, @id)
+  end
+end
+
+# A text message's body: the presentation filters' output after
+# `auto_link`.
+pub class TextContent
+  getter html : String
+
+  def initialize(@html : String)
+  end
+end
+
+# `sound.image`: `image_path(image.asset_path)` and its size.
+pub class SoundImageView
+  getter src : String
+  getter width : Int32
+  getter height : Int32
+
+  def initialize(@src : String, @width : Int32, @height : Int32)
+  end
+end
+
+# A `/play <name>` message's `Sound`.
+pub class SoundView
+  # `asset_path(sound.asset_path)`, the digested mp3.
+  getter url : String
+  getter image : SoundImageView?
+  getter text : String?
+
+  def initialize(@url : String, @image : SoundImageView?, @text : String?)
+  end
+end
+
+# A Ruby number as the views print it: an Integer, or a Float as
+# `Float#to_s` writes it.
+pub alias RubyNumber = Int64 | Float64
+
+# The message's Active Storage attachment.
+pub class AttachmentView
+  # `attachment.filename.to_s`.
+  getter filename : String
+  # `rails_blob_path(attachment)`.
+  getter blob_path : String
+  # `rails_blob_path(attachment, disposition: "attachment")`.
+  getter download_path : String
+  # "video" (`attachment.video?`), "image" (otherwise previewable or
+  # variable) or "file" (neither: a download link).
+  getter preview : String
+  # The video's poster (`url_for(attachment.preview(...))`) or the image's
+  # thumbnail (`attachment.representation(:thumb)`); nil for a file.
+  getter preview_url : String?
+  # `attachment.metadata[:width]` / `[:height]`: an Integer for images, a
+  # Float for videos.
+  getter width : RubyNumber?
+  getter height : RubyNumber?
+
+  def initialize(@filename : String, @blob_path : String, @download_path : String, @preview : String, @preview_url : String?, @width : RubyNumber?, @height : RubyNumber?)
+  end
+end
+
+# `Message#content_type` with what each presentation needs.
+pub alias MessageContent = TextContent | SoundView | AttachmentView
+
+# A message as `messages/_message` renders it.
+pub class MessageView
+  getter id : Int64
+  # `Message#to_key`, so every `dom_id(message)` uses it.
+  getter client_message_id : String
+  getter room_id : Int64
+  # `room_display_name(message.room, for_user: nil)`.
+  getter room_name : String
+  getter creator : UserView
+  getter created_at : Time
+  getter updated_at : Time
+  # `message.plain_text_body.all_emoji?`.
+  getter all_emoji : Bool
+  # What `message_presentation` presents.
+  getter content : MessageContent
+  # `message.boosts.ordered`.
+  getter boosts : Array(BoostView)
+  # `message_tag` rescued what its block raised (a creator that's gone) and
+  # renders `messages/_unrenderable` in place of the message.
+  getter unrenderable : Bool
+
+  def initialize(@id : Int64, @client_message_id : String, @room_id : Int64, @room_name : String, @creator : UserView,
+                 @created_at : Time, @updated_at : Time, @all_emoji : Bool, @content : MessageContent, @boosts : Array(BoostView),
+                 @unrenderable : Bool = false)
+  end
+
+  # `message.attachment`, when it's an attachment message.
+  def attachment : AttachmentView?
+    content = @content
+    content.is_a?(AttachmentView) ? content : nil
+  end
+
+  # `dom_id(message)` / `dom_id(message, prefix)`.
+  def dom_id(prefix : String) : String
+    prefix.empty? ? "message_#{@client_message_id}" : "#{prefix}_message_#{@client_message_id}"
+  end
+
+  def created_at_iso : String
+    iso8601(@created_at)
+  end
+
+  def created_at_epoch : Int64
+    epoch_ms(@created_at)
+  end
+
+  def updated_at_epoch : Int64
+    epoch_ms(@updated_at)
+  end
+
+  def path : String
+    room_message_path(@room_id, @id)
+  end
+
+  def at_path : String
+    room_at_message_path(@room_id, @id)
+  end
+
+  def edit_path : String
+    edit_room_message_path(@room_id, @id)
+  end
+
+  def boosts_path : String
+    message_boosts_path(@id)
+  end
+
+  def new_boost_path : String
+    new_message_boost_path(@id)
+  end
+end
+
+# `messages/_message`.
+pub class MessagePartial
+  getter ctx : ViewContext
+  getter cache_key : MessageFragmentKey
+
+  @build_message : Proc(MessageView)
+  @fragments : Hash(MessageFragmentKey, Fragment)
+
+  def initialize(@ctx : ViewContext, message : MessageView,
+                 @fragments : Hash(MessageFragmentKey, Fragment) = {} of MessageFragmentKey => Fragment)
+    @cache_key = message_fragment_key(message.id, Timestamp.from_time(message.updated_at).microseconds)
+    @build_message = -> { message }
+  end
+
+  def initialize(@ctx : ViewContext, @cache_key : MessageFragmentKey,
+                 @fragments : Hash(MessageFragmentKey, Fragment), @build_message : Proc(MessageView))
+  end
+
+  def build_message : MessageView
+    @build_message.call
+  end
+
+  def cache(key : MessageFragmentKey, & : -> Html) : Fragment
+    cache_fragment(@fragments, key) { yield }
+  end
+
+  Template.def_render("messages/_message.html.erb")
+end
+
+# `messages/index` (`layout false`): the page's message fragments.
+pub class Index
+  getter ctx : ViewContext
+  getter messages : Array(Fragment)
+
+  def initialize(@ctx : ViewContext, @messages : Array(Fragment))
+  end
+
+  Template.def_render("messages/index.html.erb")
+end
+
+# `render message`: `messages/_message` as the fragment the cache keeps.
+pub def message_fragment(ctx : ViewContext, message : MessageView,
+                         fragments : Hash(MessageFragmentKey, Fragment) = {} of MessageFragmentKey => Fragment) : Fragment
+  render_message_fragment(MessagePartial.new(ctx, message, fragments))
+end
+
+# The record supplies the key before any presentation data is loaded.
+pub def message_fragment(ctx : ViewContext, key : MessageFragmentKey,
+                         fragments : Hash(MessageFragmentKey, Fragment), &build : -> MessageView) : Fragment
+  render_message_fragment(MessagePartial.new(ctx, key, fragments, build))
+end
+
+def render_message_fragment(partial : MessagePartial) : Fragment
+  fragment = Fragment.new("")
+  tape do
+    buffer = Buffer.new
+    partial.render_into(buffer)
+    page = buffer.to_page
+    fragment = page.text.empty? && page.fragments.size == 1 ? page.fragments[0][1] : Fragment.new(page.to_s)
+  end
+  fragment
+end
+
+# `views/messages/_message/messages/<id>-<version>/presentation-v3`, the
+# version being `updated_at` to the microsecond (`cache_key_with_version`):
+# the id and the version are all of it that varies, so they are the key,
+# where a string a message was 40 a page made for the lookup alone.
+pub alias MessageFragmentKey = Tuple(Int64, Int64)
+
+pub def message_fragment_key(id : Int64, updated_at_usec : Int64) : MessageFragmentKey
+  {id, updated_at_usec}
+end
+
+# `Message::THUMBNAIL_MAX_WIDTH` / `THUMBNAIL_MAX_HEIGHT`.
+THUMBNAIL_MAX_WIDTH  = 1200
+THUMBNAIL_MAX_HEIGHT =  800
+
+# `message_presentation(message)`.
+pub def message_presentation(ctx : ViewContext, message : MessageView) : String
+  content = message.content
+  case content
+  when AttachmentView then attachment_presentation(ctx, content)
+  when SoundView      then sound_presentation(content)
+  when TextContent    then content.html
+  else                     ""
+  end
+end
+
+# `message_sound_presentation`: a play button, then the sound's image or
+# text.
+def sound_presentation(sound : SoundView) : String
+  shown = if image = sound.image
+            %(<img width="#{image.width}" height="#{image.height}" class="align--middle" src="#{escape(image.src)}" />)
+          elsif text = sound.text
+            escape(text)
+          else
+            ""
+          end
+  %(<div class="sound" data-controller="sound" data-action="messages:play-&gt;sound#play" data-sound-url-value="#{escape(sound.url)}"><button class="btn btn--plain" data-action="sound#play">🔊</button>#{shown}</div>)
+end
+
+# `Messages::AttachmentPresentation#render`.
+def attachment_presentation(ctx : ViewContext, attachment : AttachmentView) : String
+  case attachment.preview
+  when "video" then video_preview(attachment, attachment.preview_url || "")
+  when "image" then lightboxed_image_preview(attachment, attachment.preview_url || "")
+  else              file_link(ctx, attachment)
+  end
+end
+
+def video_preview(attachment : AttachmentView, poster_url : String) : String
+  video = %(<video src="#{escape(attachment.blob_path)}" poster="#{escape(poster_url)}" controls="controls" preload="none" width="100%" height="100%" class="message__attachment"></video>)
+  inline_media_dimension_constraints(preview_dimensions(attachment), video)
+end
+
+def lightboxed_image_preview(attachment : AttachmentView, thumb_url : String) : String
+  dimensions = preview_dimensions(attachment)
+  size = dimensions ? %( width="#{ruby_number(dimensions[0])}" height="#{ruby_number(dimensions[1])}") : ""
+  image = %(<img#{size} class="message__attachment" loading="lazy" src="#{escape(thumb_url)}" />)
+  link = %(<a class="flex" data-lightbox-target="image" data-action="lightbox#open" data-lightbox-url-value="#{escape(attachment.download_path)}" href="#{escape(attachment.blob_path)}">#{image}</a>)
+  inline_media_dimension_constraints(dimensions, link)
+end
+
+def inline_media_dimension_constraints(dimensions : Tuple(RubyNumber, RubyNumber)?, content : String) : String
+  if dimensions
+    width, height = dimensions
+    aspect_ratio = to_f(width) / to_f(height)
+    %(<div class="max-inline-size center flex overflow-clip" style="width: #{ruby_number(half(width))}px; aspect-ratio: #{float_to_s(aspect_ratio)};">#{content}</div>)
+  else
+    %(<div class="max-inline-size center overflow-clip">#{content}</div>)
+  end
+end
+
+# `preview_dimensions`: the metadata's size, scaled down to fit the
+# thumbnail's bounds.
+def preview_dimensions(attachment : AttachmentView) : Tuple(RubyNumber, RubyNumber)?
+  width = attachment.width
+  height = attachment.height
+  return nil if width.nil? || height.nil?
+  if to_f(width) <= THUMBNAIL_MAX_WIDTH && to_f(height) <= THUMBNAIL_MAX_HEIGHT
+    {width, height}
+  else
+    width_factor = THUMBNAIL_MAX_WIDTH / to_f(width)
+    height_factor = THUMBNAIL_MAX_HEIGHT / to_f(height)
+    scale = width_factor < height_factor ? width_factor : height_factor
+    {(to_f(width) * scale).as(RubyNumber), (to_f(height) * scale).as(RubyNumber)}
+  end
+end
+
+# `render_link`: the file's icon, name, download link and share button,
+# nothing between them.
+def file_link(ctx : ViewContext, attachment : AttachmentView) : String
+  filename = escape(attachment.filename)
+  download = escape(attachment.download_path)
+  %(<div class="flex-inline align-center gap-half">) +
+    %(<img class="colorize--black" aria-hidden="true" src="#{escape(ctx.asset("common-file-text.svg"))}" width="22" height="22" />) +
+    %(<span>#{filename}</span>) +
+    %(<a class="btn message__action-btn hide-in-ios-pwa" style="--width: auto;" href="#{download}">) +
+    %(<img aria-hidden="true" src="#{escape(ctx.asset("download.svg"))}" width="20" height="20" />) +
+    %(<span class="for-screen-reader">Download #{filename}</span></a>) +
+    %(<button class="btn message__action-btn" style="--width: auto;" data-controller="web-share" data-action="web-share#share" data-web-share-files-value="#{download}">) +
+    %(<img aria-hidden="true" src="#{escape(ctx.asset("share.svg"))}" width="20" height="20" />) +
+    %(<span class="for-screen-reader">Share #{filename}</span></button>) +
+    %(</div>)
+end
+
+def to_f(number : RubyNumber) : Float64
+  number.is_a?(Int64) ? number.to_f64 : number
+end
+
+# `number / 2`: integer division for an Integer.
+def half(number : RubyNumber) : RubyNumber
+  number.is_a?(Int64) ? number // 2 : number / 2.0
+end
+
+def ruby_number(number : RubyNumber) : String
+  number.is_a?(Int64) ? number.to_s : float_to_s(number)
+end
+
+# `messages/show.html.erb`: `render @message`, in the layout.
+pub class Show
+  getter ctx : ViewContext
+  getter message : MessageView
+
+  def initialize(@ctx : ViewContext, @message : MessageView)
+  end
+
+  Template.def_page("messages/show.html.erb")
+
+  pub def page(frame : Bool = false) : RecordedPage
+    render_in_layout(@ctx, nil, nil, frame) { |buffer| render_into(buffer) }
+  end
+end
+
+# `messages/room_not_found.html.erb`: the composer's frame when the room
+# is gone.
+pub class RoomNotFound
+  getter ctx : ViewContext
+
+  def initialize(@ctx : ViewContext)
+  end
+
+  Template.def_page("messages/room_not_found.html.erb")
+
+  pub def page(frame : Bool = false) : RecordedPage
+    render_in_layout(@ctx, nil, nil, frame) { |buffer| render_into(buffer) }
+  end
+end
+
+# `messages/boosts/index.html.erb`: the message's boosts.
+pub class BoostsIndex
+  getter ctx : ViewContext
+  getter message : MessageView
+
+  def initialize(@ctx : ViewContext, @message : MessageView)
+  end
+
+  Template.def_page("messages/boosts/index.html.erb")
+
+  pub def page(frame : Bool = false) : RecordedPage
+    render_in_layout(@ctx, nil, nil, frame) { |buffer| render_into(buffer) }
+  end
+end
+
+# `messages/boosts/new.html.erb`: the boost form, for `Current.user`
+# (*user*).
+pub class BoostsNew
+  getter ctx : ViewContext
+  getter message : MessageView
+  getter user : UserView
+
+  def initialize(@ctx : ViewContext, @message : MessageView, @user : UserView)
+  end
+
+  Template.def_page("messages/boosts/new.html.erb")
+
+  pub def page(frame : Bool = false) : RecordedPage
+    render_in_layout(@ctx, nil, nil, frame) { |buffer| render_into(buffer) }
+  end
+end
+
+# `messages/edit.html.erb`: the editor for a text message, or the delete
+# button for an attachment, in the message's edit frame.
+pub class Edit
+  getter ctx : ViewContext
+  getter message : MessageView
+  # `message.body` as the editor's value.
+  getter editable_body_html : String
+
+  def initialize(@ctx : ViewContext, @message : MessageView, @editable_body_html : String)
+  end
+
+  Template.def_page("messages/edit.html.erb")
+
+  pub def page(frame : Bool = false) : RecordedPage
+    render_in_layout(@ctx, nil, nil, frame) { |buffer| render_into(buffer) }
+  end
+end
+
+# `messages/boosts/_boost.html.erb`: what a boost's create broadcasts.
+pub class BoostPartial
+  getter ctx : ViewContext
+  getter boost : BoostView
+
+  def initialize(@ctx : ViewContext, @boost : BoostView)
+  end
+
+  Template.def_render("messages/boosts/_boost.html.erb")
+end
+
+# `messages/_presentation.html.erb`: what `update` broadcasts in place of
+# the message's body.
+pub class PresentationPartial
+  getter ctx : ViewContext
+  getter message : MessageView
+
+  def initialize(@ctx : ViewContext, @message : MessageView)
+  end
+
+  Template.def_render("messages/_presentation.html.erb")
+end
+
+# `messages/create.turbo_stream.erb`: the new message, appended to its
+# room's messages. *room_kind* is "open", "closed" or "direct".
+pub class CreateTurboStream
+  getter ctx : ViewContext
+  getter message : MessageView
+  getter room_kind : String
+
+  def initialize(@ctx : ViewContext, @message : MessageView, @room_kind : String)
+  end
+
+  Template.def_render("messages/create.turbo_stream.erb")
+end
+
+# `messages/destroy.turbo_stream.erb`.
+pub class DestroyTurboStream
+  getter ctx : ViewContext
+  getter message : MessageView
+
+  def initialize(@ctx : ViewContext, @message : MessageView)
+  end
+
+  Template.def_render("messages/destroy.turbo_stream.erb")
+end
+
+# `rooms/refreshes/show.turbo_stream.erb`: what changed in a room since
+# the client last looked.
+pub class RefreshTurboStream
+  getter ctx : ViewContext
+  getter room_id : Int64
+  getter room_kind : String
+  getter new_messages : Array(MessageView)
+  getter updated_messages : Array(MessageView)
+
+  def initialize(@ctx : ViewContext, @room_id : Int64, @room_kind : String, @new_messages : Array(MessageView), @updated_messages : Array(MessageView))
+  end
+
+  Template.def_render("rooms/refreshes/show.turbo_stream.erb")
+end

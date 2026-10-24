@@ -1,0 +1,391 @@
+# `String#to_f` and `Float#to_s` as Ruby 3.4 has them.
+module rils/ruby/floats
+
+import std/text
+import std/float
+import rils/ruby/text::{space?, skip_space}
+
+# `String#to_f` (`rb_cstr_to_dbl` in Ruby 3.4's object.c, which reads up to
+# the first NUL): the number after any leading whitespace, and 0.0 when
+# there's none. An underscore between two digits is skipped, so `"1_000.5"`
+# is 1000.5; `"1.2.3"` is 1.2 and `"1e2"` 100.0. Hexadecimal is read only
+# after a sign: `"-0x1A"` is -26.0, and `"0x1A"` 0.0.
+pub def to_f(s : String) : Float64
+  nul = s.byte_index("\0")
+  s = s[0, nul] if nul
+  bytes = Bytes.new(skip_space(s))
+  return 0.0 if hex?(bytes)
+  value, stop = strtod(bytes)
+  return value if stop == 0 || stop == bytes.size
+  number = without_underscores(bytes, stop)
+  hex?(number) ? 0.0 : strtod(number)[0]
+end
+
+# A string's bytes, read past the end as NUL the way C reads a buffer.
+struct Bytes
+  getter text : String
+
+  def initialize(@text : String)
+  end
+
+  def self.new(list : Array(UInt8)) : Bytes
+    Bytes.new(String.build(list.size) { |io| list.each { |byte| io.write_byte(byte) } })
+  end
+
+  def size : Int32
+    @text.bytesize
+  end
+
+  def at(i : Int32) : UInt8
+    i < @text.bytesize ? @text.as_tape[i] : 0_u8
+  end
+end
+
+def hex?(s : Bytes) : Bool
+  s.at(0) == '0'.ord && (s.at(1) == 'x'.ord || s.at(1) == 'X'.ord)
+end
+
+def digit?(byte : UInt8) : Bool
+  byte >= 48 && byte <= 57
+end
+
+def digit?(byte : UInt8, base : Int32) : Bool
+  return digit?(byte) if base == 10
+  digit?(byte) || (byte >= 'a'.ord && byte <= 'f'.ord) || (byte >= 'A'.ord && byte <= 'F'.ord)
+end
+
+def hex_value(byte : UInt8) : Float64?
+  return (byte - 48).to_f64 if digit?(byte)
+  return (byte - 'a'.ord + 10).to_f64 if byte >= 'a'.ord && byte <= 'f'.ord
+  return (byte - 'A'.ord + 10).to_f64 if byte >= 'A'.ord && byte <= 'F'.ord
+  nil
+end
+
+def lower(byte : UInt8) : UInt8
+  byte >= 'A'.ord && byte <= 'Z'.ord ? byte + 32 : byte
+end
+
+# A number's significand fills at most this much of `rb_cstr_to_dbl`'s
+# buffer (`DBL_DIG * 4`), and it all at most this much (`sizeof(buf) - 1`).
+INFINITY = IyiFloatText.from_bits(0x7FF0000000000000_u64)
+
+SIGNIFICAND_WIDTH = 60
+BUFFER_WIDTH      = 69
+
+# What `rb_cstr_to_dbl` hands `strtod` a second time when the first read
+# stopped short at *stop*: the number copied into a fixed buffer with the
+# underscores between digits left buffer, up to anything else that can't
+# continue it. Significand characters past the buffer's first 60 are
+# dropped, not scaled, so `"1" + "0" * 70 + "x"` is 1e59.
+def without_underscores(s : Bytes, stop : Int32) : Bytes
+  buffer = [] of UInt8
+  width = SIGNIFICAND_WIDTH
+  base = 10
+  exponent_letter = 'e'.ord.to_u8
+  dot_seen = false
+  previous = 0_u8
+  p = 0
+  if s.at(p) == '+'.ord || s.at(p) == '-'.ord
+    previous = s.at(p)
+    buffer << previous
+    p += 1
+  end
+  if s.at(p) == '0'.ord
+    previous = '0'.ord.to_u8
+    buffer << previous
+    p += 1
+    if s.at(p) == 'x'.ord || s.at(p) == 'X'.ord
+      previous = 'x'.ord.to_u8
+      buffer << previous
+      base = 16
+      exponent_letter = 'p'.ord.to_u8
+      p += 1
+    end
+    # Successive zeros are squeezed into the one.
+    while s.at(p) == '0'.ord
+      p += 1
+    end
+  end
+  while p < stop && buffer.size < width
+    previous = s.at(p)
+    buffer << previous
+    p += 1
+  end
+  while p < s.size
+    if s.at(p) == '_'.ord
+      p += 1
+      break if buffer.empty? || !digit?(previous, base) || !digit?(s.at(p), base)
+    end
+    previous = s.at(p)
+    p += 1
+    if width == SIGNIFICAND_WIDTH && lower(previous) == exponent_letter
+      width = BUFFER_WIDTH
+      buffer << previous
+      if s.at(p) == '+'.ord || s.at(p) == '-'.ord
+        previous = s.at(p)
+        buffer << previous
+        p += 1
+      end
+      if s.at(p) == '0'.ord
+        previous = '0'.ord.to_u8
+        buffer << previous
+        while s.at(p) == '0'.ord
+          p += 1
+        end
+      end
+      base = 10
+      next
+    elsif space?(previous)
+      while space?(s.at(p))
+        p += 1
+      end
+      break if p < s.size
+    elsif previous == '.'.ord
+      break if dot_seen
+      dot_seen = true
+    elsif !digit?(previous, base)
+      break
+    end
+    buffer << previous if buffer.size < width
+  end
+  Bytes.new(buffer)
+end
+
+# The most significant digits `ruby_strtod` reads of a fraction
+# (`DBL_DIG * 4`): past them the rest is ignored. Zeros count once a digit
+# follows them.
+FRACTION_DIGITS = 60
+
+# `ruby_strtod` (David Gay's, in Ruby's missing/dtoa.c): the number at the
+# start of *s*, and how much of *s* it takes up (0 for none). iyi's
+# `String#to_f` reads the digits it gathers; both round correctly.
+def strtod(s : Bytes) : Tuple(Float64, Int32)
+  i = 0
+  while space?(s.at(i))
+    i += 1
+  end
+  negative = s.at(i) == '-'.ord
+  i += 1 if s.at(i) == '+'.ord || s.at(i) == '-'.ord
+  return {0.0, 0} if i == s.size
+  return hex_strtod(s, i + 2, negative) if s.at(i) == '0'.ord && (s.at(i + 1) == 'x'.ord || s.at(i + 1) == 'X'.ord)
+  signed_zero = negative ? -0.0 : 0.0
+
+  leading_zero = s.at(i) == '0'.ord
+  while s.at(i) == '0'.ord
+    i += 1
+  end
+  return {signed_zero, i} if leading_zero && i == s.size
+  integer = String::Builder.new
+  while digit?(s.at(i))
+    integer.write_byte(s.at(i))
+    i += 1
+  end
+  digits = integer.bytesize
+  fraction = String::Builder.new
+  fraction_zeros = false
+  if s.at(i) == '.'.ord && digit?(s.at(i + 1))
+    i += 1
+    zeros = 0
+    while digit?(s.at(i))
+      digit = s.at(i)
+      i += 1
+      if digits > FRACTION_DIGITS
+        next
+      elsif digit == '0'.ord
+        zeros += 1
+        fraction_zeros = true
+        next
+      end
+      zeros.times { fraction << '0' }
+      fraction.write_byte(digit)
+      digits += digits == 0 ? 1 : zeros + 1
+      zeros = 0
+    end
+  elsif s.at(i) == '.'.ord
+    i += 1
+  end
+  any_digits = digits > 0 || fraction_zeros || leading_zero
+
+  exponent = 0
+  if s.at(i) == 'e'.ord || s.at(i) == 'E'.ord
+    return {0.0, 0} unless any_digits
+    exponent, i = strtod_exponent(s, i)
+  end
+  return any_digits ? {signed_zero, i} : {0.0, 0} if digits == 0
+  integer_text = integer.to_s
+  fraction_text = fraction.to_s
+  # Where the first significant digit sits, so a number past the double's
+  # range is answered without asking the parser.
+  magnitude = exponent + integer_text.bytesize
+  if integer_text.empty?
+    lead = 0
+    while lead < fraction_text.bytesize && fraction_text.as_tape[lead] == '0'.ord
+      lead += 1
+    end
+    magnitude -= lead
+  end
+  return {negative ? -INFINITY : INFINITY, i} if magnitude > 310
+  return {signed_zero, i} if magnitude < -330
+  number = "#{negative ? "-" : ""}#{integer_text.empty? ? "0" : integer_text}.#{fraction_text.empty? ? "0" : fraction_text}e#{exponent}"
+  {number.to_f? || signed_zero, i}
+end
+
+# The exponent at `s[e]` (the `e`), and where it ends; `s[e]` itself when no
+# digit follows. Past 19999 it's 19999, as in Ruby.
+def strtod_exponent(s : Bytes, e : Int32) : Tuple(Int32, Int32)
+  i = e + 1
+  negative = s.at(i) == '-'.ord
+  i += 1 if s.at(i) == '+'.ord || s.at(i) == '-'.ord
+  return {0, e} unless digit?(s.at(i))
+  while s.at(i) == '0'.ord
+    i += 1
+  end
+  start = i
+  exponent = 0_i64
+  while digit?(s.at(i))
+    exponent = exponent * 10 + (s.at(i) - 48).to_i64 if exponent < 100_000_000
+    i += 1
+  end
+  exponent = 19999_i64 if i - start > 8 || exponent > 19999
+  {negative ? -exponent.to_i32 : exponent.to_i32, i}
+end
+
+# `ruby_strtod`'s hexadecimal branch, from the digits after `0x` at *start*:
+# hex digits, a fraction and a binary exponent (`p`), added up as doubles the
+# way Ruby does, then scaled.
+def hex_strtod(s : Bytes, start : Int32, negative : Bool) : Tuple(Float64, Int32)
+  i = start
+  return {0.0, 0} if hex_value(s.at(i)).nil? && s.at(i) != '.'.ord
+  sum = 0.0
+  weight = 1.0
+  exponent = -4_i64
+  while s.at(i) == '0'.ord
+    i += 1
+  end
+  return {negative ? -0.0 : 0.0, i} if i == s.size
+  while digit = hex_value(s.at(i))
+    sum += weight * digit
+    exponent += 4
+    weight /= 16.0
+    i += 1
+  end
+  if s.at(i) == '.'.ord
+    i += 1
+    if hex_value(s.at(i))
+      if exponent < 0
+        while s.at(i) == '0'.ord
+          i += 1
+          exponent -= 4
+        end
+      end
+      while digit = hex_value(s.at(i))
+        sum += weight * digit
+        i += 1
+        weight /= 16.0
+        if weight == 0.0
+          while hex_value(s.at(i))
+            i += 1
+          end
+          break
+        end
+      end
+    end
+  end
+  if s.at(i) == 'p'.ord || s.at(i) == 'P'.ord
+    i += 1
+    sign = 0_i64
+    sign = -1_i64 if s.at(i) == '-'.ord
+    sign = 1_i64 if s.at(i) == '+'.ord
+    i += 1 if sign != 0
+    sign = 1_i64 if sign == 0
+    return {0.0, 0} unless digit?(s.at(i))
+    power = 0_i64
+    while digit?(s.at(i))
+      power = power * 10 + (s.at(i) - 48).to_i64
+      i += 1
+      # Ruby stops reading the exponent past this, where any significand
+      # overflows.
+      if power + sign * exponent > 2095
+        while digit?(s.at(i))
+          i += 1
+        end
+        break
+      end
+    end
+    exponent += power * sign
+  end
+  value = scale_by_two(sum, exponent)
+  {negative ? -value : value, i}
+end
+
+def power_of_two(n : Int64) : Float64
+  IyiFloatText.from_bits((0x3ff_i64 + n).to_u64.unsafe_shl(52_u64))
+end
+
+# `ldexp(value, exponent)`: *value* times 2 to the *exponent*, rounded once
+# (musl's `scalbn`).
+def scale_by_two(value : Float64, exponent : Int64) : Float64
+  n = exponent
+  if n > 1023
+    value *= power_of_two(1023)
+    n -= 1023
+    if n > 1023
+      value *= power_of_two(1023)
+      n = n - 1023 < 1023 ? n - 1023 : 1023_i64
+    end
+  elsif n < -1022
+    # Scaled so that the last step, into the subnormals, is the only one
+    # that rounds.
+    value *= power_of_two(-1022) * power_of_two(53)
+    n += 1022 - 53
+    if n < -1022
+      value *= power_of_two(-1022) * power_of_two(53)
+      n = n + 1022 - 53 > -1022 ? n + 1022 - 53 : -1022_i64
+    end
+  end
+  value * power_of_two(n)
+end
+
+# `Float#to_s`: plain decimals from 1e-4 up to (not including) 1e15, and
+# above that while the shortest digits still reach past the decimal point
+# (`1000000000000000.1`); the exponent form otherwise (`flo_to_s` in Ruby
+# 3.4's numeric.c).
+pub def float_to_s(f : Float64) : String
+  return "NaN" if f != f
+  return "Infinity" if f == INFINITY
+  return "-Infinity" if f == -INFINITY
+  return f.to_s if f == 0.0
+  digits, decpt = shortest_digits(f.abs)
+  sign = f < 0 ? "-" : ""
+  if decpt < -3 || (decpt > 15 && digits.bytesize <= decpt)
+    rest = digits.bytesize > 1 ? digits[1, digits.bytesize - 1] : "0"
+    e = decpt - 1
+    "#{sign}#{digits[0, 1]}.#{rest}e#{e < 0 ? '-' : '+'}#{e.abs.to_s.rjust(2, '0')}"
+  elsif decpt <= 0
+    "#{sign}0.#{"0" * -decpt}#{digits}"
+  elsif decpt >= digits.bytesize
+    "#{sign}#{digits}#{"0" * (decpt - digits.bytesize)}.0"
+  else
+    "#{sign}#{digits[0, decpt]}.#{digits[decpt, digits.bytesize - decpt]}"
+  end
+end
+
+# The shortest digits that read back as *magnitude*, and where the decimal
+# point goes in them, read off iyi's printer, which breaks ties to even as
+# Ruby's dtoa does.
+def shortest_digits(magnitude : Float64) : Tuple(String, Int32)
+  text = magnitude.to_s
+  mantissa, _, power = text.partition('e')
+  exponent = power.empty? ? 0 : power.lchop('+').to_i
+  whole, _, fraction = mantissa.partition('.')
+  digits = whole + fraction
+  decpt = whole.bytesize + exponent
+  lead = 0
+  while lead < digits.bytesize - 1 && digits.as_tape[lead] == '0'.ord
+    lead += 1
+  end
+  digits = digits[lead, digits.bytesize - lead]
+  decpt -= lead
+  digits = digits.rstrip('0')
+  {digits, decpt}
+end

@@ -1,0 +1,89 @@
+# `ActionDispatch::Static` over reference/public and the precompiled
+# assets, the answers the Rust port's `campfire_assets::serve` gives.
+module rils/kit/public_files_test
+
+import std/text
+import std/file::{File}
+import rils/kit/response::{Response, HeaderList, FileBody}
+import rils/kit/request::{RequestFields}
+import rils/assets/pipeline::{LoadPath}
+import rils/kit/public_files::{PublicFiles}
+import web/web/spec::*
+
+FILES = PublicFiles.reference(LoadPath.reference)
+ROBOTS = File.read("#{__DIR__}/../../reference/public/robots.txt")
+
+def serve(method : String, path : String, range : String? = nil, if_modified_since : String? = nil) : Response?
+  headers = HeaderList.new
+  headers.append("range", range) if range
+  headers.append("if-modified-since", if_modified_since) if if_modified_since
+  FILES.serve(method, path.as_tape, RequestFields.new(headers))
+end
+
+def file_body(response : Response) : FileBody
+  body = response.body
+  raise "not a file body" unless body.is_a?(FileBody)
+  body
+end
+
+describe "public files" do
+  it "serve a public file whole, with Rails' production cache headers" do
+    response = serve("GET", "/robots.txt") || raise "missing"
+    assert response.status == 200
+    assert response["content-type"] == "text/plain"
+    assert response["cache-control"] == "public, max-age=2592000"
+    assert response["content-length"] == ROBOTS.bytesize.to_s
+    assert file_body(response).length == ROBOTS.bytesize.to_i64
+  end
+
+  it "serve digested assets, compiled ones from the precompiled copy" do
+    css = serve("GET", "/assets/composer-e490638a.css") || raise "missing"
+    assert css["content-type"] == "text/css"
+    assert File.read(file_body(css).path).includes?("url(\"/assets/common-file-text-9043d980.svg\")")
+    png = serve("GET", "/assets/campfire-icon-3d9986c5.png") || raise "missing"
+    assert png["content-type"] == "image/png"
+    assert serve("GET", "/assets/composer.css").nil?
+  end
+
+  it "leave other methods and unknown paths to the app" do
+    assert serve("POST", "/robots.txt").nil?
+    assert serve("GET", "/rooms/1").nil?
+  end
+
+  it "clean the path as Rack does" do
+    assert !serve("GET", "/assets/../robots.txt").nil?
+    assert !serve("GET", "/robots.txt/").nil?
+    assert !serve("GET", "/%72obots.txt").nil?
+    assert serve("GET", "/robots.txt%00").nil?
+  end
+
+  it "answer 304 to the file's own Last-Modified" do
+    modified = (serve("GET", "/robots.txt") || raise "missing")["last-modified"]
+    response = serve("GET", "/robots.txt", if_modified_since: modified) || raise "missing"
+    assert response.status == 304
+    assert response.headers.empty?
+  end
+
+  it "answer ranges as Rack::Files does" do
+    one = serve("GET", "/robots.txt", "bytes=1-10") || raise "missing"
+    assert one.status == 206
+    assert one["content-range"] == "bytes 1-10/#{ROBOTS.bytesize}"
+    assert file_body(one).offset == 1_i64
+    assert file_body(one).length == 10_i64
+
+    two = serve("GET", "/robots.txt", "bytes=0-1, 4-5") || raise "missing"
+    assert two.status == 206
+    assert two["content-type"] == "text/plain"
+    expected = "\r\n--AaB03x\r\ncontent-type: text/plain\r\ncontent-range: bytes 0-1/#{ROBOTS.bytesize}\r\n\r\n#{ROBOTS[0, 2]}" \
+               "\r\n--AaB03x\r\ncontent-type: text/plain\r\ncontent-range: bytes 4-5/#{ROBOTS.bytesize}\r\n\r\n#{ROBOTS[4, 2]}" \
+               "\r\n--AaB03x--\r\n"
+    assert two.body == expected
+    assert two["content-length"] == expected.bytesize.to_s
+
+    none = serve("GET", "/robots.txt", "bytes=999999999-") || raise "missing"
+    assert none.status == 416
+    assert none["content-range"] == "bytes */#{ROBOTS.bytesize}"
+    assert none["x-cascade"] == "pass"
+    assert none.body == "Byte range unsatisfiable\n"
+  end
+end

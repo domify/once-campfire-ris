@@ -1,0 +1,14 @@
+module rils/storage/marcel_test
+
+import rils/storage/marcel::*
+import web/web/spec::*
+
+describe "marcel" do
+  it "identifies" do
+    assert identify("\x89PNG\r\n\x1A\n", "a.png", nil) == "image/png"
+    assert identify("hello", "a.txt", nil) == "text/plain"
+    assert identify("", nil, "IMAGE/JPEG; q=1") == "image/jpeg"
+    assert for_extension("jpg") == "image/jpeg"
+    assert magic_prefix_len > 0
+  end
+end

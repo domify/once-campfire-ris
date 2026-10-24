@@ -1,0 +1,87 @@
+# Heap bytes one request allocates, through the same path the server runs:
+# web's parse into an `Arrived` and the kit's handler answering it, the response
+# written to a socket as the server writes it, with the collector off so
+# every allocation counts. A thread reads the other end and drops it.
+#
+#   bench/heap_probe DB SECRET_KEY_BASE PATH COOKIE [N]
+module bench/heap_probe
+
+import std/gc::{GC}
+import std/socket::{IyiSocket, SocketError}
+import std/http::{Server, ParsedHead}
+import web/web/request::{Arrived, arrived_from}
+import web/web/response::{Response}
+import rils/kit/server::{KitHandler}
+import config/app::{App}
+import config/routes::{campfire_router}
+
+# The request as web's server hands it to a handler: its head parsed
+# where its bytes lie on the tape.
+def arrive(raw : String) : Arrived
+  bytes = Str.new(raw)
+  head = Server.parse_head(bytes).as(ParsedHead)
+  arrived_from(head, "".as_tape, "").as(Arrived)
+end
+
+def allocated : UInt64
+  GC.stats.bytes_since_collection
+end
+
+listener = IyiSocket.listen("127.0.0.1", 0)
+port = listener.local_port
+IyiThread.start do
+  case client = IyiSocket.connect("127.0.0.1", port)
+  in IyiSocket
+    tape do
+      chunk = Str::Builder.new(65536)
+      loop do
+        chunk.clear
+        got = client.read(chunk, 65536)
+        break unless got.is_a?(Int32) && got > 0
+      end
+    end
+  in Cancelled
+  in SocketError
+  end
+  nil
+end
+socket = listener.accept.as(IyiSocket)
+
+app = App.open(Program.args[0], Program.args[1])
+handler = KitHandler.new(app.stack, campfire_router(app))
+raw = "GET #{Program.args[2]} HTTP/1.1\r\nHost: 127.0.0.1:8091\r\nAccept: text/html\r\nCookie: session_token=#{Program.args[3]}\r\n\r\n"
+n = Program.args.size > 4 ? Program.args[4].to_i : 200
+body = 0
+status = 0
+2.times do
+  tape do
+    arrived = arrive(raw)
+    wire = Response.new
+    wire.attach(->(bytes : String) { socket.write(bytes); nil }, socket, "HTTP/1.1", true, false)
+    handler.answer(arrived, wire)
+  end
+end
+GC.collect
+GC.disable
+# Totals over *n*, each phase on its own: the counter moves by the
+# allocator's chunk, so one request's difference says little.
+start = allocated
+n.times do
+  tape do
+    arrive(raw)
+  end
+end
+parsed = allocated - start
+start = allocated
+n.times do
+  tape do
+    wire = Response.new
+    wire.attach(->(bytes : String) { socket.write(bytes); nil }, socket, "HTTP/1.1", true, false)
+    handler.answer(arrive(raw), wire)
+    body = wire.body.bytesize
+    status = wire.status_code
+  end
+end
+total = allocated - start
+puts "status #{status}, body kept by the probe #{body} B (0: sent to the socket)"
+puts "per request: #{total // n.to_u64} B in all, #{parsed // n.to_u64} B parsing the request, #{(total - parsed) // n.to_u64 - body.to_u64} B in the handler besides the probe's kept body"

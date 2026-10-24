@@ -1,0 +1,50 @@
+# The sliver of Ruby's Marshal format needed to read Rails 7-era signed
+# messages, whose payload is a marshaled String
+# (`Marshal.dump("gid://campfire/User/1")`). Anything else is rejected.
+module rils/rails_compat/marshal
+import std/int
+
+pub MARSHAL_SIGNATURE = "\x04\x08"
+
+# Loads a marshaled String: `"\x04\x08" ["I"] '"' <len> <bytes> [<ivars>]`.
+pub def marshal_string(dumped : String) : String?
+  return nil unless dumped.starts_with?(MARSHAL_SIGNATURE)
+  i = 2
+  i += 1 if i < dumped.bytesize && dumped.as_tape[i] == 'I'.ord
+  return nil unless i < dumped.bytesize && dumped.as_tape[i] == '"'.ord
+  i += 1
+  read = read_fixnum(dumped, i)
+  return nil unless read
+  length, i = read
+  return nil if length < 0 || i + length > dumped.bytesize
+  dumped[i, length.to_i32]
+end
+
+def read_fixnum(bytes : String, at : Int32) : Tuple(Int64, Int32)?
+  return nil unless at < bytes.bytesize
+  byte = bytes.as_tape[at].to_i32
+  first = byte >= 128 ? byte - 256 : byte
+  rest = at + 1
+  if first == 0
+    {0_i64, rest}
+  elsif first >= 1 && first <= 4
+    n = first
+    return nil if rest + n > bytes.bytesize
+    value = 0_i64
+    n.times { |i| value = (value << 8) | bytes.as_tape[rest + n - 1 - i].to_i64 }
+    {value, rest + n}
+  elsif first >= -4 && first <= -1
+    n = -first
+    return nil if rest + n > bytes.bytesize
+    value = -1_i64
+    n.times do |i|
+      value &= ~(0xff_i64 << (8 * i))
+      value |= bytes.as_tape[rest + i].to_i64 << (8 * i)
+    end
+    {value, rest + n}
+  elsif first >= 5
+    {first.to_i64 - 5, rest}
+  else
+    {first.to_i64 + 5, rest}
+  end
+end

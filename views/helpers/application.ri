@@ -1,0 +1,164 @@
+# `ApplicationHelper`, `CableHelper`, `VersionHelper`, `ClipboardHelper` and
+# `QrCodeHelper` (`reference/app/helpers/*.rb`), and the Ruby string methods
+# the views call.
+module views/helpers/application
+
+import std/text
+import std/unicode::{Unicode}
+import rils/rails_compat/encoding::{urlsafe_encode_padded}
+import rils/routes/paths::{root_path, room_path, qr_code_path}
+import rils/template/html::{Html}
+import views/context::{ViewContext}
+import views/helpers/tag::*
+import views/helpers/assets::{image_tag}
+import views/helpers/links::{link_to}
+
+# `page_title_tag`: `@page_title || "Campfire"`.
+pub def page_title_tag(page_title : String?) : Html
+  content_tag_text("title", attrs, page_title || "Campfire")
+end
+
+# `current_user_meta_tags`.
+pub def current_user_meta_tags(ctx : ViewContext) : Html
+  if user = ctx.current_user
+    legacy_tag("meta", attrs.name("current-user-id").attr("content", user.id)) +
+      legacy_tag("meta", attrs.name("current-user-name").attr("content", user.name))
+  else
+    Html.new("")
+  end
+end
+
+# `script_aware_action_cable_meta_tag`.
+pub def script_aware_action_cable_meta_tag(ctx : ViewContext) : Html
+  builder_tag("meta", attrs.name("action-cable-url").attr("content", ctx.cable_url))
+end
+
+# `custom_styles_tag`: the account's CSS, unescaped.
+pub def custom_styles_tag(ctx : ViewContext) : Html
+  if styles = ctx.custom_styles
+    content_tag("style", attrs.data("turbo_track", "reload"), Html.new(styles))
+  else
+    Html.new("")
+  end
+end
+
+# `body_classes`: `[ @body_class, admin_body_class, account_logo_body_class ].compact.join(" ")`.
+pub def body_classes(ctx : ViewContext, body_class : String?) : String
+  classes = [] of String
+  if body_class
+    classes << body_class
+  end
+  classes << "admin" if ctx.can_administer?
+  classes << "account-has-logo" if ctx.account.has_logo
+  classes.join(" ")
+end
+
+# `link_back`: to the referrer, unless it's missing or the current page.
+pub def link_back(ctx : ViewContext) : Html
+  back_url = root_path
+  if referrer = ctx.referrer
+    back_url = referrer unless referrer == ctx.request_url
+  end
+  link_back_to(ctx, back_url)
+end
+
+# `link_back_to(destination)`.
+pub def link_back_to(ctx : ViewContext, destination : String) : Html
+  content = image_tag(ctx, "arrow-left.svg", attrs.aria_hidden.size(20)) +
+            content_tag_text("span", attrs.class("for-screen-reader"), "Go Back")
+  link_to(destination, attrs.class("btn"), content)
+end
+
+# `RoomsHelper#link_back_to_last_room_visited`.
+pub def link_back_to_last_room_visited(ctx : ViewContext) : Html
+  if room_id = ctx.last_room_visited_id
+    link_back_to(ctx, room_path(room_id))
+  else
+    link_back_to(ctx, root_path)
+  end
+end
+
+# `version_badge`.
+pub def version_badge(ctx : ViewContext) : Html
+  content_tag_text("span", attrs.class("version-badge"), ctx.app_version)
+end
+
+# `button_to_copy_to_clipboard(url) { content }`.
+pub def button_to_copy_to_clipboard(url : String, content : Html) : Html
+  options = attrs.class("btn")
+    .data("controller", "copy-to-clipboard")
+    .data("action", "copy-to-clipboard#copy")
+    .data("copy_to_clipboard_success_class", "btn--success")
+    .data("copy_to_clipboard_content_value", url)
+  content_tag("button", options, content)
+end
+
+pub def button_to_copy_to_clipboard(url : String, & : -> Html) : Html
+  button_to_copy_to_clipboard(url, yield)
+end
+
+# `link_to_zoom_qr_code(url) { content }`: the QR code route takes the URL,
+# `Base64.urlsafe_encode64`d (reference/app/helpers/qr_code_helper.rb).
+pub def link_to_zoom_qr_code(url : String, content : Html) : Html
+  path = qr_code_path(urlsafe_encode_padded(url))
+  options = attrs.class("btn").data("lightbox_target", "image").data("action", "lightbox#open").data("lightbox_url_value", path)
+  link_to(path, options, content)
+end
+
+pub def link_to_zoom_qr_code(url : String, & : -> Html) : Html
+  link_to_zoom_qr_code(url, yield)
+end
+
+# `web_share_session_button(url, title, text) { content }`
+# (`Users::ProfilesHelper`).
+pub def web_share_session_button(url : String, title : String, text : String, content : Html) : Html
+  options = attrs.class("btn").hidden
+    .data("controller", "web-share")
+    .data("action", "web-share#share")
+    .data("web_share_url_value", url)
+    .data("web_share_text_value", text)
+    .data("web_share_title_value", title)
+  content_tag("button", options, content)
+end
+
+pub def web_share_session_button(url : String, title : String, text : String, & : -> Html) : Html
+  web_share_session_button(url, title, text, yield)
+end
+
+# `truncate(text, length:, omission:)` with Rails' default of no separator:
+# the result, omission included, is at most *length* characters. Plain text
+# (escape on output).
+pub def truncate(text : String, length : Int32, omission : String) : String
+  return text if text.size <= length
+  keep = length - omission.size
+  keep = 0 if keep < 0
+  String.build do |io|
+    count = 0
+    text.each_char do |c|
+      io << c if count < keep
+      count += 1
+    end
+    io << omission
+  end
+end
+
+# `String#capitalize`: first character upcased, the rest downcased.
+pub def capitalize(text : String) : String
+  Unicode.capitalize(text)
+end
+
+# `String#downcase`, beyond ASCII.
+pub def downcase(text : String) : String
+  Unicode.downcase(text)
+end
+
+# `Array#to_sentence` with the default English connectors, or a custom
+# `two_words_connector`.
+pub def to_sentence(items : Array(String), two_words_connector : String) : String
+  case items.size
+  when 0 then ""
+  when 1 then items[0]
+  when 2 then "#{items[0]}#{two_words_connector}#{items[1]}"
+  else        "#{items.first(items.size - 1).join(", ")}, and #{items.last}"
+  end
+end

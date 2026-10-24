@@ -1,0 +1,514 @@
+# `RoomsController` (reference/app/controllers/rooms_controller.rb): the
+# room screen.
+module controllers/rooms
+
+import rils/template/template::{Buffer}
+import std/text
+import rils/record/sqlite::{Connection}
+import models/account::{Account}
+import models/message::{Message}
+import models/room::{Room}
+import models/user::{User}
+import rils/rails_compat/global_id::{GlobalId}
+import rils/rails_compat/turbo::{signed_stream_name}
+import rils/routes/paths::{root_path, room_path}
+import rils/kit/ctx::{Ctx, ActionResult, Redirect}
+import rils/kit/cookies::{Cookie}
+import rils/kit/response::{Response}
+import rils/kit/errors::{HttpError}
+import rils/kit/format::{HTML}
+import rils/ruby/integers::{integer_cast}
+import views/context::{CurrentUser, ViewContext}
+import views/rooms::{Show, ShowView, RoomView, room_display_name}
+import config/app::{App}
+import controllers/concerns::{Current, allow_browser, set_version_headers, require_authentication}
+import controllers/messages::{MessagePresenter, current_user, room_kind}
+import controllers/concerns::{Passed, before_actions, head}
+import channels/broadcasts::{room_param_key}
+import views/helpers/user_paths::{avatar_path}
+import models/room::{RoomType, Membership, Involvement}
+import models/message::{destroy_room}
+import rils/record/timestamp::{Timestamp}
+import rils/kit/errors::{halt}
+import rils/kit/format::{TURBO_STREAM}
+import rils/kit/params::{permit_keys}
+import rils/ruby/integers::{to_i}
+import rils/routes/paths::{room_involvement_path, new_rooms_open_path, edit_rooms_open_path, new_rooms_closed_path, edit_rooms_closed_path}
+import views/messages/messages::{UserView, RefreshTurboStream}
+import views/messages/support::{epoch_ms}
+import views/room_forms::{FormRoom, OpenForm, ClosedForm, RoomFormPage, DirectsNew, DirectsEdit}
+import views/rooms::{InvolvementsShow}
+import views/users::{SidebarShared, SidebarRoom, SidebarDirect, SidebarDirectPartial, SidebarUser}
+
+# `index`: `redirect_to room_url(Current.user.rooms.last)`.
+pub def index_rooms(app : App, c : Ctx) : ActionResult
+  platform = allow_browser(app, c)
+  return platform if platform.is_a?(HttpError)
+  current = require_authentication(app, c)
+  return current if current.is_a?(HttpError)
+  set_version_headers(app, c)
+  room = app.db.read { |conn| Room.last_for_user(conn, current.user.id) }
+  # `room_url(nil)` raises in Rails.
+  return HttpError.internal("the user is in no room") unless room
+  c.redirect_to(c.url_for(room_path(room.id)))
+end
+
+# `show` (`set_room`, `remember_last_room_visited`): the page around
+# `params[:message_id]`, else the last page.
+pub def show_room(app : App, c : Ctx) : ActionResult
+  platform = allow_browser(app, c)
+  return platform if platform.is_a?(HttpError)
+  current = require_authentication(app, c)
+  return current if current.is_a?(HttpError)
+  set_version_headers(app, c)
+  room = set_room(app, c, current)
+  return room if room.is_a?(ActionResult)
+  # `remember_last_room_visited`: `cookies.permanent[:last_room] = @room.id`
+  c.cookies.set("last_room", Cookie.new(room.id.to_s, permanent: true))
+  format = c.respond_to([HTML])
+  return format if format.is_a?(HttpError)
+
+  user = current.user
+  ctx = app.layout_context(c, CurrentUser.new(user.id, user.name, user.administrator?, user.bot?), platform)
+  presenter = MessagePresenter.new(app, ctx, room, c.request.host)
+  message_id = c.param_str("message_id")
+  show = app.db.read do |conn|
+    anchor = message_id ? integer_cast(message_id) : nil
+    shown = anchor ? Message.find_by_id(conn, anchor) : nil
+    messages = shown && shown.room_id == room.id ? Message.page_around(conn, room.id, shown) : Message.last_page(conn, room.id)
+    original = Room.original(conn)
+    account = Account.first(conn)
+    ShowView.new(room_view(conn, room, user), room.updated_at.time, presenter.user_view(user), presenter.fragments(messages),
+      !original.nil? && original.id == room.id && !Message.paged?(conn, room.id), account ? account.join_code : "",
+      signed_stream_name(app.secrets, [GlobalId.new(room.room_type.class_name, room.id).to_param, "messages"]))
+  end
+  app.render_layout(c, 200, show.room.display_name, "sidebar", ctx) { |buffer| Show.new(ctx, show).render_into(buffer) }
+end
+
+# `set_room`: `Current.user.rooms.find_by(id: params[:room_id] || params[:id])`,
+# else back to the root.
+def set_room(app : App, c : Ctx, current : Current) : Room | ActionResult
+  raw = c.param_str("room_id") || c.param_str("id")
+  id = raw ? integer_cast(raw) : nil
+  room = id ? app.db.read { |conn| Room.find_for_user(conn, current.user.id, id) } : nil
+  room || c.redirect_to(c.url_for(root_path), Redirect.new(alert: "Room not found or inaccessible"))
+end
+
+# The room as the room views show it, named for *user*.
+def room_view(conn : Connection, room : Room, user : User) : RoomView
+  others = room.direct? ? room.users(conn).reject { |member| member.id == user.id }.map(&.name) : [] of String
+  kind = room.direct? ? "direct" : room.closed? ? "closed" : "open"
+  RoomView.new(room.id, kind, room.name, room_display_name(room.name, room.direct?, others, user.name))
+end
+
+# Which rooms a controller reaches (`room_scope`): `RoomsController` all
+# of the user's, opens and closeds all but the direct ones, directs only
+# those.
+pub enum Scope
+  All
+  WithoutDirects
+  Directs
+
+  def includes?(room : Room) : Bool
+    case self
+    when Scope::WithoutDirects then !room.direct?
+    when Scope::Directs        then room.direct?
+    else                            true
+    end
+  end
+end
+
+DEFAULT_ROOM_NAME = "New room"
+
+# `destroy` (`set_room`, `ensure_can_administer`).
+pub def destroy_room_action(app : App, c : Ctx) : ActionResult
+  scoped = scoped_room(app, c, Scope::All)
+  return scoped unless scoped.is_a?(Tuple)
+  passed, room = scoped
+  forbidden = ensure_can_administer_room(passed.user, room)
+  return forbidden if forbidden
+  destroy_and_go_home(app, c, room)
+end
+
+# `destroy` for opens and closeds, whose `set_room` doesn't cover it:
+# `@room.destroy` on nil.
+pub def destroy_without_room(app : App, c : Ctx) : ActionResult
+  passed = before_actions(app, c)
+  return passed if passed.is_a?(HttpError)
+  HttpError.internal("undefined method 'destroy' for nil")
+end
+
+def destroy_and_go_home(app : App, c : Ctx, room : Room) : ActionResult
+  app.db.write { |tx| destroy_room(tx, room) }
+  app.broadcasts.room_remove(room)
+  c.redirect_to(c.url_for(root_path))
+end
+
+# The before-actions and `set_room` within *scope*.
+def scoped_room(app : App, c : Ctx, scope : Scope) : Tuple(Passed, Room) | ActionResult
+  passed = before_actions(app, c)
+  return passed if passed.is_a?(HttpError)
+  raw = c.param_str("room_id") || c.param_str("id")
+  id = raw ? integer_cast(raw) : nil
+  room = id ? app.db.read { |conn| Room.find_for_user(conn, passed.user.id, id) } : nil
+  return c.redirect_to(c.url_for(root_path), Redirect.new(alert: "Room not found or inaccessible")) unless room && scope.includes?(room)
+  {passed, room}
+end
+
+# `head :forbidden unless Current.user.can_administer?(@room)`
+def ensure_can_administer_room(user : User, room : Room) : HttpError?
+  user.can_administer?(room.creator_id) ? nil : halt(head(403))
+end
+
+# `ensure_permission_to_create_rooms`
+def ensure_permission_to_create_rooms(app : App, user : User) : HttpError?
+  account = app.db.read { |conn| Account.first(conn) }
+  restricted = account ? account.settings.restrict_room_creation_to_administrators? : false
+  restricted && !user.administrator? ? halt(head(403)) : nil
+end
+
+# `room_params`: `params.require(:room).permit(:name)`. The outer nil is a
+# name that wasn't given.
+def room_name_param(c : Ctx) : Tuple(String?)? | HttpError
+  room = c.require("room")
+  return room if room.is_a?(HttpError)
+  permitted = room.permit(permit_keys(["name"]))
+  return nil unless permitted.has_key?("name")
+  name = permitted["name"]?
+  {name ? name.as_s? : nil}
+end
+
+# `params.fetch(:user_ids, [])`, as ids.
+def user_ids_param(c : Ctx) : Array(Int64)
+  param = c.param("user_ids") || return [] of Int64
+  if list = param.as_a?
+    list.compact_map { |value| (text = value.as_s?) ? integer_cast(text) : nil }
+  elsif text = param.as_s?
+    (id = integer_cast(text)) ? [id] : [] of Int64
+  else
+    [] of Int64
+  end
+end
+
+def existing_user_ids(conn : Connection, ids : Array(Int64)) : Array(Int64)
+  User.where_ids(conn, ids).map(&.id)
+end
+
+def redirect_to_room(c : Ctx, room_id : Int64) : ActionResult
+  c.redirect_to(c.url_for(room_path(room_id)))
+end
+
+# `@room.becomes!(type)`: the same row as another STI class.
+def becomes(room : Room, room_type : RoomType) : Room
+  Room.new(room.id, room.name, room_type, room.creator_id, room.created_at, room.updated_at)
+end
+
+# The users views' summary of *user*.
+def user_views(app : App, users : Array(User)) : Array(UserView)
+  users.map { |user| UserView.new(user.id, user.name, user.title, avatar_path(app.secrets, user)) }
+end
+
+# `users/sidebars/rooms/_shared` with `room:`.
+pub def shared_room_html(app : App, c : Ctx, room : Room) : String
+  SidebarShared.new(app.view_context(c.request), SidebarRoom.new(room.id, room_param_key(room), room.name || "", false)).render.to_s
+end
+
+# `users/sidebars/rooms/_direct`'s locals for *membership*: the room's
+# other users, or its user alone.
+pub def sidebar_direct(app : App, conn : Connection, membership : Membership) : SidebarDirect
+  room = Room.find_by_id(conn, membership.room_id) || raise "the membership's room is gone"
+  users = room.users(conn)
+  members = users.reject { |user| user.id == membership.user_id }
+  if members.empty?
+    if own = User.find_by_id(conn, membership.user_id)
+      members = [own]
+    end
+  end
+  SidebarDirect.new(room.id, membership.unread?, epoch_ms(room.updated_at.time).to_s,
+    members.map { |user| SidebarUser.new(user.id, user.name, avatar_path(app.secrets, user)) })
+end
+
+# The open and closed rooms' `show`: `redirect_to room_url(@room)`.
+pub def show_shared_room(app : App, c : Ctx) : ActionResult
+  scoped = scoped_room(app, c, Scope::WithoutDirects)
+  return scoped unless scoped.is_a?(Tuple)
+  room = scoped[1]
+  c.cookies.set("last_room", Cookie.new(room.id.to_s, permanent: true))
+  redirect_to_room(c, room.id)
+end
+
+# `Rooms::OpensController#new` / `ClosedsController#new`.
+pub def new_room(app : App, c : Ctx, kind : String) : ActionResult
+  passed = before_actions(app, c)
+  return passed if passed.is_a?(HttpError)
+  forbidden = ensure_permission_to_create_rooms(app, passed.user)
+  return forbidden if forbidden
+  format = c.respond_to([HTML])
+  return format if format.is_a?(HttpError)
+  ctx = app.layout_context(c, current_user(passed.user), passed.platform)
+  room = FormRoom.new(nil, DEFAULT_ROOM_NAME)
+  # `@users = User.active.ordered`
+  users = user_views(app, app.db.read { |conn| User.active_ordered(conn) })
+  form = if kind == "open"
+           OpenForm.new(ctx, room, true, users, new_rooms_closed_path).render
+         else
+           ClosedForm.new(ctx, room, true, passed.user.id, [] of UserView, users, new_rooms_open_path).render
+         end
+  render_form_page(app, c, ctx, RoomFormPage.new(ctx, room, true, form))
+end
+
+# `Rooms::OpensController#edit` / `ClosedsController#edit`
+# (`force_room_type`).
+pub def edit_room(app : App, c : Ctx, kind : String) : ActionResult
+  scoped = scoped_room(app, c, Scope::WithoutDirects)
+  return scoped unless scoped.is_a?(Tuple)
+  passed, room = scoped
+  format = c.respond_to([HTML])
+  return format if format.is_a?(HttpError)
+  user = passed.user
+  ctx = app.layout_context(c, current_user(user), passed.platform)
+  form_room = FormRoom.new(room.id, room.name)
+  can_administer = user.can_administer?(room.creator_id)
+  form = if kind == "open"
+           OpenForm.new(ctx, form_room, can_administer, user_views(app, app.db.read { |conn| User.active_ordered(conn) }), edit_rooms_closed_path(room.id)).render
+         else
+           selected_ids = app.db.read { |conn| room.user_ids(conn) }
+           active = app.db.read { |conn| User.active_ordered(conn) }
+           selected = active.select { |member| selected_ids.includes?(member.id) }
+           unselected = active.reject { |member| selected_ids.includes?(member.id) }
+           ClosedForm.new(ctx, form_room, can_administer, user.id, user_views(app, selected), user_views(app, unselected), edit_rooms_open_path(room.id)).render
+         end
+  render_form_page(app, c, ctx, RoomFormPage.new(ctx, form_room, can_administer, form))
+end
+
+def render_form_page(app : App, c : Ctx, ctx : ViewContext, page : RoomFormPage) : ActionResult
+  app.render_layout(c, 200, page.page_title, nil, ctx) { |buffer| page.render_into(buffer) }
+end
+
+# `Rooms::OpensController#create`: `Rooms::Open.create_for(room_params,
+# users: Current.user)`, prepended to everyone's sidebar.
+pub def create_open_room(app : App, c : Ctx) : ActionResult
+  passed = before_actions(app, c)
+  return passed if passed.is_a?(HttpError)
+  forbidden = ensure_permission_to_create_rooms(app, passed.user)
+  return forbidden if forbidden
+  name = room_name_param(c)
+  return name if name.is_a?(HttpError)
+  user_id = passed.user.id
+  room = app.db.write { |tx| Room.create_for(tx, RoomType::Open, name ? name[0] : nil, user_id, [user_id]) }
+  app.broadcasts.open_room_create(shared_room_html(app, c, room))
+  redirect_to_room(c, room.id)
+end
+
+# `Rooms::ClosedsController#create`: `Rooms::Closed.create_for(room_params,
+# users: grantees)`, prepended to each member's sidebar.
+pub def create_closed_room(app : App, c : Ctx) : ActionResult
+  passed = before_actions(app, c)
+  return passed if passed.is_a?(HttpError)
+  forbidden = ensure_permission_to_create_rooms(app, passed.user)
+  return forbidden if forbidden
+  name = room_name_param(c)
+  return name if name.is_a?(HttpError)
+  grantee_ids = user_ids_param(c)
+  room = app.db.write { |tx| Room.create_for(tx, RoomType::Closed, name ? name[0] : nil, passed.user.id, existing_user_ids(tx.conn, grantee_ids)) }
+  html = shared_room_html(app, c, room)
+  app.db.read { |conn| app.broadcasts.closed_room_create(conn, room, html) }
+  redirect_to_room(c, room.id)
+end
+
+# `update` for opens and closeds: `force_room_type`, `@room.update!
+# room_params`, then for a closed room `memberships.revise`.
+pub def update_room(app : App, c : Ctx, kind : String) : ActionResult
+  scoped = scoped_room(app, c, Scope::WithoutDirects)
+  return scoped unless scoped.is_a?(Tuple)
+  passed, room = scoped
+  forbidden = ensure_can_administer_room(passed.user, room)
+  return forbidden if forbidden
+  name = room_name_param(c)
+  return name if name.is_a?(HttpError)
+  room_type = kind == "open" ? RoomType::Open : RoomType::Closed
+  invalid = app.db.write { |tx| room.update(tx, name, room_type) }
+  return HttpError.status(422, "Validation failed") if invalid
+  html = shared_room_html(app, c, room)
+  if kind == "open"
+    app.broadcasts.open_room_update(room, html)
+  else
+    grantee_ids = user_ids_param(c)
+    app.db.write do |tx|
+      granted = existing_user_ids(tx.conn, grantee_ids)
+      revoked = room.user_ids(tx.conn).reject { |id| grantee_ids.includes?(id) }
+      room.revise(tx, granted, revoked)
+    end
+    app.db.read { |conn| app.broadcasts.closed_room_update(conn, room, html) }
+  end
+  redirect_to_room(c, room.id)
+end
+
+# `Rooms::DirectsController#show`: RoomsController's without `set_room`,
+# so `remember_last_room_visited` raises on the nil room; the room page
+# is where it goes in practice.
+pub def show_direct_room(app : App, c : Ctx) : ActionResult
+  passed = before_actions(app, c)
+  return passed if passed.is_a?(HttpError)
+  raw = c.param_str("id") || return HttpError.not_found
+  id = integer_cast(raw) || return HttpError.not_found
+  redirect_to_room(c, id)
+end
+
+pub def new_direct_room(app : App, c : Ctx) : ActionResult
+  passed = before_actions(app, c)
+  return passed if passed.is_a?(HttpError)
+  format = c.respond_to([HTML])
+  return format if format.is_a?(HttpError)
+  ctx = app.layout_context(c, current_user(passed.user), passed.platform)
+  view = DirectsNew.new(ctx)
+  app.render_layout(c, 200, nil, nil, ctx) { |buffer| view.render_into(buffer) }
+end
+
+# `create`: `Rooms::Direct.find_or_create_for(selected_users)`, then
+# `_direct` prepended to each member's sidebar.
+pub def create_direct_room(app : App, c : Ctx) : ActionResult
+  passed = before_actions(app, c)
+  return passed if passed.is_a?(HttpError)
+  user_id = passed.user.id
+  ids = user_ids_param(c)
+  ids << user_id
+  room = app.db.write { |tx| Room.find_or_create_direct_for(tx, existing_user_ids(tx.conn, ids), user_id) }
+  ctx = app.view_context(c.request)
+  app.db.read do |conn|
+    app.broadcasts.direct_room_create(conn, room) { |membership| SidebarDirectPartial.new(ctx, sidebar_direct(app, conn, membership)).render.to_s }
+  end
+  redirect_to_room(c, room.id)
+end
+
+pub def edit_direct_room(app : App, c : Ctx) : ActionResult
+  scoped = scoped_room(app, c, Scope::Directs)
+  return scoped unless scoped.is_a?(Tuple)
+  passed, room = scoped
+  format = c.respond_to([HTML])
+  return format if format.is_a?(HttpError)
+  user = passed.user
+  ctx = app.layout_context(c, current_user(user), passed.platform)
+  view = app.db.read do |conn|
+    # `@room.users.many? ? @room.users.without(Current.user) : @room.users`
+    users = room.users(conn)
+    shown = users.size > 1 ? users.reject { |member| member.id == user.id } : users
+    DirectsEdit.new(ctx, room.id, room_view(conn, room, user).display_name, user_views(app, shown))
+  end
+  app.render_layout(c, 200, nil, nil, ctx) { |buffer| view.render_into(buffer) }
+end
+
+# `destroy`: every member of a direct room can (`ensure_can_administer`
+# always passes).
+pub def destroy_direct_room(app : App, c : Ctx) : ActionResult
+  scoped = scoped_room(app, c, Scope::Directs)
+  return scoped unless scoped.is_a?(Tuple)
+  destroy_and_go_home(app, c, scoped[1])
+end
+
+# `Rooms::InvolvementsController#show`.
+pub def show_involvement(app : App, c : Ctx) : ActionResult
+  passed = before_actions(app, c)
+  return passed if passed.is_a?(HttpError)
+  scoped = set_membership(app, c, passed.signed_in)
+  return scoped if scoped.is_a?(HttpError)
+  membership, room = scoped
+  format = c.respond_to([HTML])
+  return format if format.is_a?(HttpError)
+  ctx = app.layout_context(c, current_user(passed.user), passed.platform)
+  involvement = membership.involvement
+  view = InvolvementsShow.new(ctx, app.db.read { |conn| room_view(conn, room, passed.user) }, involvement ? involvement.name : "")
+  app.render_layout(c, 200, nil, nil, ctx) { |buffer| view.render_into(buffer) }
+end
+
+# `update`: `@membership.update! involvement: params[:involvement]`, then
+# `broadcast_visibility_changes`.
+pub def update_involvement(app : App, c : Ctx) : ActionResult
+  passed = before_actions(app, c)
+  return passed if passed.is_a?(HttpError)
+  scoped = set_membership(app, c, passed.signed_in)
+  return scoped if scoped.is_a?(HttpError)
+  membership, room = scoped
+  involvement = involvement_param(c)
+  return involvement if involvement.is_a?(HttpError)
+  previous = membership.involvement
+  app.db.write { |tx| membership.update_involvement(tx, involvement) }
+  failed = app.broadcasts.involvement_change(room, membership, previous) { shared_room_html(app, c, room) }
+  return HttpError.internal(failed.message) if failed
+  c.redirect_to(c.url_for(room_involvement_path(room.id)))
+end
+
+# `params[:involvement]` as the enum casts it: blank is nil, anything
+# that isn't one of the values raises.
+def involvement_param(c : Ctx) : Involvement? | HttpError
+  param = c.param("involvement") || return nil
+  return nil if param.blank?
+  text = param.as_s?
+  found = text ? Involvement.from_name(text) : nil
+  found || HttpError.internal("#{(param.to_s? || "").inspect} is not a valid involvement")
+end
+
+def set_membership(app : App, c : Ctx, current : Current) : Tuple(Membership, Room) | HttpError
+  Controllers::Concerns.set_room(app, c, current)
+end
+
+# `Rooms::RefreshesController#show`: the messages created, and those
+# updated, since `params[:since]` (milliseconds).
+pub def show_refresh(app : App, c : Ctx) : ActionResult
+  passed = before_actions(app, c)
+  return passed if passed.is_a?(HttpError)
+  scoped = set_membership(app, c, passed.signed_in)
+  return scoped if scoped.is_a?(HttpError)
+  room = scoped[1]
+  since = since_param(c)
+  return since if since.is_a?(HttpError)
+  format = c.respond_to([TURBO_STREAM])
+  return format if format.is_a?(HttpError)
+  ctx = app.view_context(c.request)
+  presenter = MessagePresenter.new(app, ctx, room, c.request.host)
+  created, updated = app.db.read do |conn|
+    fresh = Message.page_created_since(conn, room.id, since)
+    {fresh, Message.page_updated_since(conn, room.id, since, fresh.map(&.id))}
+  end
+  view = RefreshTurboStream.new(ctx, room.id, room_kind(room), created.map { |m| presenter.view(m) }, updated.map { |m| presenter.view(m) })
+  c.render(200, TURBO_STREAM, app.written(->(buffer : Buffer) { view.render_into(buffer) }))
+end
+
+# `Time.at(0, params[:since].to_i, :millisecond)`; outside the range a
+# timestamp holds, its nearest end.
+def since_param(c : Ctx) : Timestamp | HttpError
+  param = c.param("since")
+  ms = 0_i64
+  if param && !param.null?
+    text = param.as_s? || return HttpError.internal("undefined method 'to_i'")
+    ms = to_i(text)
+  end
+  limit = 9223372036854775_i64
+  ms = limit if ms > limit
+  ms = -limit if ms < -limit
+  Timestamp.new(ms * 1000)
+end
+
+pub def opens_new(app : App, c : Ctx) : ActionResult
+  new_room(app, c, "open")
+end
+
+pub def opens_edit(app : App, c : Ctx) : ActionResult
+  edit_room(app, c, "open")
+end
+
+pub def opens_update(app : App, c : Ctx) : ActionResult
+  update_room(app, c, "open")
+end
+
+pub def closeds_new(app : App, c : Ctx) : ActionResult
+  new_room(app, c, "closed")
+end
+
+pub def closeds_edit(app : App, c : Ctx) : ActionResult
+  edit_room(app, c, "closed")
+end
+
+pub def closeds_update(app : App, c : Ctx) : ActionResult
+  update_room(app, c, "closed")
+end

@@ -1,0 +1,367 @@
+# Outbound HTTP for webhooks, Web Push and link previews:
+# `RestrictedHTTP::PrivateNetworkGuard`
+# (reference/lib/restricted_http/private_network_guard.rb) and the parts of
+# the surfguard gem it calls (`Surfguard.resolve_public_ips`,
+# `Surfguard.blocked_address?`, default policy), then the request itself,
+# pinned to the address the guard let through.
+#
+# ris' sockets resolve numeric addresses only and speak no TLS, so names
+# are looked up with `getent ahosts` and requests go through `curl`, with
+# `--resolve` pinning the host to the checked address so a second lookup
+# can't land somewhere private.
+module integrations/net
+
+import std/text
+import std/int
+import std/file::{File}
+import rils/ruby/ipaddr::{IpAddr, parse_ipaddr, ipaddr_include?, ipaddr_to_s}
+import rils/storage/process::{output_within, TimedOut}
+import std/process::{ProcessResult, ProcessError}
+
+# Looks a name up: its addresses, in the resolver's order, or nil when it
+# can't be resolved.
+pub alias Lookup = Proc(String, Array(String)?)
+
+# `Surfguard::DISALLOWED_IPV4`
+DISALLOWED_IPV4 = ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "168.63.129.16/32", "169.254.0.0/16", "172.16.0.0/12",
+                   "192.0.0.0/24", "192.0.2.0/24", "192.88.99.0/24", "192.168.0.0/16", "198.18.0.0/15", "198.51.100.0/24",
+                   "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4"]
+
+# `Surfguard::DISALLOWED_IPV6`
+DISALLOWED_IPV6 = ["::/128", "100::/64", "100:0:0:1::/64", "2001::/32", "2001:2::/48", "2001:db8::/32", "2002::/16", "3fff::/20",
+                   "5f00::/16", "fec0::/10", "ff00::/8"]
+
+# `Surfguard::IANA_ALLOCATED_IPV6_UNICAST`
+IANA_ALLOCATED_IPV6_UNICAST = ["2001::/23", "2001:200::/23", "2001:400::/23", "2001:600::/23", "2001:800::/22", "2001:c00::/23",
+                               "2001:e00::/23", "2001:1200::/23", "2001:1400::/22", "2001:1800::/23", "2001:1a00::/23", "2001:1c00::/22",
+                               "2001:2000::/19", "2001:4000::/23", "2001:4200::/23", "2001:4400::/23", "2001:4600::/23", "2001:4800::/23",
+                               "2001:4a00::/23", "2001:4c00::/23", "2001:5000::/20", "2001:8000::/19", "2001:a000::/20", "2001:b000::/20",
+                               "2002::/16", "2003::/18", "2400::/12", "2410::/12", "2600::/12", "2610::/23", "2620::/23", "2630::/12",
+                               "2800::/12", "2a00::/12", "2a10::/12", "2c00::/12"]
+
+# `Surfguard::GLOBALLY_REACHABLE_IETF_ASSIGNMENTS`
+GLOBALLY_REACHABLE_IETF_ASSIGNMENTS = ["2001:3::/32", "2001:4:112::/48"]
+
+IETF_PROTOCOL_ASSIGNMENTS = "2001::/23"
+NAT64_WELL_KNOWN          = "64:ff9b::/96"
+NAT64_LOCAL_USE           = "64:ff9b:1::/48"
+IPV4_MAPPED               = "::ffff:0:0/96"
+IPV4_TRANSLATABLE         = "::ffff:0:0:0/96"
+IPV4_COMPATIBLE           = "::/96"
+UNIQUE_LOCAL              = "fc00::/7"
+LINK_LOCAL_V6             = "fe80::/10"
+
+MAX_HOST_BYTES = 255
+MAX_ADDRESSES  = 256
+
+def in_range?(ip : IpAddr, range : String) : Bool
+  network, _, prefix = range.partition('/')
+  parsed = parse_ipaddr(network) || raise "bad range #{range}"
+  ipaddr_include?(parsed, prefix.to_i, ip)
+end
+
+# The IPv4 address in an IPv6 one's last 32 bits.
+def embedded_v4(ip : IpAddr) : IpAddr
+  IpAddr.new(false, 0_u64, ip.low & 0xffffffff_u64)
+end
+
+# `Surfguard.blocked_address?(ip)`.
+pub def blocked_address?(ip : IpAddr) : Bool
+  return DISALLOWED_IPV4.any? { |range| in_range?(ip, range) } unless ip.v6
+  return true if in_range?(ip, IPV4_MAPPED) || in_range?(ip, IPV4_COMPATIBLE) || in_range?(ip, NAT64_LOCAL_USE)
+  if in_range?(ip, NAT64_WELL_KNOWN) || in_range?(ip, IPV4_TRANSLATABLE)
+    return blocked_address?(embedded_v4(ip))
+  end
+  return false if GLOBALLY_REACHABLE_IETF_ASSIGNMENTS.any? { |range| in_range?(ip, range) }
+  loopback = ip.high == 0 && ip.low == 1
+  return true if in_range?(ip, UNIQUE_LOCAL) || loopback || in_range?(ip, LINK_LOCAL_V6) || in_range?(ip, IETF_PROTOCOL_ASSIGNMENTS)
+  return true if DISALLOWED_IPV6.any? { |range| in_range?(ip, range) }
+  !IANA_ALLOCATED_IPV6_UNICAST.any? { |range| in_range?(ip, range) }
+end
+
+# What `RestrictedHTTP::PrivateNetworkGuard.resolve` failed with.
+pub class GuardError
+  getter message : String
+
+  def initialize(@message : String)
+  end
+
+  # `RestrictedHTTP::Violation`
+  pub def self.violation(host : String) : GuardError
+    GuardError.new("Attempt to access private IP via #{host}")
+  end
+
+  # `Surfguard::Unresolvable`
+  pub def self.unresolvable : GuardError
+    GuardError.new("Host could not be resolved")
+  end
+end
+
+# `PrivateNetworkGuard.resolve(hostname)`: the first public address.
+pub def guard_resolve(lookup : Lookup, host : String) : String | GuardError
+  found = resolve_public_ips(lookup, host)
+  return found if found.is_a?(GuardError)
+  found.first? || GuardError.violation(host)
+end
+
+# `Surfguard.resolve_public_ips(host)`: IPv4 answers before IPv6 ones, the
+# blocked ones dropped. Malformed input comes back empty.
+pub def resolve_public_ips(lookup : Lookup, host : String) : Array(String) | GuardError
+  return [] of String unless normal_host?(host)
+  return [] of String unless valid_host_syntax?(host)
+  return [] of String if malformed_numeric_host_candidate?(host)
+  addresses = [] of IpAddr
+  if literal = numeric_address(host) || ip_literal(host)
+    addresses << literal
+  elsif numeric_host_candidate?(host)
+    return [] of String
+  else
+    answers = lookup.call(host) || return GuardError.unresolvable
+    return GuardError.unresolvable if answers.size > MAX_ADDRESSES
+    answers.each do |answer|
+      ip = parse_ipaddr(answer)
+      addresses << ip if ip
+    end
+  end
+  unique = [] of IpAddr
+  addresses.each { |ip| unique << ip unless unique.any? { |seen| seen.v6 == ip.v6 && seen.high == ip.high && seen.low == ip.low } }
+  return GuardError.unresolvable if unique.empty?
+  allowed = unique.reject { |ip| blocked_address?(ip) }
+  (allowed.reject(&.v6) + allowed.select(&.v6)).map { |ip| ipaddr_to_s(ip) }
+end
+
+# `normalize_host`: ASCII, no NUL, not empty, at most 255 bytes, no zone.
+def normal_host?(host : String) : Bool
+  bytes_of(host).all? { |b| b < 128 } && !host.includes?("\0") && !host.empty? && host.bytesize <= MAX_HOST_BYTES && !host.includes?("%")
+end
+
+def bytes_of(text : String) : Array(UInt8)
+  bytes = [] of UInt8
+  text.each_byte { |byte| bytes << byte }
+  bytes
+end
+
+def alnum?(byte : UInt8) : Bool
+  (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
+end
+
+def valid_host_syntax?(host : String) : Bool
+  return true if host.includes?(":") || legacy_ipv4_shape?(host) || !ip_literal(host).nil?
+  name = host.ends_with?(".") ? host[0, host.bytesize - 1] : host
+  name.split('.').all? do |label|
+    bytes = bytes_of(label)
+    !bytes.empty? && bytes.size <= 63 && alnum?(bytes[0]) && alnum?(bytes[bytes.size - 1]) && bytes.all? { |b| alnum?(b) || b == '-'.ord }
+  end
+end
+
+def numeric_host_candidate?(host : String) : Bool
+  host.includes?(":") || legacy_ipv4_shape?(host)
+end
+
+def malformed_numeric_host_candidate?(host : String) : Bool
+  return false if host.includes?(":")
+  core = host
+  while core.starts_with?("%") || core.starts_with?("/")
+    core = core[1, core.bytesize - 1]
+  end
+  cut = [core.byte_index("%"), core.byte_index("/")].compact
+  core = core[0, cut.min] unless cut.empty?
+  malformed = core != host || core.split('.').any?(&.empty?)
+  malformed && legacy_ipv4_shape?(core) && ip_literal(host).nil?
+end
+
+# 1 to 4 dot-separated (empty parts ignored) decimal or 0x-hex numbers.
+def legacy_ipv4_shape?(text : String) : Bool
+  parts = text.split('.').reject(&.empty?)
+  return false unless parts.size >= 1 && parts.size <= 4
+  parts.all? do |part|
+    if part.starts_with?("0x") || part.starts_with?("0X")
+      hex = part[2, part.bytesize - 2]
+      !hex.empty? && bytes_of(hex).all? { |b| (b >= 48 && b <= 57) || (b >= 65 && b <= 70) || (b >= 97 && b <= 102) }
+    else
+      bytes_of(part).all? { |b| b >= 48 && b <= 57 }
+    end
+  end
+end
+
+# `IPAddr.new(text)` for one address: dotted-quad IPv4 without leading
+# zeros, or IPv6 with optional brackets.
+def ip_literal(text : String) : IpAddr?
+  return nil if text.includes?("/")
+  if text.starts_with?("[") || text.includes?(":")
+    ip = parse_ipaddr(text)
+    return ip && ip.v6 ? ip : nil
+  end
+  octets = text.split('.')
+  return nil unless octets.size == 4 && octets.all? { |o| !o.empty? && bytes_of(o).all? { |b| b >= 48 && b <= 57 } && (o.bytesize == 1 || !o.starts_with?("0")) }
+  parse_ipaddr(text)
+end
+
+# glibc's `getaddrinfo(..., AI_NUMERICHOST)`: `inet_pton` for IPv6,
+# `inet_aton`'s forms for IPv4 (1-4 parts, decimal, octal or hex, the last
+# filling the remaining bytes).
+def numeric_address(host : String) : IpAddr?
+  if host.includes?(":")
+    return nil if host.starts_with?("[")
+    ip = parse_ipaddr(host)
+    return ip && ip.v6 ? ip : nil
+  end
+  parts = host.split('.')
+  return nil if parts.empty? || parts.size > 4
+  values = [] of UInt64
+  parts.each do |part|
+    return nil if part.empty?
+    digits, radix = if part.starts_with?("0x") || part.starts_with?("0X")
+                      {part[2, part.bytesize - 2], 16}
+                    elsif part.bytesize > 1 && part.starts_with?("0")
+                      {part[1, part.bytesize - 1], 8}
+                    else
+                      {part, 10}
+                    end
+    value = 0_u64
+    digits.each_char do |char|
+      digit = char.to_i?(radix) || return nil
+      value = value * radix.to_u64 + digit.to_u64
+      return nil if value > 0xffffffff_u64
+    end
+    values << value
+  end
+  last = values.last
+  leading = values.first(values.size - 1)
+  return nil if leading.any? { |v| v > 0xff_u64 }
+  remaining_bits = 32 - 8 * leading.size
+  return nil if remaining_bits < 32 && last >= (1_u64 << remaining_bits)
+  address = last
+  leading.each_with_index { |v, i| address |= v << (24 - 8 * i) }
+  IpAddr.new(false, 0_u64, address)
+end
+
+# The system resolver, through `getent ahosts`: each address once, in its
+# order.
+pub def system_lookup(host : String) : Array(String)?
+  result = output_within("getent", ["ahosts", host], 5000)
+  return nil unless result.is_a?(ProcessResult) && result.exit_code == 0
+  addresses = [] of String
+  result.stdout.each_line do |line|
+    address = line.split(' ').first? || next
+    addresses << address unless address.empty? || addresses.includes?(address)
+  end
+  addresses.empty? ? nil : addresses
+end
+
+# An answer from `post`/`get`: the status, the headers (names downcased)
+# and the body.
+pub class HttpAnswer
+  getter status : Int32
+  getter headers : Hash(String, String)
+  getter body : String
+
+  def initialize(@status : Int32, @headers : Hash(String, String), @body : String)
+  end
+end
+
+# What an outbound request failed with: a timeout, a refused connection,
+# a guard violation.
+pub class NetError
+  getter message : String
+  getter timed_out : Bool
+
+  def initialize(@message : String, @timed_out : Bool = false)
+  end
+end
+
+# Does outbound HTTP. The app keeps one, and tests swap in a fake.
+pub class Http
+  getter lookup : Lookup
+
+  def initialize(@lookup : Lookup = ->(host : String) { system_lookup(host) })
+  end
+
+  # The checked address *host* resolves to.
+  pub def resolve(host : String) : String | GuardError
+    guard_resolve(@lookup, host)
+  end
+
+  # A request to *url* with the host pinned to *address*, within
+  # *timeout_ms* (connect and read together). Redirects aren't followed.
+  pub def request(method : String, url : String, address : String?, headers : Array(Tuple(String, String)) = [] of Tuple(String, String), body : String? = nil, timeout_ms : Int32 = 7000, max_bytes : Int64 = 10_485_760_i64) : HttpAnswer | NetError
+    uri = split_url(url) || return NetError.new("bad URL #{url}")
+    scheme, host, port = uri
+    verb = method == "HEAD" ? ["--head"] : ["--include", "--request", method]
+    args = verb + ["--silent", "--show-error", "--globoff", "--compressed", "--max-time", (timeout_ms / 1000.0).to_s,
+            "--max-filesize", max_bytes.to_s, "--proto", "=http,https"] of String
+    if address
+      args << "--resolve" << "#{host}:#{port}:#{address.includes?(":") ? "[#{address}]" : address}"
+    end
+    headers.each { |name, value| args << "--header" << "#{name}: #{value}" }
+    body_file = nil.as(String?)
+    if body
+      path = File.tempfile("campfire-request-", ".body")
+      File.write(path, body)
+      body_file = path
+      args << "--data-binary" << "@#{path}"
+    end
+    args << url
+    result = output_within("curl", args, timeout_ms + 1000)
+    File.delete(body_file) if body_file
+    return NetError.new("timed out", true) if result.is_a?(TimedOut)
+    return NetError.new(result.message) if result.is_a?(ProcessError)
+    return NetError.new(result.stderr.strip, result.exit_code == 28) unless result.exit_code == 0
+    parse_answer(result.stdout)
+  end
+end
+
+# The scheme, the host (without brackets) and the port of *url*.
+pub def split_url(url : String) : Tuple(String, String, Int32)?
+  scheme, sep, rest = url.partition("://")
+  return nil if sep.empty?
+  scheme = scheme.downcase
+  return nil unless scheme == "http" || scheme == "https"
+  authority = rest
+  ["/", "?", "#"].each do |stop|
+    if at = authority.byte_index(stop)
+      authority = authority[0, at]
+    end
+  end
+  authority = authority.partition('@')[2] if authority.includes?("@")
+  host = authority
+  port = scheme == "https" ? 443 : 80
+  if authority.starts_with?("[")
+    close = authority.byte_index("]") || return nil
+    host = authority[1, close - 1]
+    after = authority[close + 1, authority.bytesize - close - 1]
+    if after.starts_with?(":")
+      port = after[1, after.bytesize - 1].to_i? || return nil
+    end
+  elsif authority.includes?(":")
+    name, _, port_text = authority.partition(':')
+    host = name
+    port = port_text.to_i? || return nil
+  end
+  return nil if host.empty?
+  {scheme, host, port}
+end
+
+# curl's `--include` output: the last response's head (interim ones and
+# proxies' come first), then the body.
+def parse_answer(output : String) : HttpAnswer | NetError
+  rest = output
+  loop do
+    ends = rest.byte_index("\r\n\r\n") || return NetError.new("no response head")
+    head = rest[0, ends]
+    body = rest[ends + 4, rest.bytesize - ends - 4]
+    lines = head.split("\r\n")
+    code = (lines.first? || "").split(' ')[1]? || return NetError.new("bad status line")
+    status = code.to_i? || return NetError.new("bad status line")
+    if status >= 100 && status < 200 && body.starts_with?("HTTP/")
+      rest = body
+      next
+    end
+    headers = {} of String => String
+    lines.skip(1).each do |line|
+      name, colon, value = line.partition(':')
+      headers[name.strip.downcase] = value.strip unless colon.empty?
+    end
+    return HttpAnswer.new(status, headers, body)
+  end
+end

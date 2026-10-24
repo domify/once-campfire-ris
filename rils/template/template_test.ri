@@ -1,0 +1,104 @@
+# The template engine: escaping by default, `<%==` and helpers' `Html` as
+# the ways out, blocks, includes, regions, Askama's whitespace rules and
+# recorded fragments.
+module rils/template/template_test
+
+import std/text
+import views/helpers/cache::{cache_fragment}
+import rils/template/html::{Html, raw, text}
+import rils/template/recorded::{Fragment, RecordedPage}
+import rils/template/template::{Template, Buffer}
+import test/views/testing::{assert_same}
+import web/web/spec::*
+
+def bold(s : String) : Html
+  raw("<b>") + text(s) + raw("</b>")
+end
+
+def wrap(tag : String, & : -> Html) : Html
+  raw("<#{tag}>") + yield + raw("</#{tag}>")
+end
+
+class Page
+  getter title : String
+  getter klass : String
+  getter name : String
+  getter items : Array(String)
+  getter fragment : Fragment
+
+  def initialize(@title : String, @klass : String, @name : String, @items : Array(String), @fragment : Fragment)
+  end
+
+  Template.def_render("engine/page.html.erb")
+end
+
+class CachedPage
+  getter calls : Int32
+  getter fragments : Hash(String, Fragment)
+
+  def initialize
+    @calls = 0
+    @fragments = {} of String => Fragment
+  end
+
+  def cache(key : String, & : -> Html) : Fragment
+    cache_fragment(@fragments, key) do
+      @calls += 1
+      yield
+    end
+  end
+
+  Template.def_render("engine/cache.html.erb")
+end
+
+describe "templates" do
+  it "escape by default, print Html as is, and follow Askama's whitespace" do
+    big = Fragment.new("<i>" + "x" * 1100 + "</i>")
+    page = Page.new("T<", "a\"b", "<script>", ["1", "<2>"], big)
+    expected = "<p class=\"a&quot;b\">&lt;script&gt; & <b>raw</b> <b>x&lt;y</b></p>\n" +
+               "  <li>1</li>\n  <li>&lt;2&gt;</li>\n" +
+               "many\n<div><i>&lt;script&gt;</i></div>\n" +
+               "<span>\#{not} \"q\" \\ %> <%= literal %> &lt;script&gt;</span>\n\n" +
+               big.html + "|[" + big.html + "]"
+    tape do
+      buffer = Buffer.new
+      page.render_into(buffer)
+      assert_same("page", expected, buffer.to_html.to_s)
+      assert buffer.region("head").to_s == "<title>T&lt;</title>"
+    end
+    assert page.render.to_s == expected
+  end
+
+  it "record the fragments it prints, but not inside a captured block" do
+    big = Fragment.new("<i>" + "x" * 1100 + "</i>")
+    page = nil.as(RecordedPage?)
+    tape do
+      buffer = Buffer.new
+      Page.new("", "", "", [] of String, big).render_into(buffer)
+      page = buffer.to_page
+    end
+    page = page || raise("no page")
+    assert page.fragments.size == 1
+    assert page.fragments[0][1].object_id == big.object_id
+    assert page.text.ends_with?("|[" + big.html + "]")
+  end
+  it "cache ERB captures once and record the same fragment on misses and hits" do
+    view = CachedPage.new
+    expected = "<div>" + "x" * 1100 + "</div>"
+    2.times do
+      tape do
+        buffer = Buffer.new
+        view.render_into(buffer)
+        page = buffer.to_page
+        assert page.to_s == expected
+        assert page.text.empty?
+        assert page.fragments.size == 1
+        assert page.fragments[0][1].object_id == view.fragments["key"].object_id
+      end
+    end
+    assert view.calls == 1
+    assert view.render.to_s == expected
+    assert view.calls == 1
+  end
+
+end

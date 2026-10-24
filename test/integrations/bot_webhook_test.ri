@@ -1,0 +1,52 @@
+# A webhook's answer as the reference made a reply of it (the Rust port's
+# `webhook_cases.json`, recorded from `Webhook#deliver`).
+module test/integrations/bot_webhook_test
+
+import std/text
+import std/file::{File}
+import std/json::{JSON, Any}
+import rils/rails_compat/encoding::{strict_decode, strict_encode}
+import integrations/bot_webhook::{webhook_reply, net_http_content_type, WebhookReply, WebhookError}
+import web/web/spec::*
+
+VECTORS = "#{__DIR__}/../../vectors/webhook"
+
+describe "webhook replies" do
+  it "are what the reference made of each answer" do
+    cases = JSON.parse(File.read("#{VECTORS}/webhook_cases.json")).as_a
+    expected = JSON.parse(File.read("#{VECTORS}/webhook_expected.json")).as_a
+    failures = [] of String
+    cases.each_with_index do |c, i|
+      wanted = expected[i]
+      name = c["name"].as_s
+      # Timeouts and refused connections are the transport's, gzip curl's.
+      next if ["slow", "refused", "gzip"].includes?(name)
+      headers = {} of String => String
+      c["headers"].as_a.each { |pair| headers[pair[0].as_s.downcase] = pair[1].as_s }
+      body = (b64 = c.as_h["body_b64"]?) ? (strict_decode(b64.as_s) || "") : (c.as_h["body"]? || Any.new("")).as_s
+      reply = webhook_reply(c["status"].as_i64.to_i32, net_http_content_type(headers), body)
+      got = if reply.is_a?(WebhookError)
+              "error"
+            elsif reply.none?
+              "none"
+            elsif text = reply.text
+              "text #{strict_encode(text)}"
+            else
+              "attachment #{reply.filename} #{reply.content_type} #{strict_encode(reply.data || "")}"
+            end
+      w = wanted["reply"]
+      want = if wanted.as_h["error"]?
+               "error"
+             elsif w.raw.nil?
+               "none"
+             elsif t = w.as_h["text_b64"]?
+               "text #{t.as_s}"
+             else
+               a = w["attachment"]
+               "attachment #{a["filename"].as_s} #{a["content_type"].as_s} #{a["body_b64"].as_s}"
+             end
+      failures << "#{name}: expected #{want}, got #{got}" unless got == want
+    end
+    raise failures.join("\n") unless failures.empty?
+  end
+end

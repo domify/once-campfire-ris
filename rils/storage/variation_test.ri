@@ -1,0 +1,14 @@
+module rils/storage/variation_test
+
+import rils/storage/variation::*
+import rils/storage/marshal::*
+import rils/rails_compat/crypto::{hex}
+import web/web/spec::*
+
+describe "variation" do
+  it "marshals and digests" do
+    v = Variation.new([{"format", Value.sym("webp")}, {"resize_to_limit", Value.list([Value.int(512_i64), Value.int(512_i64)])}] of Tuple(String, Value))
+    assert hex(v.marshal) == "04087b073a0b666f726d61743a09776562703a14726573697a655f746f5f6c696d69745b076902000269020002"
+    assert v.digest == "6gwfjNKv9eUy9jNUtEZvQFLU0hQ="
+  end
+end

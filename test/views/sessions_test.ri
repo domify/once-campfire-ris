@@ -1,0 +1,55 @@
+# `sessions/new` in the application layout, byte for byte as the reference
+# app rendered it (vectors/views).
+module test/views/sessions_test
+
+import std/text
+import views/sessions::{New, HelpContact, IncompatibleBrowser, TransferShow}
+import test/views/golden::{golden_case, golden_context, golden_page}
+import test/views/testing::{assert_same}
+import web/web/spec::*
+
+def help_contact(name : String) : HelpContact
+  contact = golden_case(name)["help_contact"]
+  HelpContact.new(contact["name"].as_s, contact["email_address"].as_s)
+end
+
+describe "sessions/new" do
+  it "renders in the layout as the reference does" do
+    [
+      {"sessions_new", nil, nil},
+      {"sessions_new_email", "x@y.com", nil},
+      {"sessions_new_rejected", "david@37signals.com", "Too many requests or unauthorized."},
+      {"sessions_new_with_logo", nil, nil},
+    ].each do |(name, email, alert)|
+      page = New.new(golden_context(name, alert), email, help_contact(name)).page
+      assert_same(name, golden_page(name), page.to_s)
+    end
+  end
+end
+
+describe "sessions/incompatible_browser" do
+  it "renders in the layout as the reference does" do
+    ["incompatible_browser", "incompatible_browser_apple_messages"].each do |name|
+      page = IncompatibleBrowser.new(golden_context(name)).page
+      assert_same(name, golden_page(name), page.to_s)
+    end
+  end
+end
+
+describe "sessions/transfers/show" do
+  it "renders in the layout as the reference does" do
+    name = "sessions_transfer"
+    action = golden_case(name)["path"].as_s
+    html = TransferShow.new(golden_context(name), action).page.to_s
+    # The complete form: its start up to its `</form>`.
+    start = html.byte_index("data-controller=\"auto-submit\"") || raise "no auto-submit form"
+    close = html.byte_index("</form>", start) || raise "unclosed form"
+    form = html[start, close - start]
+    assert form.includes?("name=\"_method\" value=\"put\"")
+    assert html.byte_index("data-controller=\"auto-submit\"", start + 1).nil?
+    # The pinned reference omits this `</form>`, so the golden has none: drop
+    # the one closing the form above before comparing with it.
+    rest = close + "</form>".bytesize
+    assert_same(name, golden_page(name), html[0, close] + html[rest, html.bytesize - rest])
+  end
+end

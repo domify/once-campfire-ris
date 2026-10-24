@@ -1,0 +1,81 @@
+# Why a storage operation answered no, named after the Active Storage
+# exception Rails would raise. Unexpected disk failures panic instead, as an
+# `Errno` would end the request in Rails (and as `db/sqlite` does for a
+# failed statement).
+module rils/storage/errors
+
+pub enum StorageErrorKind
+  # `ActiveStorage::FileNotFoundError`.
+  FileNotFound
+  # `ActiveStorage::IntegrityError`: the checksum didn't match.
+  Integrity
+  # `ActiveSupport::MessageVerifier::InvalidSignature`.
+  InvalidSignature
+  # `ArgumentError` from a transformation image_processing can't apply.
+  InvalidVariation
+  # `ActiveStorage::InvariableError`.
+  Invariable
+  # `ActiveStorage::UnpreviewableError`.
+  Unpreviewable
+  # `ActiveStorage::UnrepresentableError`.
+  Unrepresentable
+  # `Vips::Error`.
+  Vips
+  # `ActiveStorage::PreviewError`: ffmpeg failed or took too long.
+  Preview
+  # The analyzer couldn't read what ffprobe said.
+  Analyze
+end
+
+pub struct StorageError
+  getter kind : StorageErrorKind
+  getter detail : String
+
+  def initialize(@kind : StorageErrorKind, @detail : String = "")
+  end
+
+  pub def self.file_not_found : StorageError
+    StorageError.new(StorageErrorKind::FileNotFound)
+  end
+
+  pub def self.integrity : StorageError
+    StorageError.new(StorageErrorKind::Integrity)
+  end
+
+  pub def self.invalid_signature : StorageError
+    StorageError.new(StorageErrorKind::InvalidSignature)
+  end
+
+  pub def self.invalid_variation(detail : String) : StorageError
+    StorageError.new(StorageErrorKind::InvalidVariation, detail)
+  end
+
+  pub def self.vips(detail : String) : StorageError
+    StorageError.new(StorageErrorKind::Vips, detail)
+  end
+
+  pub def self.preview(detail : String) : StorageError
+    StorageError.new(StorageErrorKind::Preview, detail)
+  end
+
+  pub def self.analyze(detail : String) : StorageError
+    StorageError.new(StorageErrorKind::Analyze, detail)
+  end
+end
+
+impl Error for StorageError
+  def message : String
+    case @kind
+    when StorageErrorKind::FileNotFound     then "file not found"
+    when StorageErrorKind::Integrity        then "checksum mismatch"
+    when StorageErrorKind::InvalidSignature then "invalid signature"
+    when StorageErrorKind::InvalidVariation then "invalid variation: #{@detail}"
+    when StorageErrorKind::Invariable       then "can't transform blob with content_type=#{@detail}"
+    when StorageErrorKind::Unpreviewable    then "no previewer found for content_type=#{@detail}"
+    when StorageErrorKind::Unrepresentable  then "no previewer found and can't transform blob with content_type=#{@detail}"
+    when StorageErrorKind::Vips             then "libvips: #{@detail}"
+    when StorageErrorKind::Analyze          then "analysis failed: #{@detail}"
+    else                                         @detail
+    end
+  end
+end

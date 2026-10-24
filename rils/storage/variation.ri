@@ -1,0 +1,170 @@
+# `ActiveStorage::Variation`: an ordered transformations hash, its
+# Marshal-based digest (`active_storage_variant_records.variation_digest`)
+# and its signed URL key.
+module rils/storage/variation
+
+import std/time::{Time}
+import std/indexable
+import std/json::{Any}
+import rils/rails_compat/json::{encode}
+import rils/rails_compat/message_verifier::{MessageVerifier}
+import rils/rails_compat/metadata::{Failure}
+import rils/storage/errors::{StorageError}
+import rils/storage/marshal::{Value, Kind, dump}
+import rils/storage/key::{sha1_base64digest}
+import rils/storage/marcel::{by_extension, for_extension}
+import rils/storage/json::{json_parse}
+
+alias Entries = Array(Tuple(String, Value))
+
+pub class Variation
+  getter transformations : Entries
+
+  # Transformations in Ruby's insertion order.
+  def initialize(@transformations : Entries)
+  end
+
+  # `resize_to_limit: [width, height]` plus an optional `format:` symbol,
+  # the only shape the app's named variants and previews use.
+  pub def self.resize_to_limit(width : Int64, height : Int64, format : String? = nil) : Variation
+    entries = [{"resize_to_limit", Value.list([Value.int(width), Value.int(height)])}] of Tuple(String, Value)
+    entries << {"format", Value.sym(format)} if format
+    Variation.new(entries)
+  end
+
+  # `preview(format: :webp)` and friends.
+  pub def self.format_only(format : String) : Variation
+    Variation.new([{"format", Value.sym(format)}] of Tuple(String, Value))
+  end
+
+  pub def get(name : String) : Value?
+    @transformations.each { |entry| return entry[1] if entry[0] == name }
+    nil
+  end
+
+  pub def empty? : Bool
+    @transformations.empty?
+  end
+
+  pub def ==(other : Variation) : Bool
+    Value.map(@transformations) == Value.map(other.transformations)
+  end
+
+  pub def inspect : String
+    Value.map(@transformations).inspect
+  end
+
+  # `default_to(defaults)`: `defaults.merge(transformations)`, so default
+  # keys come first and keep their place when overridden.
+  pub def default_to(defaults : Entries) : Variation
+    merged = defaults.dup
+    @transformations.each do |entry|
+      if i = merged.index { |m| m[0] == entry[0] }
+        merged[i] = entry
+      else
+        merged << entry
+      end
+    end
+    Variation.new(merged)
+  end
+
+  pub def marshal : String
+    dump(Value.map(@transformations))
+  end
+
+  # `OpenSSL::Digest::SHA1.base64digest Marshal.dump(transformations)`.
+  pub def digest : String
+    sha1_base64digest(marshal)
+  end
+
+  # `transformations.fetch(:format, :png)`, checked against Marcel's
+  # extension table.
+  pub def format : String | StorageError
+    value = get("format")
+    format = "png"
+    if value
+      unless value.kind == Kind::Symbol || value.kind == Kind::Str
+        return StorageError.invalid_variation("invalid format #{value.inspect}")
+      end
+      format = value.text
+    end
+    return StorageError.invalid_variation("invalid variant format (#{format.inspect})") unless by_extension(format)
+    format
+  end
+
+  # `Marcel::MimeType.for(extension: format)`.
+  pub def content_type : String | StorageError
+    format = self.format
+    format.is_a?(StorageError) ? format : for_extension(format)
+  end
+
+  # The transformations as JSON, as the verifier serializes them (symbols
+  # become strings).
+  pub def to_json : Any
+    value_to_json(Value.map(@transformations))
+  end
+
+  # `Variation#key`: `ActiveStorage.verifier.generate(transformations,
+  # purpose: :variation)`.
+  pub def key(verifier : MessageVerifier) : String
+    verifier.generate_raw(encode(to_json), "variation")
+  end
+
+  # `Variation.decode`: symbolized keys, but values stay strings.
+  pub def self.from_json(json : Any) : Variation | StorageError
+    value = json_to_value(json)
+    return value if value.is_a?(StorageError)
+    return StorageError.invalid_variation("transformations must be a hash") unless value.kind == Kind::Map
+    Variation.new(value.entries)
+  end
+
+  pub def self.decode(verifier : MessageVerifier, key : String, now : Time) : Variation | StorageError
+    data = verifier.verify_raw(key, "variation", now)
+    return StorageError.invalid_signature if data.is_a?(Failure)
+    json = json_parse(data)
+    return StorageError.invalid_signature unless json
+    from_json(json)
+  end
+end
+
+def value_to_json(value : Value) : Any
+  case value.kind
+  when Kind::Nil  then Any.new(nil)
+  when Kind::Bool then Any.new(value.flag)
+  when Kind::Int  then Any.new(value.int)
+  when Kind::Symbol, Kind::Str then Any.new(value.text)
+  when Kind::List then Any.new(value.items.map { |item| value_to_json(item) })
+  else
+    entries = {} of String => Any
+    value.entries.each { |entry| entries[entry[0]] = value_to_json(entry[1]) }
+    Any.new(entries)
+  end
+end
+
+def json_to_value(json : Any) : Value | StorageError
+  raw = json.raw
+  case raw
+  when Nil    then Value.none
+  when Bool   then Value.bool(raw)
+  when Int64  then Value.int(raw)
+  when String then Value.str(raw)
+  when Array(Any)
+    items = [] of Value
+    raw.each do |item|
+      value = json_to_value(item)
+      return value if value.is_a?(StorageError)
+      items << value
+    end
+    Value.list(items)
+  when Hash(String, Any)
+    entries = [] of Tuple(String, Value)
+    raw.each do |k, item|
+      value = json_to_value(item)
+      return value if value.is_a?(StorageError)
+      entries << {k, value}
+    end
+    Value.map(entries)
+  else
+    StorageError.invalid_variation("float transformation arguments are unsupported")
+  end
+end

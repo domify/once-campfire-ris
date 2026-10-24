@@ -1,0 +1,393 @@
+# `ActionView::Helpers::TagHelper`: attribute rendering (`tag_options`) and
+# element builders.
+#
+# `Attrs` keeps insertion order, since Rails renders attributes in hash
+# order. Build one with `attrs` and chain setters, mirroring the Ruby
+# options hash: `attrs.class("btn").data("turbo_frame", "_top")` is
+# `class: "btn", data: { turbo_frame: "_top" }`. A helper that adds to the
+# options it was given works on a `dup`, never on the caller's.
+module views/helpers/tag
+
+import rils/template/html::{Html, escape}
+import rils/ruby/erb::{write_html_escaped}
+import std/text
+
+# `TagHelper::BOOLEAN_ATTRIBUTES`: rendered as `name="name"` when true,
+# omitted when false.
+BOOLEAN_ATTRIBUTES = [
+  "allowfullscreen", "allowpaymentrequest", "async", "autofocus", "autoplay", "checked", "compact", "controls", "declare", "default",
+  "defaultchecked", "defaultmuted", "defaultselected", "defer", "disabled", "enabled", "formnovalidate", "hidden", "indeterminate",
+  "inert", "ismap", "itemscope", "loop", "multiple", "muted", "nohref", "nomodule", "noresize", "noshade", "novalidate", "nowrap",
+  "open", "pauseonexit", "playsinline", "readonly", "required", "reversed", "scoped", "seamless", "selected", "sortable", "truespeed",
+  "typemustmatch", "visible",
+]
+
+# HTML void elements, which the `tag.*` builder renders without a closing tag.
+VOID_ELEMENTS = ["area", "base", "br", "col", "embed", "hr", "img", "input", "keygen", "link", "meta", "source", "track", "wbr"]
+
+# An option's value: plain text (escaped on output), `Html` (only `"` is
+# replaced on output), a flag, or nil (kept in place, never rendered).
+pub alias AttrValue = String | Html | Bool | Nil
+
+# An ordered options hash. A nil value is kept so that later assignments
+# stay in place (Ruby's `options["value"] = nil` keeps the key's position)
+# but is never rendered.
+pub class Attrs
+  getter entries : Array(Tuple(String, AttrValue))
+
+  def initialize
+    @entries = [] of Tuple(String, AttrValue)
+  end
+
+  def initialize(@entries : Array(Tuple(String, AttrValue)))
+  end
+
+  def dup : Attrs
+    Attrs.new(@entries.dup)
+  end
+
+  # Sets *name*, replacing an earlier value in place (Ruby hash assignment).
+  def attr(name : String, value : AttrValue) : Attrs
+    set(name, value)
+    self
+  end
+
+  def attr(name : String, value : Int64) : Attrs
+    set(name, value.to_s)
+    self
+  end
+
+  def attr(name : String, value : Int32) : Attrs
+    set(name, value.to_s)
+    self
+  end
+
+  def data(key : String, value : AttrValue) : Attrs
+    attr(prefixed("data-", key), value)
+  end
+
+  def data(key : String, value : Int64) : Attrs
+    attr(prefixed("data-", key), value.to_s)
+  end
+
+  def aria(key : String, value : AttrValue) : Attrs
+    attr(prefixed("aria-", key), value)
+  end
+
+  # `aria: { hidden: "true" }`, the most common option in Campfire's views.
+  def aria_hidden : Attrs
+    aria("hidden", "true")
+  end
+
+  def class(value : AttrValue) : Attrs
+    attr("class", value)
+  end
+
+  def id(value : AttrValue) : Attrs
+    attr("id", value)
+  end
+
+  def style(value : AttrValue) : Attrs
+    attr("style", value)
+  end
+
+  def title(value : AttrValue) : Attrs
+    attr("title", value)
+  end
+
+  def alt(value : AttrValue) : Attrs
+    attr("alt", value)
+  end
+
+  def role(value : AttrValue) : Attrs
+    attr("role", value)
+  end
+
+  def name(value : AttrValue) : Attrs
+    attr("name", value)
+  end
+
+  def type(value : AttrValue) : Attrs
+    attr("type", value)
+  end
+
+  def value(value : AttrValue) : Attrs
+    attr("value", value)
+  end
+
+  def target(value : AttrValue) : Attrs
+    attr("target", value)
+  end
+
+  def placeholder(value : AttrValue) : Attrs
+    attr("placeholder", value)
+  end
+
+  def autocomplete(value : AttrValue) : Attrs
+    attr("autocomplete", value)
+  end
+
+  def accept(value : AttrValue) : Attrs
+    attr("accept", value)
+  end
+
+  def loading(value : AttrValue) : Attrs
+    attr("loading", value)
+  end
+
+  def tabindex(value : Int32) : Attrs
+    attr("tabindex", value)
+  end
+
+  def maxlength(value : Int32) : Attrs
+    attr("maxlength", value)
+  end
+
+  def rows(value : Int32) : Attrs
+    attr("rows", value)
+  end
+
+  # `image_tag`'s `size:` option, expanded into width and height.
+  def size(value : Int32) : Attrs
+    attr("size", value)
+  end
+
+  def size(value : String) : Attrs
+    attr("size", value)
+  end
+
+  def method(value : AttrValue) : Attrs
+    attr("method", value)
+  end
+
+  def hidden : Attrs
+    attr("hidden", true)
+  end
+
+  def required(value : Bool) : Attrs
+    attr("required", value)
+  end
+
+  def autofocus : Attrs
+    attr("autofocus", true)
+  end
+
+  def readonly : Attrs
+    attr("readonly", true)
+  end
+
+  def disabled(value : Bool) : Attrs
+    attr("disabled", value)
+  end
+
+  def checked(value : Bool) : Attrs
+    attr("checked", value)
+  end
+
+  def set(name : String, value : AttrValue) : Nil
+    i = 0
+    while i < @entries.size
+      if @entries[i][0] == name
+        @entries[i] = {name, value}
+        return
+      end
+      i += 1
+    end
+    @entries << {name, value}
+  end
+
+  # `options[name] ||= value`: sets only when absent or nil.
+  def set_default(name : String, value : AttrValue) : Nil
+    set(name, value) if get(name).nil?
+  end
+
+  # `options.fetch(name) { value }`: sets only when the key is absent (a
+  # nil stays nil).
+  def fetch_or_set(name : String, value : AttrValue) : Nil
+    set(name, value) unless has?(name)
+  end
+
+  def get(name : String) : AttrValue
+    @entries.each do |(key, value)|
+      return value if key == name
+    end
+    nil
+  end
+
+  # The value as Ruby's `to_s` prints it, nil when absent or nil.
+  def get_str(name : String) : String?
+    value = get(name)
+    value.nil? ? nil : value_to_s(value)
+  end
+
+  def has?(name : String) : Bool
+    @entries.any? { |(key, _)| key == name }
+  end
+
+  def remove(name : String) : AttrValue
+    found : AttrValue = nil
+    kept = [] of Tuple(String, AttrValue)
+    @entries.each do |entry|
+      if entry[0] == name
+        found = entry[1]
+      else
+        kept << entry
+      end
+    end
+    @entries = kept
+    found
+  end
+
+  # Appends *other*'s entries, overriding in place like `Hash#merge!`.
+  def merge(other : Attrs) : Attrs
+    other.entries.each { |(name, value)| set(name, value) }
+    self
+  end
+
+  def size : Int32
+    @entries.size
+  end
+
+  def empty? : Bool
+    @entries.empty?
+  end
+
+  # `link_to(url, **attributes, data: defaults.merge(attributes.delete(:data)))`:
+  # the default data attributes go where the caller's first `data-*`
+  # attribute is (or at the end), ahead of the caller's own data attributes,
+  # which override them.
+  def with_default_data(defaults : Array(Tuple(String, AttrValue))) : Attrs
+    position = @entries.size
+    i = 0
+    while i < @entries.size
+      if @entries[i][0].starts_with?("data-")
+        position = i
+        break
+      end
+      i += 1
+    end
+    before = Attrs.new(@entries.first(position))
+    data = Attrs.new(defaults.dup)
+    after = Attrs.new
+    i = position
+    while i < @entries.size
+      key, value = @entries[i]
+      if key.starts_with?("data-")
+        data.set(key, value)
+      else
+        after.set(key, value)
+      end
+      i += 1
+    end
+    data.entries.each { |(key, value)| before.set(key, value) }
+    after.entries.each { |(key, value)| before.set(key, value) }
+    before
+  end
+
+  # `tag_options`: the attributes, each with a leading space.
+  def render_into(io : String::Builder) : Nil
+    @entries.each do |(name, value)|
+      render_attr(io, name, value)
+    end
+  end
+
+  def to_s : String
+    String.build { |io| render_into(io) }
+  end
+end
+
+pub def attrs : Attrs
+  Attrs.new
+end
+
+# The value as Ruby's `to_s` prints it.
+pub def value_to_s(value : AttrValue) : String
+  case value
+  when String then value
+  when Html   then value.to_s
+  when Bool   then value ? "true" : "false"
+  else             ""
+  end
+end
+
+# One attribute of `tag_options`, with Rails' value rules.
+def render_attr(io : String::Builder, name : String, value : AttrValue) : Nil
+  case value
+  when Bool
+    if BOOLEAN_ATTRIBUTES.includes?(name)
+      io << " " << name << "=\"" << name << "\"" if value
+    else
+      io << " " << name << "=\"" << (value ? "true" : "false") << "\""
+    end
+  when String
+    io << " " << name << "=\""
+    write_html_escaped(io, value)
+    io << "\""
+  when Html
+    io << " " << name << "=\"" << value.to_s.gsub("\"", "&quot;") << "\""
+  end
+end
+
+# `String#dasherize`.
+pub def dasherize(key : String) : String
+  key.gsub('_', '-')
+end
+
+# *prefix* and the dasherized key: `data: { turbo_frame: ... }` is
+# `data-turbo-frame`.
+def prefixed(prefix : String, key : String) : String
+  prefix + dasherize(key)
+end
+
+# `<name attributes` (the tag left open).
+def open_tag(io : String::Builder, name : String, options : Attrs) : Nil
+  io << "<" << name
+  options.render_into(io)
+end
+
+# `content_tag`'s opening tag. A textarea's content starts on a new line.
+def open_content_tag(io : String::Builder, name : String, options : Attrs) : Nil
+  open_tag(io, name, options)
+  io << ">"
+  io << "\n" if name == "textarea"
+end
+
+# `content_tag(name, content, options)` with already-safe content.
+pub def content_tag(name : String, options : Attrs, content : Html) : Html
+  Html.new(String.build do |io|
+    open_content_tag(io, name, options)
+    io << content.to_s
+    io << "</" << name << ">"
+  end)
+end
+
+# `content_tag(name, options) do ... end`.
+pub def content_tag(name : String, options : Attrs, & : -> Html) : Html
+  content_tag(name, options, yield)
+end
+
+# `content_tag` with plain-text content, escaped.
+pub def content_tag_text(name : String, options : Attrs, content : String) : Html
+  content_tag(name, options, Html.new(escape(content)))
+end
+
+# `tag.name(**options)` from the tag builder: void elements have no closing
+# tag and no slash, others render empty. Underscores in the name become
+# dashes (`tag.turbo_frame`).
+pub def builder_tag(name : String, options : Attrs) : Html
+  name = dasherize(name)
+  Html.new(String.build do |io|
+    open_tag(io, name, options)
+    io << ">"
+    io << "</" << name << ">" unless VOID_ELEMENTS.includes?(name)
+  end)
+end
+
+# Legacy `tag(:name, options)`, used by `image_tag` and form fields: always
+# self-closing with `" />"`.
+pub def legacy_tag(name : String, options : Attrs) : Html
+  Html.new(String.build do |io|
+    open_tag(io, name, options)
+    io << " />"
+  end)
+end

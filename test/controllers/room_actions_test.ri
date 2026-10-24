@@ -1,0 +1,239 @@
+# `test/controllers/rooms/*_controller_test.rb` and `RoomsController`'s
+# destroy tests, through the drawn routes.
+module test/controllers/room_actions_test
+
+import std/text
+import test/models/testing::{id}
+import rils/record/sqlite::{SqlValue}
+import models/account::{Account}
+import models/message::{Message, NewMessage}
+import models/room::{Room, Membership}
+import models/user::{User}
+import channels/broadcasts::{user_gid_param}
+import test/testing::*
+import web/web/spec::*
+
+def room(client : Client, label : String) : Room
+  client.t.read { |conn| Room.find_by_id(conn, id(label)) } || raise "no #{label}"
+end
+
+def room_count(client : Client) : Int64
+  client.t.read { |conn| Room.all(conn).size.to_i64 }
+end
+
+def last_room(client : Client) : Room
+  client.t.read { |conn| Room.all(conn).max_by(&.id) }
+end
+
+def members(client : Client, room : Room) : Array(Int64)
+  client.t.read { |conn| room.user_ids(conn) }.sorted
+end
+
+def user_count(client : Client) : Int64
+  client.t.read { |conn| User.count(conn) }
+end
+
+def rooms_stream(label : String) : String
+  "#{user_gid_param(id(label))}:rooms"
+end
+
+def sent(client : Client, stream : String) : Int32
+  client.broadcasts.count { |s, _| s == stream }
+end
+
+def restrict_room_creation(client : Client) : Nil
+  client.t.write do |tx|
+    account = Account.first(tx.conn) || raise "no account"
+    account.update(tx, settings: [{"restrict_room_creation_to_administrators", "true"}])
+  end
+end
+
+DAVID = "david@37signals.com"
+JZ    = "jz@37signals.com"
+KEVIN = "kevin@37signals.com"
+
+describe "rooms/opens" do
+  it "shows the room page and the new form" do
+    client = Client.new
+    cookie = client.cookie(DAVID)
+    pets = room(client, "pets")
+    response = client.get("/rooms/opens/#{pets.id}", cookie: cookie)
+    assert response["location"] == "http://once.campfire.test/rooms/#{pets.id}"
+    assert client.get("/rooms/opens/new", cookie: cookie).status == 200
+    assert client.get("/rooms/opens/#{pets.id}/edit", cookie: cookie).status == 200
+  end
+
+  it "creates a room everyone is in, and tells everyone" do
+    client = Client.new
+    response = client.submit("POST", "/rooms/opens", "room[name]=My+New+Room", client.cookie(DAVID))
+    created = last_room(client)
+    assert response["location"] == "http://once.campfire.test/rooms/#{created.id}"
+    assert members(client, created).size == user_count(client)
+    assert sent(client, "rooms") == 1
+  end
+
+  it "forbids a non-admin when the account restricts room creation" do
+    client = Client.new
+    restrict_room_creation(client)
+    assert client.submit("POST", "/rooms/opens", "room[name]=My+New+Room", client.cookie(JZ)).status == 403
+  end
+
+  it "lets only admins or creators update" do
+    client = Client.new
+    hq = room(client, "hq")
+    assert client.submit("PUT", "/rooms/opens/#{hq.id}", "room[name]=New+Name", client.cookie(JZ)).status == 403
+    assert sent(client, "rooms") == 0
+    pets = room(client, "pets")
+    response = client.submit("PUT", "/rooms/opens/#{pets.id}", "room[name]=New+Name", client.cookie(DAVID))
+    assert response["location"] == "http://once.campfire.test/rooms/#{pets.id}"
+    assert room(client, "pets").name == "New Name"
+    assert sent(client, "rooms") == 1
+  end
+
+  it "opens a closed room to everyone, but never a direct one" do
+    client = Client.new
+    designers = room(client, "designers")
+    client.submit("PUT", "/rooms/opens/#{designers.id}", "room[name]=Doesn%27t+matter", client.cookie(DAVID))
+    assert members(client, designers).size == user_count(client)
+    direct = room(client, "david_and_kevin")
+    before = members(client, direct)
+    client.submit("PUT", "/rooms/opens/#{direct.id}", "room[name]=Watercooler", client.cookie(DAVID))
+    assert room(client, "david_and_kevin").direct?
+    assert members(client, direct) == before
+  end
+end
+
+describe "rooms/closeds" do
+  it "creates a room with the chosen members, told each" do
+    client = Client.new
+    ids = [id("david"), id("kevin"), id("jason")]
+    form = "room[name]=My+New+Room&" + ids.map { |i| "user_ids[]=#{i}" }.join("&")
+    response = client.submit("POST", "/rooms/closeds", form, client.cookie(DAVID))
+    created = last_room(client)
+    assert response["location"] == "http://once.campfire.test/rooms/#{created.id}"
+    assert members(client, created) == ids.sorted
+    ["david", "kevin", "jason"].each { |label| assert sent(client, rooms_stream(label)) == 1 }
+  end
+
+  it "revises the members on update" do
+    client = Client.new
+    designers = room(client, "designers")
+    keep = members(client, designers).reject { |i| i == id("jason") }
+    form = "room[name]=New+Name&" + keep.map { |i| "user_ids[]=#{i}" }.join("&")
+    response = client.submit("PUT", "/rooms/closeds/#{designers.id}", form, client.cookie(DAVID))
+    assert response["location"] == "http://once.campfire.test/rooms/#{designers.id}"
+    assert members(client, designers) == keep
+    assert room(client, "designers").name == "New Name"
+  end
+
+  it "closes an open room to the chosen members" do
+    client = Client.new
+    pets = room(client, "pets")
+    client.submit("PUT", "/rooms/closeds/#{pets.id}", "room[name]=x&user_ids[]=#{id("david")}&user_ids[]=#{id("jason")}", client.cookie(DAVID))
+    assert members(client, pets) == [id("david"), id("jason")].sorted
+  end
+
+  it "can't reach a direct room" do
+    client = Client.new
+    direct = room(client, "bender_and_kevin")
+    before = members(client, direct)
+    client.submit("PUT", "/rooms/closeds/#{direct.id}", "room[name]=Watercooler&user_ids[]=#{id("kevin")}&user_ids[]=#{id("jz")}", client.cookie(KEVIN))
+    assert room(client, "bender_and_kevin").direct?
+    assert members(client, direct) == before
+  end
+end
+
+describe "rooms/directs" do
+  it "creates a direct room once per set of users" do
+    client = Client.new
+    before = room_count(client)
+    cookie = client.cookie(DAVID)
+    response = client.submit("POST", "/rooms/directs", "user_ids[]=#{id("jz")}", cookie)
+    created = last_room(client)
+    assert response["location"] == "http://once.campfire.test/rooms/#{created.id}"
+    assert members(client, created) == [id("david"), id("jz")].sorted
+    client.submit("POST", "/rooms/directs", "user_ids[]=#{id("jz")}", cookie)
+    assert room_count(client) == before + 1
+  end
+
+  it "lets any member destroy it, and reaches no other room" do
+    client = Client.new
+    before = room_count(client)
+    client.submit("DELETE", "/rooms/directs/#{id("designers")}", "", client.cookie(KEVIN))
+    client.submit("DELETE", "/rooms/directs/#{id("hq")}", "", client.cookie(KEVIN))
+    client.submit("DELETE", "/rooms/directs/#{id("david_and_kevin")}", "", client.cookie(JZ))
+    assert room_count(client) == before
+    response = client.submit("DELETE", "/rooms/directs/#{id("david_and_kevin")}", "", client.cookie(KEVIN))
+    assert response["location"] == "http://once.campfire.test/"
+    assert room_count(client) == before - 1
+  end
+
+  it "shows the new and edit pages" do
+    client = Client.new
+    cookie = client.cookie(DAVID)
+    assert client.get("/rooms/directs/new", cookie: cookie).status == 200
+    assert client.get("/rooms/directs/#{id("david_and_kevin")}/edit", cookie: cookie).status == 200
+  end
+end
+
+describe "rooms#destroy" do
+  it "destroys a room for an administrator or its creator only" do
+    client = Client.new
+    before = room_count(client)
+    designers = room(client, "designers")
+    assert client.submit("DELETE", "/rooms/#{designers.id}", "", client.cookie(JZ)).status == 403
+    assert room_count(client) == before
+    client.submit("DELETE", "/rooms/#{designers.id}", "", client.cookie(DAVID))
+    assert room_count(client) == before - 1
+    assert sent(client, "rooms") == 1
+  end
+end
+
+describe "rooms/involvements" do
+  it "shows the involvement" do
+    client = Client.new
+    assert client.get("/rooms/#{id("designers")}/involvement", cookie: client.cookie(DAVID)).status == 200
+  end
+
+  it "tells the sidebar when the room goes invisible and comes back" do
+    client = Client.new
+    cookie = client.cookie(DAVID)
+    watercooler = id("watercooler")
+    response = client.submit("PUT", "/rooms/#{watercooler}/involvement", "involvement=invisible", cookie)
+    assert response["location"] == "http://once.campfire.test/rooms/#{watercooler}/involvement"
+    assert sent(client, rooms_stream("david")) == 1
+    client.submit("PUT", "/rooms/#{watercooler}/involvement", "involvement=everything", cookie)
+    assert sent(client, rooms_stream("david")) == 2
+    client.submit("PUT", "/rooms/#{watercooler}/involvement", "involvement=mentions", cookie)
+    assert sent(client, rooms_stream("david")) == 2
+    involvement = client.t.read { |conn| Membership.find_by_room_and_user(conn, watercooler, id("david")) || raise "gone" }.involvement
+    assert (involvement ? involvement.name : "") == "mentions"
+  end
+
+  it "says nothing for a direct room" do
+    client = Client.new
+    client.submit("PUT", "/rooms/#{id("david_and_jason")}/involvement", "involvement=nothing", client.cookie(DAVID))
+    assert sent(client, rooms_stream("david")) == 0
+  end
+end
+
+describe "rooms/refreshes" do
+  it "appends new messages and replaces updated ones" do
+    client = Client.new
+    hq = room(client, "hq")
+    client.t.travel(-86400)
+    old = client.t.write { |tx| Message.create(tx, NewMessage.new(hq.id, id("jason"), "old", "Old message")) }
+    client.t.travel(86400 - 60)
+    fresh = client.t.write { |tx| Message.create(tx, NewMessage.new(hq.id, id("jason"), "new", "New message")) }
+    client.t.write { |tx| old.touch(tx) }
+    client.t.travel(60)
+    since = (client.t.now.microseconds // 1000) - 600_000
+    response = client.get("/rooms/#{hq.id}/refresh.turbo_stream", "since=#{since}", cookie: client.cookie(DAVID))
+    assert response.status == 200
+    html = body(response)
+    assert html.includes?("<turbo-stream action=\"append\"")
+    assert html.includes?("id=\"message_new\"")
+    assert html.includes?("<turbo-stream action=\"replace\"")
+    assert html.includes?("id=\"message_old\"")
+  end
+end

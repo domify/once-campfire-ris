@@ -1,0 +1,47 @@
+# VAPID identification (RFC 8292) as the web-push gem's
+# `WebPush::Request#build_vapid_header` writes it: `vapid t=<ES256 JWT>,k=<public key>`,
+# the JWT carrying `aud`, `exp` (12 hours out) and `sub`.
+module integrations/vapid
+
+import std/text
+import std/json::{Any}
+import rils/rails_compat/json::{encode}
+import rils/rails_compat/encoding::{urlsafe_decode, urlsafe_encode_unpadded}
+import rils/rails_compat/ec::{public_key, es256_sign, valid_point?}
+
+# `WebPush::Notification#vapid_identification`'s subject.
+VAPID_SUBJECT = "mailto:support@37signals.com"
+# `WebPush::Request#expiration`
+VAPID_EXPIRATION_SECONDS = 12_i64 * 60 * 60
+
+# `Rails.configuration.x.vapid`: the key pair, parsed once, so that a bad
+# key turns Web Push off rather than failing each subscription.
+pub class Vapid
+  getter private_key : String
+  getter public_key : String
+  # `VAPID_PUBLIC_KEY` as given, for the layout's `vapid-public-key` meta.
+  getter encoded_public_key : String
+
+  def initialize(@private_key : String, @public_key : String, @encoded_public_key : String)
+  end
+
+  # From urlsafe Base64 (`VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`); nil, and
+  # Web Push off, when either is missing, invalid or they don't match.
+  pub def self.from(public_key : String?, private_key : String?) : Vapid?
+    return nil unless public_key && private_key
+    point = urlsafe_decode(public_key) || return nil
+    secret = urlsafe_decode(private_key) || return nil
+    return nil if secret.bytesize > 32
+    secret = "\0" * (32 - secret.bytesize) + secret
+    return nil unless valid_point?(point) && public_key(secret) == point
+    Vapid.new(secret, point, public_key)
+  end
+
+  # The `Authorization` header for a push service at *audience*.
+  pub def authorization(audience : String, now : Int64) : String
+    header = %({"typ":"JWT","alg":"ES256"})
+    claims = encode(Any.new({"aud" => Any.new(audience), "exp" => Any.new(now + VAPID_EXPIRATION_SECONDS), "sub" => Any.new(VAPID_SUBJECT)}))
+    signing_input = "#{urlsafe_encode_unpadded(header)}.#{urlsafe_encode_unpadded(claims)}"
+    "vapid t=#{signing_input}.#{urlsafe_encode_unpadded(es256_sign(@private_key, signing_input))},k=#{urlsafe_encode_unpadded(@public_key)}"
+  end
+end

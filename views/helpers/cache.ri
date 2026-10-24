@@ -1,0 +1,10 @@
+# The view's `cache key do`: capture on a miss, and return the retained
+# fragment itself so a buffer can record it without copying its bytes.
+module views/helpers/cache
+
+import rils/template/html::{Html}
+import rils/template/recorded::{Fragment}
+
+pub def cache_fragment(fragments : Hash(K, Fragment), key : K, & : -> Html) : Fragment forall K
+  fragments[key]? || (fragments[key] = Fragment.new(yield.to_s))
+end

@@ -1,0 +1,32 @@
+# Ruby's `ISSPACE`, what `String#to_i` and `#to_f` skip and `\s` matches, and
+# `String#strip`.
+module rils/ruby/text
+
+pub def space?(byte : UInt8) : Bool
+  byte == 32 || (byte >= 9 && byte <= 13)
+end
+
+# `String#strip`: NUL and ASCII whitespace off both ends (not Unicode spaces
+# like U+00A0).
+pub def strip(s : String) : String
+  bytes = s.as_tape
+  first = 0
+  last = s.bytesize
+  while first < last && (bytes[first] == 0 || space?(bytes[first]))
+    first += 1
+  end
+  while last > first && (bytes[last - 1] == 0 || space?(bytes[last - 1]))
+    last -= 1
+  end
+  s[first, last - first]
+end
+
+# The bytes after any leading `ISSPACE`.
+pub def skip_space(s : String) : String
+  bytes = s.as_tape
+  first = 0
+  while first < s.bytesize && space?(bytes[first])
+    first += 1
+  end
+  first == 0 ? s : s[first, s.bytesize - first]
+end

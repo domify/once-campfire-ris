@@ -1,0 +1,24 @@
+# The Rust port's analyzer tests, checked against `VideoAnalyzer`.
+module rils/storage/analyze_test
+
+import rils/storage/analyze::*
+import rils/storage/json::{json_parse, json_encode}
+import web/web/spec::*
+
+def encoded(probe : String) : String
+  metadata = video_metadata(json_parse(probe) || raise "unparsed")
+  raise metadata.message if metadata.is_a?(Error)
+  json_encode(metadata)
+end
+
+describe "video_metadata" do
+  it "matches the analyzer" do
+    probe = %({"streams":[{"codec_type":"video","width":320,"height":180,"display_aspect_ratio":"16:9","duration":"65.840000"}],"format":{"duration":"65.9"}})
+    assert encoded(probe) == %({"width":320.0,"height":180.0,"duration":65.84,"display_aspect_ratio":[16,9],"audio":false,"video":true})
+  end
+
+  it "swaps a rotated video's dimensions" do
+    probe = %({"streams":[{"codec_type":"video","width":1920,"height":1080,"side_data_list":[{"side_data_type":"Display Matrix","rotation":-90}]},{"codec_type":"audio"}],"format":{"duration":"3.5"}})
+    assert encoded(probe) == %({"width":1080.0,"height":1920.0,"duration":3.5,"angle":-90,"audio":true,"video":true})
+  end
+end

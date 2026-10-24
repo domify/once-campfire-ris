@@ -1,0 +1,41 @@
+# Views for `reference/app/views/searches`: searching messages.
+module views/searches
+
+import std/text
+import rils/routes/paths::{room_path, searches_path, clear_searches_path}
+import rils/ruby/uri::{cgi_escape}
+import rils/template/html::{Html}
+import rils/template/recorded::{Fragment, RecordedPage}
+import rils/template/template::{Template, Buffer}
+import views/context::{ViewContext}
+import views/layouts::{render_in_layout}
+import views/helpers/tag::*
+
+# `search_path(q: search)`: the query as `CGI.escape` writes it.
+pub def search_path(query : String) : String
+  "#{searches_path}?q=#{cgi_escape(query)}"
+end
+
+# `searches/index.html.erb`: the results for a query, if any, and the
+# user's recent searches.
+pub class Index
+  getter ctx : ViewContext
+  # The query searched for, which the nav repeats; nil before searching.
+  getter query : String?
+  # `params[:q]`, which the search field keeps.
+  getter q : String?
+  # The results, each `messages/_message`'s fragment.
+  getter messages : Array(Fragment)
+  getter recent_searches : Array(String)
+  # The room "Exit search" goes back to.
+  getter return_to_room_id : Int64
+
+  def initialize(@ctx : ViewContext, @query : String?, @q : String?, @messages : Array(Fragment), @recent_searches : Array(String), @return_to_room_id : Int64)
+  end
+
+  Template.def_page("searches/index.html.erb")
+
+  pub def page(frame : Bool = false) : RecordedPage
+    render_in_layout(@ctx, "Search", "sidebar searches", frame) { |buffer| render_into(buffer) }
+  end
+end

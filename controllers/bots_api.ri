@@ -1,0 +1,197 @@
+# The bot API under `/rooms/:room_id/:bot_key/messages` (JSON by route
+# default): `Messages::ByBotsController` and `Messages::Boosts::ByBotsController`
+# (reference/app/controllers/messages/by_bots_controller.rb,
+# messages/boosts/by_bots_controller.rb). Bodies are the raw request body
+# (`RawRequestBody`), or a top-level multipart `attachment`.
+module controllers/bots_api
+
+import std/text
+import rils/record/sqlite::{Connection}
+import models/message::{Message, create_boost}
+import models/boost::{Boost}
+import models/room::{Room}
+import models/user::{User}
+import rils/record/errors::{RecordNotFound}
+import rils/routes/paths::{message_path, room_message_path, room_bot_messages_path}
+import rils/kit/ctx::{Ctx, ActionResult}
+import rils/kit/errors::{HttpError, halt}
+import rils/kit/response::{Response}
+import rils/kit/format::{HTML, JSON_MIME}
+import rils/kit/params::{permit_keys}
+import rils/ruby/integers::{integer_cast}
+import rils/richtext/richtext::{rendered_body}
+import views/messages/json::{UserJson, MessageJson, BoostJson, by_bots_index, by_bots_show, boosts_by_bots_show}
+import config/app::{App}
+import models/action_text::{DbResolver}
+import views/helpers/user_paths::{avatar_path}
+import controllers/concerns::{Passed, Before, before_actions, head}
+import controllers/messages::{MessageParams, Assignment, find_paged_messages, set_message, create_message, update_message, destroy_message, broadcast_create, broadcast_replace, deliver_webhooks_to_bots}
+import controllers/boosts::{set_boost, destroy_boost_of, broadcast_boost_create}
+
+def bot_before : Before
+  Before.bots
+end
+
+# `String#blank?`
+def blank?(text : String) : Bool
+  text.each_char { |char| return false unless char.whitespace? }
+  true
+end
+
+# `set_room`: `Current.user.rooms.find_by(id: params[:room_id])`, else
+# `head :not_found`.
+def bot_room(app : App, c : Ctx, user : User) : Room | HttpError
+  raw = c.param_str("room_id")
+  id = raw ? integer_cast(raw) : nil
+  room = id ? app.db.read { |conn| Room.find_for_user(conn, user.id, id) } : nil
+  room || halt(head(404))
+end
+
+def user_json(app : App, c : Ctx, user : User) : UserJson
+  UserJson.new(user.id, user.name, user.role.name, c.url_for(avatar_path(app.secrets, user)))
+end
+
+# `messages/_message.json.jbuilder`.
+def message_json(app : App, c : Ctx, conn : Connection, message : Message) : MessageJson
+  creator = User.find_by_id(conn, message.creator_id) || raise "the message's creator is gone"
+  html = message.body_html(conn)
+  rendered = html ? rendered_body(html, c.request.host, DbResolver.new(conn, app.secrets, app.stack.clock)) : ""
+  MessageJson.new(message.id, message.created_at.time, message.plain_text_body(conn, app.db.env.rich_text), rendered,
+    user_json(app, c, creator), message.room_id, c.url_for(room_message_path(message.room_id, message.id)))
+end
+
+pub def bot_messages_index(app : App, c : Ctx) : ActionResult
+  passed = before_actions(app, c, bot_before)
+  return passed if passed.is_a?(HttpError)
+  room = bot_room(app, c, passed.user)
+  return room if room.is_a?(HttpError)
+  messages = find_paged_messages(app, c, room)
+  return messages if messages.is_a?(HttpError)
+  set_pagination_headers(app, c, room, messages)
+  format = c.respond_to([JSON_MIME])
+  return format if format.is_a?(HttpError)
+  body = app.db.read { |conn| by_bots_index(messages.map { |message| message_json(app, c, conn, message) }) }
+  c.render(200, JSON_MIME, body)
+end
+
+# `X-Total-Count`, and a `Link` to the next page when there is one.
+def set_pagination_headers(app : App, c : Ctx, room : Room, messages : Array(Message)) : Nil
+  after = (param = c.param("after")) && param.present?
+  count, next_page = app.db.read do |conn|
+    following = nil.as(Tuple(String, Int64)?)
+    if (first = messages.first?) && (last = messages.last?)
+      if after
+        following = {"after", last.id} if Message.exists_after?(conn, room.id, last)
+      else
+        following = {"before", first.id} if Message.exists_before?(conn, room.id, first)
+      end
+    end
+    {Message.count_in_room(conn, room.id), following}
+  end
+  c.set_header("x-total-count", count.to_s)
+  if next_page
+    key, id = next_page
+    c.set_header("link", %(<#{c.url_for("#{room_bot_messages_path(room.id, c.param_str("bot_key") || "")}?#{key}=#{id}")}>; rel="next"))
+  end
+end
+
+# `params[:attachment] ? params.permit(:attachment) : { body: raw_request_body }`
+def bot_message_params(c : Ctx) : MessageParams
+  if (attachment = c.param("attachment")) && !attachment.null?
+    MessageParams.new(nil, Assignment.from_params(c.params.permit(permit_keys(["attachment"])), "attachment"), nil)
+  else
+    MessageParams.new(c.request.raw_post, nil, nil)
+  end
+end
+
+# `create`: `MessagesController#create`, then `head :created` with the
+# message's location. `ensure_body_or_attachment_present` first.
+pub def bot_messages_create(app : App, c : Ctx) : ActionResult
+  passed = before_actions(app, c, bot_before)
+  return passed if passed.is_a?(HttpError)
+  room = bot_room(app, c, passed.user)
+  return room if room.is_a?(HttpError)
+  attachment = c.param("attachment")
+  return halt(head(422)) if (attachment.nil? || attachment.blank?) && blank?(c.request.raw_post)
+  message = create_message(app, c, room, passed.user, bot_message_params(c))
+  return message if message.is_a?(HttpError)
+  broadcast_create(app, app.view_context(c.request), room, message)
+  deliver_webhooks_to_bots(app, room, message)
+  c.head_with_location(201, c.url_for(message_path(message.id)))
+end
+
+pub def bot_messages_update(app : App, c : Ctx) : ActionResult
+  passed = before_actions(app, c, bot_before)
+  return passed if passed.is_a?(HttpError)
+  room = bot_room(app, c, passed.user)
+  return room if room.is_a?(HttpError)
+  message = set_message(app, c, room)
+  return message if message.is_a?(HttpError)
+  return halt(head(403)) unless passed.user.can_administer?(message.creator_id)
+  updated = update_message(app, c, message, bot_message_params(c))
+  return updated if updated.is_a?(HttpError)
+  broadcast_replace(app, c, room, updated)
+  format = c.respond_to([HTML, JSON_MIME])
+  return format if format.is_a?(HttpError)
+  if format == JSON_MIME
+    # `render :show`
+    c.render(200, JSON_MIME, app.db.read { |conn| by_bots_show(message_json(app, c, conn, updated)) })
+  else
+    c.redirect_to(c.url_for(room_message_path(room.id, updated.id)))
+  end
+end
+
+pub def bot_messages_destroy(app : App, c : Ctx) : ActionResult
+  passed = before_actions(app, c, bot_before)
+  return passed if passed.is_a?(HttpError)
+  room = bot_room(app, c, passed.user)
+  return room if room.is_a?(HttpError)
+  message = set_message(app, c, room)
+  return message if message.is_a?(HttpError)
+  return halt(head(403)) unless passed.user.can_administer?(message.creator_id)
+  destroy_message(app, room, message)
+  c.head(204)
+end
+
+# `Messages::Boosts::ByBotsController#set_message`: the room's message,
+# else `head :not_found`.
+def bot_boost_message(app : App, c : Ctx, user : User) : Tuple(Room, Message) | HttpError
+  room_id = (raw = c.param_str("room_id")) ? integer_cast(raw) : nil
+  message_id = (raw = c.param_str("message_id")) ? integer_cast(raw) : nil
+  found = app.db.read do |conn|
+    room = room_id ? Room.find_for_user(conn, user.id, room_id) : nil
+    message = room && message_id ? Message.find_by_id(conn, message_id) : nil
+    room && message && message.room_id == room.id ? {room, message} : nil
+  end
+  found || halt(head(404))
+end
+
+# `create`: `@message.boosts.create!(content: raw_request_body)`, then
+# `render :show, status: :created`.
+pub def bot_boosts_create(app : App, c : Ctx) : ActionResult
+  passed = before_actions(app, c, bot_before)
+  return passed if passed.is_a?(HttpError)
+  found = bot_boost_message(app, c, passed.user)
+  return found if found.is_a?(HttpError)
+  room, message = found
+  content = c.request.raw_post
+  return halt(head(422)) if blank?(content)
+  boost = app.db.write { |tx| create_boost(tx, message, passed.user.id, content) }
+  broadcast_boost_create(app, c, room, message, boost)
+  json = BoostJson.new(boost.id, boost.content, boost.created_at.time, user_json(app, c, passed.user), message.id,
+    c.url_for(room_message_path(message.room_id, message.id)))
+  c.render(201, JSON_MIME, boosts_by_bots_show(json))
+end
+
+# `destroy`: the bot's own boost, `head :not_found` otherwise.
+pub def bot_boosts_destroy(app : App, c : Ctx) : ActionResult
+  passed = before_actions(app, c, bot_before)
+  return passed if passed.is_a?(HttpError)
+  found = bot_boost_message(app, c, passed.user)
+  return found if found.is_a?(HttpError)
+  room, message = found
+  boost = set_boost(app, c, message, passed.user)
+  return halt(head(404)) if boost.is_a?(HttpError)
+  destroy_boost_of(app, room, boost)
+  c.head(204)
+end

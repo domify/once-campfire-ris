@@ -1,0 +1,55 @@
+<%# reference/app/views/first_runs/show.html.erb %>
+<% form = form_with(first_run_path).model("user").class("center max-width") %><%= form.wrap do %>
+  <section class="nametag u-relative">
+    <div class="flex justify-center align-center pad-block">
+      <%= image_tag(ctx, "lanyard.svg", attrs.class("nametag__lanyard").aria_hidden) %>
+    </div>
+
+    <div class="nametag__inner flex flex-column gap">
+      <fieldset class="flex flex-column center-block">
+        <legend class="txt-large txt-align-center"><strong><%= PAGE_TITLE %></strong></legend>
+
+        <label class="align-center center avatar__form gap" data-controller="upload-preview">
+          <div class="btn input--file">
+            <%= image_tag(ctx, "camera.svg", attrs.aria_hidden) %>
+            <%= form.file_field("avatar", attrs.class("input").accept("image/*").data("upload_preview_target", "input").data("action", "upload-preview#previewImage")) %>
+            <span class="for-screen-reader">Add your avatar</span>
+          </div>
+
+          <div class="btn avatar input--file txt-xx-large">
+            <%= image_tag(ctx, "default-avatar.svg", attrs.aria_hidden.data("upload_preview_target", "image").alt("Add your avatar")) %>
+            <span class="for-screen-reader">Avatar</span>
+          </div>
+        </label>
+      </fieldset>
+
+      <div class="flex align-center gap">
+        <%= translation_button(ctx, "user_name") %>
+        <label class="flex align-center gap flex-item-grow txt-large input input--actor">
+          <%= form.text_field("name", nil, attrs.class("input").autocomplete("name").placeholder("Name").autofocus.required(true).data("1p-ignore", true)) %>
+          <%= image_tag(ctx, "person.svg", attrs.aria_hidden.size(24).class("colorize--black")) %>
+        </label>
+      </div>
+
+      <div class="flex align-center gap">
+        <%= translation_button(ctx, "email_address") %>
+        <label class="flex align-center gap flex-item-grow txt-large input input--actor">
+          <%= form.email_field("email_address", nil, attrs.class("input").autocomplete("username").placeholder("Email address").required(true)) %>
+          <%= image_tag(ctx, "email.svg", attrs.aria_hidden.size(24).class("colorize--black")) %>
+        </label>
+      </div>
+
+      <div class="flex align-center gap">
+        <%= translation_button(ctx, "password") %>
+        <label class="flex align-center gap flex-item-grow txt-large input input--actor">
+          <%= form.password_field("password", attrs.class("input").autocomplete("new-password").placeholder("Password").required(true).maxlength(72)) %>
+          <%= image_tag(ctx, "password.svg", attrs.aria_hidden.size(24).class("colorize--black")) %>
+        </label>
+      </div>
+
+      <%= button_tag(attrs.class("btn btn--reversed center txt-large").type("submit")) do %>
+        <%= image_tag(ctx, "arrow-right.svg", attrs.aria_hidden) %>
+        <span class="for-screen-reader">Save</span>
+<% end %>    </div>
+  </section>
+<% end %>

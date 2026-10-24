@@ -1,0 +1,133 @@
+# The Rust port's cookie jar, session and flash tests.
+module rils/kit/cookies_test
+
+import std/text
+import std/json::{JSON, Any}
+import rils/rails_compat/json::{generate}
+import rils/rails_compat/clock::{Clock, parse_timestamp}
+import rils/rails_compat/key_generator::{Secrets}
+import rils/rails_compat/cookies::{escape}
+import rils/kit/cookies::*
+import rils/kit/session::*
+import rils/kit/errors::{HttpError}
+import web/web/spec::*
+
+SECRETS = Secrets.new("test-secret")
+CLOCK   = Clock.frozen_at(parse_timestamp("2024-06-01T12:00:00Z") || raise("time"))
+
+def jar(header : String) : CookieJar
+  CookieJar.from_headers([header], SECRETS, CLOCK)
+end
+
+describe "cookies" do
+  it "are parsed from the request" do
+    parsed = jar("a=1; b=x%20y+z;c=3; a=2; d")
+    assert parsed["a"] == "1"
+    assert parsed["b"] == "x y z"
+    assert parsed["c"] == "3"
+    assert parsed["d"] == ""
+    assert parsed["zz"].nil?
+  end
+
+  it "are set with Rails' defaults" do
+    cookies = jar("")
+    cookies.set("last_room", "42")
+    assert cookies.set_cookie_headers(false, "example.com") == ["last_room=42; path=/; samesite=lax"]
+  end
+
+  it "aren't rewritten unchanged unless expiring" do
+    cookies = jar("last_room=42")
+    cookies.set("last_room", "42")
+    assert cookies.set_cookie_headers(false, "h").empty?
+    cookies.set("last_room", Cookie.new("42", permanent: true))
+    assert cookies.set_cookie_headers(false, "h") == ["last_room=42; path=/; expires=Wed, 01 Jun 2044 12:00:00 GMT; samesite=lax"]
+  end
+
+  it "escape values" do
+    cookies = jar("")
+    cookies.set("x", "a b+c/=")
+    assert cookies.set_cookie_headers(false, "h") == ["x=a+b%2Bc%2F%3D; path=/; samesite=lax"]
+  end
+
+  it "round-trip signed permanent httponly values" do
+    cookies = jar("")
+    assert cookies.set_signed("session_token", Cookie.new("tok", permanent: true, httponly: true)).nil?
+    headers = cookies.set_cookie_headers(true, "h")
+    assert headers.size == 1
+    assert headers[0].starts_with?("session_token=")
+    assert headers[0].ends_with?("; path=/; expires=Wed, 01 Jun 2044 12:00:00 GMT; httponly; samesite=lax")
+    assert cookies.signed("session_token") == "tok"
+    raw = cookies["session_token"] || raise("no cookie")
+    following = CookieJar.from_headers(["session_token=#{escape(raw)}"], SECRETS, CLOCK)
+    assert following.signed("session_token") == "tok"
+  end
+
+  it "read tampered signed values as nil" do
+    cookies = jar("session_token=forged")
+    assert cookies.signed("session_token").nil?
+    assert cookies["session_token"] == "forged"
+  end
+
+  it "round-trip encrypted values" do
+    cookies = jar("")
+    assert cookies.set_encrypted("secret", JSON.parse(%({"a":1})), Cookie.new("")).nil?
+    value = cookies.encrypted("secret")
+    assert !value.nil? && generate(value) == %({"a":1})
+  end
+
+  it "overflow" do
+    cookies = jar("")
+    assert cookies.set_signed("big", Cookie.new("x" * MAX_COOKIE_SIZE)).is_a?(HttpError)
+  end
+
+  it "are deleted only when present" do
+    cookies = jar("session_token=abc")
+    cookies.delete("missing")
+    cookies.delete("session_token")
+    assert cookies.deleted?("session_token")
+    assert cookies["session_token"].nil?
+    assert cookies.set_cookie_headers(false, "h") == ["session_token=; path=/; max-age=0; expires=Thu, 01 Jan 1970 00:00:00 GMT; samesite=lax"]
+  end
+
+  it "need SSL when secure" do
+    cookies = jar("")
+    cookies.set("s", Cookie.new("1", secure: true))
+    assert cookies.set_cookie_headers(false, "example.com").empty?
+    assert cookies.set_cookie_headers(false, "x.onion").size == 1
+    assert cookies.set_cookie_headers(true, "example.com") == ["s=1; path=/; secure; samesite=lax"]
+  end
+end
+
+describe "flash" do
+  it "is discarded after one request" do
+    flash = Flash.new
+    flash["notice"] = "✓"
+    stored = flash.to_session_value || raise("nothing stored")
+    assert generate(stored) == %({"discard":[],"flashes":{"notice":"✓"}})
+    following = Flash.from_session_value(stored)
+    assert following.notice == "✓"
+    assert following.to_session_value.nil?
+  end
+
+  it "isn't persisted for now" do
+    flash = Flash.new
+    flash.now("alert", "Too many requests or unauthorized.")
+    assert flash.alert == "Too many requests or unauthorized."
+    assert flash.to_session_value.nil?
+  end
+
+  it "keeps and reads legacy discard lists" do
+    stored = JSON.parse(%({"discard": ["alert"], "flashes": {"notice": "hi", "alert": "gone"}}))
+    flash = Flash.from_session_value(stored)
+    assert flash.alert.nil?
+    flash.keep("notice")
+    kept = flash.to_session_value || raise("nothing kept")
+    assert generate(kept) == %({"discard":[],"flashes":{"notice":"hi"}})
+  end
+
+  it "has 32-character hex session ids" do
+    sid = generate_sid
+    assert sid.bytesize == 32
+    assert sid.chars.all? { |c| c.ascii_number? || (c >= 'a' && c <= 'f') }
+  end
+end

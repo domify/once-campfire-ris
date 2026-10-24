@@ -1,0 +1,287 @@
+# The Active Storage endpoints (`activestorage/config/routes.rb`) over
+# `storage/`, as the engine's controllers serve them. Downloads stay public
+# behind signed URLs; the disk `PUT` and direct uploads need a Campfire
+# session (`reference/config/initializers/active_storage_authentication.rb`).
+# The disk service's `show` gets `Cache-Control: max-age=3600, public`
+# (`reference/config/initializers/active_storage.rb`). These controllers
+# inherit from `ActiveStorage::BaseController`, not `ApplicationController`,
+# so none of Campfire's concerns run. Also `Rails::HealthController` and
+# turbo-rails' native navigation.
+module controllers/active_storage
+
+import std/text
+import std/file::{File}
+import std/json::{Any}
+import std/time::{Time, Span}
+import rils/rails_compat/json::{encode}
+import rils/rails_compat/content_disposition::{content_disposition}
+import rils/rails_compat/crypto::{random_bytes, hex}
+import models/session::{Session}
+import rils/kit/ctx::{Ctx, ActionResult, Redirect, Freshness, ExpiresIn}
+import rils/kit/errors::{HttpError, halt}
+import rils/kit/response::{Response, SendOptions, FileBody}
+import rils/kit/format::{HTML}
+import rils/ruby/integers::{integer_cast}
+import rils/ruby/rack::{byte_ranges}
+import rils/storage/blob::{Blob, NewBlob}
+import rils/storage/disk::{decode_verified_key, decode_verified_token}
+import rils/storage/file_server::{serve_file, FilePart}
+import rils/storage/content_types::{for_serving, forced_disposition}
+import rils/storage/paths::{verify_signed_blob_id, signed_blob_id}
+import rils/storage/variation::{Variation}
+import rils/storage/errors::{StorageError, StorageErrorKind}
+import rils/storage/filename::{Filename}
+import rils/storage/key::{generate_key}
+import config/app::{App}
+import controllers/concerns::{head}
+
+# `ActiveStorage.service_urls_expire_in`
+SERVICE_URLS_EXPIRE_IN = 5_i64 * 60
+# `http_cache_forever`: `expires_in 100.years`.
+HUNDRED_YEARS = 3_155_695_200_i64
+# The largest direct upload a URL is handed out for: its PUT body is read
+# into memory.
+MAX_DIRECT_UPLOAD = 100_i64 * 1024 * 1024
+
+# `ActiveStorage::Blobs::RedirectController#show`
+pub def blobs_redirect(app : App, c : Ctx) : ActionResult
+  forged = c.verify_authenticity_token
+  return forged if forged
+  blob = set_blob(app, c)
+  return blob if blob.is_a?(HttpError)
+  c.expires_in(SERVICE_URLS_EXPIRE_IN)
+  c.redirect_to(blob_url(app, c, blob, c.param_str("disposition")), Redirect.new(allow_other_host: true))
+end
+
+# `ActiveStorage::Blobs::ProxyController#show`
+pub def blobs_proxy(app : App, c : Ctx) : ActionResult
+  forged = c.verify_authenticity_token
+  return forged if forged
+  blob = set_blob(app, c)
+  return blob if blob.is_a?(HttpError)
+  if (range = c.request.header("range")) && !range.strip.empty?
+    return send_byte_ranges(app, c, blob, range)
+  end
+  if not_modified = http_cache_forever(c)
+    return not_modified
+  end
+  response = send_blob(app, c, blob, c.param_str("disposition"))
+  response.headers["accept-ranges"] = "bytes" if response.is_a?(Response)
+  response
+end
+
+# `ActiveStorage::Representations::RedirectController#show`
+pub def representations_redirect(app : App, c : Ctx) : ActionResult
+  forged = c.verify_authenticity_token
+  return forged if forged
+  blob = set_blob(app, c)
+  return blob if blob.is_a?(HttpError)
+  image = set_representation(app, c, blob)
+  return image if image.is_a?(HttpError)
+  c.expires_in(SERVICE_URLS_EXPIRE_IN)
+  c.redirect_to(blob_url(app, c, image, c.param_str("disposition")), Redirect.new(allow_other_host: true))
+end
+
+# `ActiveStorage::Representations::ProxyController#show`
+pub def representations_proxy(app : App, c : Ctx) : ActionResult
+  forged = c.verify_authenticity_token
+  return forged if forged
+  blob = set_blob(app, c)
+  return blob if blob.is_a?(HttpError)
+  image = set_representation(app, c, blob)
+  return image if image.is_a?(HttpError)
+  if not_modified = http_cache_forever(c)
+    return not_modified
+  end
+  send_blob(app, c, image, c.param_str("disposition"))
+end
+
+# `ActiveStorage::SetBlob#set_blob`: `Blob.find_signed!`. A bad signature
+# is `head :not_found`.
+def set_blob(app : App, c : Ctx) : Blob | HttpError
+  signed = c.param_str("signed_blob_id") || c.param_str("signed_id") || ""
+  id = verify_signed_blob_id(app.storage.verifier, signed, c.now) || return halt(head(404))
+  app.db.read { |conn| Blob.find(conn, id) } || HttpError.not_found
+end
+
+# `@blob.representation(params[:variation_key]).processed`: the blob that
+# represents it. A bad variation key is `head :not_found`.
+def set_representation(app : App, c : Ctx, blob : Blob) : Blob | HttpError
+  variation = Variation.decode(app.storage.verifier, c.param_str("variation_key") || "", c.now)
+  return halt(head(404)) if variation.is_a?(StorageError)
+  image = app.db.write { |tx| app.storage.process_representation(tx.conn, blob, variation, tx.now) }
+  image.is_a?(StorageError) ? HttpError.internal(image.message) : image
+end
+
+# `blob.url(disposition:)` on the disk service: a signed disk URL on this
+# request's host that expires in `service_urls_expire_in`.
+def blob_url(app : App, c : Ctx, blob : Blob, disposition : String?) : String
+  type = blob.content_type_s
+  chosen = forced_disposition(type) || disposition || "inline"
+  path = app.storage.service.url_path(app.storage.verifier, blob.key, c.now + Span.new(seconds: SERVICE_URLS_EXPIRE_IN), blob.filename, for_serving(type), chosen)
+  c.url_for(path)
+end
+
+# `http_cache_forever(public: true)`: a 304 when the client's copy is
+# fresh.
+def http_cache_forever(c : Ctx) : Response?
+  c.expires_in(HUNDRED_YEARS, ExpiresIn.new(public: true, immutable: true))
+  c.fresh_when(Freshness.new(etag: c.request.fullpath, last_modified: Time.utc(2011, 1, 1), public: true))
+end
+
+# `send_blob_stream(blob, disposition:)`
+def send_blob(app : App, c : Ctx, blob : Blob, disposition : String?) : ActionResult
+  path = app.storage.path_for(blob)
+  unless File.file?(path)
+    # `rescue ActiveStorage::FileNotFoundError`
+    c.expires_now
+    return c.head(404)
+  end
+  type = blob.content_type_s
+  sent = c.send_file(path, SendOptions.new(content_type: for_serving(type), disposition: nil))
+  sent.headers["content-disposition"] = content_disposition(forced_disposition(type) || disposition || "inline", blob.filename.sanitized) if sent.is_a?(Response)
+  sent
+end
+
+# `send_blob_byte_range_data(blob, range_header)`
+def send_byte_ranges(app : App, c : Ctx, blob : Blob, range : String) : ActionResult
+  size = blob.byte_size < 0 ? 0_i64 : blob.byte_size
+  ranges = byte_ranges(range, size)
+  return c.head(416) if ranges.nil? || ranges.empty?
+  path = app.storage.path_for(blob)
+  return HttpError.internal("file not found") unless File.file?(path)
+  type = for_serving(blob.content_type_s)
+  response = c.send_data("", SendOptions.new(content_type: type, disposition: nil, status: 206))
+  if ranges.size == 1
+    start, stop = ranges[0]
+    response.body = FileBody.new(path, start, stop - start + 1)
+    response.headers["content-range"] = "bytes #{start}-#{stop}/#{size}"
+  else
+    # `SecureRandom.hex`
+    boundary = hex(random_bytes(16))
+    data = File.read(path)
+    response.body = String.build do |io|
+      ranges.each do |start, stop|
+        io << "\r\n--#{boundary}\r\nContent-Type: #{type}\r\nContent-Range: bytes #{start}-#{stop}/#{size}\r\n\r\n"
+        io << data[start.to_i32, (stop - start + 1).to_i32]
+      end
+      io << "\r\n--#{boundary}--\r\n"
+    end
+    response.headers["content-type"] = "multipart/byteranges; boundary=#{boundary}"
+  end
+  response.headers["content-disposition"] = content_disposition(forced_disposition(blob.content_type_s) || "inline", blob.filename.sanitized)
+  response.headers["accept-ranges"] = "bytes"
+  response
+end
+
+# `ActiveStorage::DiskController#show`, plus the initializer's cache header.
+pub def disk_show(app : App, c : Ctx) : ActionResult
+  key = decode_verified_key(app.storage.verifier, c.param_str("encoded_key") || "", c.now) || return c.head(404)
+  path = app.storage.service.path_for(key.key)
+  return c.head(404) unless File.file?(path)
+  served = serve_file(c.request.method, c.request.header("range"), c.request.header("if-modified-since"), path, key.content_type, key.disposition)
+  response = Response.new(served.status)
+  served.headers.each { |name, value| response.headers[name] = value }
+  parts = served.body
+  if parts.size == 1 && (only = parts[0]).is_a?(FilePart)
+    response.body = FileBody.new(only.path, only.start, only.stop - only.start + 1)
+  elsif !parts.empty?
+    data = File.read(path)
+    response.body = String.build do |io|
+      parts.each do |part|
+        if part.is_a?(FilePart)
+          io << data[part.start.to_i32, (part.stop - part.start + 1).to_i32]
+        else
+          io << part
+        end
+      end
+    end
+  end
+  response.headers["cache-control"] = "max-age=3600, public"
+  response
+end
+
+# `require_active_storage_authentication`: 401 without a session.
+def require_session(app : App, c : Ctx) : HttpError?
+  token = c.cookies.signed("session_token")
+  found = token ? app.db.read { |conn| Session.find_by_token(conn, token) } : nil
+  found ? nil : halt(head(401))
+end
+
+# `ActiveStorage::DiskController#update`: the direct upload's PUT.
+pub def disk_update(app : App, c : Ctx) : ActionResult
+  refused = require_session(app, c)
+  return refused if refused
+  token = decode_verified_token(app.storage.verifier, c.param_str("encoded_token") || "", c.now) || return c.head(404)
+  media = (c.request.content_type || "").partition(';')[0].strip.downcase
+  length = (c.request.header("content-length") || "").strip.to_i64?
+  return c.head(422) unless (token.content_type || "").downcase == media && length == token.content_length
+  failed = app.storage.service.upload(token.key, c.request.raw_post, token.checksum)
+  failed ? (failed.kind == StorageErrorKind::Integrity ? c.head(422) : HttpError.internal(failed.message)) : c.head(204)
+end
+
+# `ActiveStorage::DirectUploadsController#create`.
+pub def direct_uploads_create(app : App, c : Ctx) : ActionResult
+  forged = c.verify_authenticity_token
+  return forged if forged
+  refused = require_session(app, c)
+  return refused if refused
+  params = c.require("blob")
+  return params if params.is_a?(HttpError)
+  blob_params = params.as_h? || return HttpError.status(400, "blob")
+  text = ->(key : String) { (param = blob_params[key]?) ? param.to_s? : nil }
+  filename = text.call("filename")
+  checksum = text.call("checksum")
+  return HttpError.status(422) unless filename && !filename.empty? && checksum && !checksum.empty?
+  # Stricter than Rails, whose cast makes a byte size that isn't a number 0.
+  byte_size = (raw = text.call("byte_size")) ? integer_cast(raw) : nil
+  return HttpError.status(422) unless byte_size
+  return HttpError.status(413) unless byte_size >= 0 && byte_size <= MAX_DIRECT_UPLOAD
+  content_type = text.call("content_type")
+  metadata = (given = blob_params["metadata"]?) && given.as_h? ? given.to_json_any : Any.new({} of String => Any)
+  new_blob = NewBlob.new(generate_key, Filename.new(filename), content_type, metadata, app.storage.service.name, byte_size, checksum)
+  blob = app.db.write { |tx| new_blob.insert(tx.conn, tx.now) }
+  url = c.url_for(app.storage.service.url_path_for_direct_upload(app.storage.verifier, blob.key, c.now + Span.new(seconds: SERVICE_URLS_EXPIRE_IN), content_type, byte_size, checksum))
+  type = content_type ? Any.new(content_type) : Any.new(nil)
+  json = Any.new({
+    "id"            => Any.new(blob.id),
+    "key"           => Any.new(blob.key),
+    "filename"      => Any.new(blob.filename.raw),
+    "content_type"  => blob.content_type ? Any.new(blob.content_type) : Any.new(nil),
+    "metadata"      => blob.metadata,
+    "service_name"  => Any.new(blob.service_name),
+    "byte_size"     => Any.new(blob.byte_size),
+    "checksum"      => blob.checksum ? Any.new(blob.checksum) : Any.new(nil),
+    "created_at"    => Any.new(db_json_time(blob.created_at)),
+    "signed_id"     => Any.new(signed_blob_id(app.storage.verifier, blob.id)),
+    "direct_upload" => Any.new({"url" => Any.new(url), "headers" => Any.new({"Content-Type" => type})}),
+  })
+  c.render_as(200, "application/json; charset=utf-8", encode(json))
+end
+
+# A stored `created_at` (`YYYY-MM-DD HH:MM:SS[.ffffff]`, UTC) as
+# `ActiveSupport::JSON` encodes times: ISO 8601 with milliseconds.
+def db_json_time(stored : String) : String
+  date, _, time = stored.partition(' ')
+  return stored if time.empty?
+  seconds, _, fraction = time.partition('.')
+  "#{date}T#{seconds}.#{(fraction + "000")[0, 3]}Z"
+end
+
+# `Rails::HealthController#show`
+pub def health(app : App, c : Ctx) : ActionResult
+  c.render_as(200, "text/html; charset=utf-8", %(<!DOCTYPE html><html><body style="background-color: green"></body></html>))
+end
+
+# turbo-rails' `Turbo::Native::NavigationController`.
+pub def native_recede(app : App, c : Ctx) : ActionResult
+  c.render_html(200, "Going back…")
+end
+
+pub def native_resume(app : App, c : Ctx) : ActionResult
+  c.render_html(200, "Staying put…")
+end
+
+pub def native_refresh(app : App, c : Ctx) : ActionResult
+  c.render_html(200, "Refreshing…")
+end

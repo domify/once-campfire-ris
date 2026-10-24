@@ -1,0 +1,256 @@
+# Minimal libvips binding covering exactly the calls ruby-vips makes for
+# Active Storage: the Vips image analyzer, and `ImageProcessing::Vips`
+# `resize_to_limit` plus format conversion. libvips must be the reference
+# image's version for variants to be byte-identical.
+@[Ffi]
+module rils/storage/vips
+
+import std/text
+import rils/storage/errors::{StorageError}
+
+@[Link("vips")]
+@[Link("gobject-2.0")]
+@[Link("glib-2.0")]
+lib LibVips
+  fun init = vips_init(argv0 : UInt8*) : Int32
+  fun version_string = vips_version_string : UInt8*
+  fun block_untrusted_set = vips_block_untrusted_set(state : Int32) : Void
+  fun operation_block_set = vips_operation_block_set(name : UInt8*, state : Int32) : Void
+  fun error_buffer_copy = vips_error_buffer_copy : UInt8*
+  fun error_clear = vips_error_clear : Void
+  fun foreign_find_load = vips_foreign_find_load(filename : UInt8*) : UInt8*
+  fun operation_new = vips_operation_new(name : UInt8*) : Void*
+  fun object_get_args = vips_object_get_args(object : Void*, names : UInt8***, flags : Int32**, n_args : Int32*) : Int32
+  fun image_new_from_file = vips_image_new_from_file(name : UInt8*, ...) : Void*
+  fun image_new_matrix_from_array = vips_image_new_matrix_from_array(width : Int32, height : Int32, array : Float64*, size : Int32) : Void*
+  fun image_set_double = vips_image_set_double(image : Void*, name : UInt8*, d : Float64) : Void
+  fun image_get_width = vips_image_get_width(image : Void*) : Int32
+  fun image_get_height = vips_image_get_height(image : Void*) : Int32
+  fun image_get_typeof = vips_image_get_typeof(image : Void*, name : UInt8*) : UInt64
+  fun image_get_as_string = vips_image_get_as_string(image : Void*, name : UInt8*, result : UInt8**) : Int32
+  fun autorot = vips_autorot(input : Void*, output : Void**, ...) : Int32
+  fun thumbnail_image = vips_thumbnail_image(input : Void*, output : Void**, width : Int32, ...) : Int32
+  fun conv = vips_conv(input : Void*, output : Void**, mask : Void*, ...) : Int32
+  fun image_write_to_file = vips_image_write_to_file(image : Void*, name : UInt8*, ...) : Int32
+  fun object_unref = g_object_unref(object : Void*) : Void
+  fun free = g_free(mem : Void*) : Void
+end
+
+ARGUMENT_REQUIRED   =  1
+ARGUMENT_CONSTRUCT  =  2
+ARGUMENT_INPUT      = 16
+ARGUMENT_DEPRECATED = 64
+ACCESS_SEQUENTIAL   =  1
+SIZE_DOWN           =  2
+PRECISION_INTEGER   =  0
+MAX_COORD           = 10_000_000
+
+# The outcome of `vips_init`, once: nil until it runs, "" on success.
+INIT = [] of String
+
+def null_text : UInt8*
+  Pointer(UInt8).new(0_u64)
+end
+
+# A C string as an owned String.
+def c_string(pointer : UInt8*) : String
+  size = 0
+  while pointer[size] != 0
+    size += 1
+  end
+  String.new(size) { |output| size.times { |i| output[i] = pointer[i] } }
+end
+
+# NUL-terminated copy of *text*.
+def c_path(text : String) : String | StorageError
+  return StorageError.vips("path contains a NUL byte") if text.byte_index("\u0000")
+  text + "\u0000"
+end
+
+# `vips_init`, then `config/initializers/vips.rb`'s restrictions:
+# `Vips.block_untrusted(true)` and
+# `Vips.block("VipsForeignLoadOpenslide", true)`. Runs on first use; a
+# failure is kept and answered every time.
+pub def init : StorageError?
+  if INIT.empty?
+    if LibVips.init("campfire\u0000".to_unsafe) != 0
+      INIT << "vips_init failed: #{take_error}"
+    else
+      LibVips.block_untrusted_set(1)
+      LibVips.operation_block_set("VipsForeignLoadOpenslide\u0000".to_unsafe, 1)
+      INIT << ""
+    end
+  end
+  INIT[0].empty? ? nil : StorageError.vips(INIT[0])
+end
+
+pub def version : String | StorageError
+  failed = init
+  return failed if failed
+  c_string(LibVips.version_string)
+end
+
+# libvips' error buffer, taken and cleared in one step. The buffer is
+# process-wide.
+def take_error : String
+  copy = LibVips.error_buffer_copy
+  return "" if copy.address == 0
+  message = c_string(copy).rstrip
+  LibVips.free(copy.as(Void*))
+  message
+end
+
+# One reference to a libvips image, never null. Released by `release`
+# (GObject references aren't tied to the collector).
+pub class Image
+  getter handle : Void*
+
+  def initialize(@handle : Void*)
+  end
+
+  def self.wrap(pointer : Void*) : Image | StorageError
+    pointer.address == 0 ? StorageError.vips(take_error) : Image.new(pointer)
+  end
+
+  def self.wrap_out(status : Int32, pointer : Void*) : Image | StorageError
+    status != 0 ? StorageError.vips(take_error) : wrap(pointer)
+  end
+
+  pub def release : Nil
+    LibVips.object_unref(@handle) unless @handle.address == 0
+    @handle = Pointer(Void).new(0_u64)
+  end
+
+  # `Vips::Image.new_from_file(path, access: :sequential)`, as the image
+  # analyzer opens files.
+  pub def self.open_sequential(path : String) : Image | StorageError
+    failed = init
+    return failed if failed
+    name = c_path(path)
+    return name if name.is_a?(StorageError)
+    wrap(LibVips.image_new_from_file(name.to_unsafe, "access\u0000".to_unsafe, ACCESS_SEQUENTIAL, null_text))
+  end
+
+  # `ImageProcessing::Vips::Processor.load_image(path, page: 0)`: `page: 0`
+  # reaches only loaders that take it, then `autorot`.
+  pub def self.load_for_processing(path : String) : Image | StorageError
+    failed = init
+    return failed if failed
+    name = c_path(path)
+    return name if name.is_a?(StorageError)
+    pointer = if loader_accepts_page?(name)
+                LibVips.image_new_from_file(name.to_unsafe, "page\u0000".to_unsafe, 0, null_text)
+              else
+                LibVips.image_new_from_file(name.to_unsafe, null_text)
+              end
+    image = wrap(pointer)
+    return image if image.is_a?(StorageError)
+    rotated = image.autorot
+    image.release
+    rotated
+  end
+
+  pub def width : Int32
+    LibVips.image_get_width(@handle)
+  end
+
+  pub def height : Int32
+    LibVips.image_get_height(@handle)
+  end
+
+  # `image.get(name)` for string fields such as `exif-ifd0-Orientation`.
+  pub def get_string(name : String) : String?
+    field = name + "\u0000"
+    return nil if LibVips.image_get_typeof(@handle, field.to_unsafe) == 0
+    text = null_text
+    if LibVips.image_get_as_string(@handle, field.to_unsafe, pointerof(text)) != 0
+      LibVips.error_clear
+      return nil
+    end
+    value = c_string(text)
+    LibVips.free(text.as(Void*))
+    value
+  end
+
+  pub def autorot : Image | StorageError
+    rotated = Pointer(Void).new(0_u64)
+    Image.wrap_out(LibVips.autorot(@handle, pointerof(rotated), null_text), rotated)
+  end
+
+  # `resize_to_limit(width, height)`: `thumbnail_image(width, height:,
+  # size: :down, no_rotate: true)`, then `conv(SHARPEN_MASK,
+  # precision: :integer)`.
+  pub def resize_to_limit(width : Int32?, height : Int32?) : Image | StorageError
+    thumbnail = Pointer(Void).new(0_u64)
+    status = LibVips.thumbnail_image(@handle, pointerof(thumbnail), width || MAX_COORD,
+      "height\u0000".to_unsafe, height || MAX_COORD, "size\u0000".to_unsafe, SIZE_DOWN,
+      "no_rotate\u0000".to_unsafe, 1, null_text)
+    small = Image.wrap_out(status, thumbnail)
+    return small if small.is_a?(StorageError)
+    mask = sharpen_mask
+    if mask.is_a?(StorageError)
+      small.release
+      return mask
+    end
+    sharpened = Pointer(Void).new(0_u64)
+    status = LibVips.conv(small.handle, pointerof(sharpened), mask.handle, "precision\u0000".to_unsafe, PRECISION_INTEGER, null_text)
+    small.release
+    mask.release
+    Image.wrap_out(status, sharpened)
+  end
+
+  # `write_to_file(path)`: the saver and its defaults come from the
+  # extension.
+  pub def write_to_file(path : String) : StorageError?
+    name = c_path(path)
+    return name if name.is_a?(StorageError)
+    LibVips.image_write_to_file(@handle, name.to_unsafe, null_text) != 0 ? StorageError.vips(take_error) : nil
+  end
+end
+
+# `ImageProcessing::Vips::Processor::SHARPEN_MASK`:
+# `new_from_array([[-1,-1,-1],[-1,32,-1],[-1,-1,-1]], 24)`.
+def sharpen_mask : Image | StorageError
+  values = [-1.0, -1.0, -1.0, -1.0, 32.0, -1.0, -1.0, -1.0, -1.0]
+  mask = Image.wrap(LibVips.image_new_matrix_from_array(3, 3, values.to_unsafe, 9))
+  return mask if mask.is_a?(StorageError)
+  LibVips.image_set_double(mask.handle, "scale\u0000".to_unsafe, 24.0)
+  LibVips.image_set_double(mask.handle, "offset\u0000".to_unsafe, 0.0)
+  mask
+end
+
+# Whether the loader libvips picks for *path* has an optional `page`
+# input, as `Utils.select_valid_loader_options` asks ruby-vips'
+# `Introspect`. The whole argument table is read: asking for an argument
+# the loader lacks (jpegload, pngload) appends "no property named `page'"
+# to libvips' error buffer. *path* is NUL-terminated.
+pub def loader_accepts_page?(path : String) : Bool
+  loader = LibVips.foreign_find_load(path.to_unsafe)
+  if loader.address == 0
+    LibVips.error_clear
+    return false
+  end
+  operation = LibVips.operation_new(loader)
+  if operation.address == 0
+    LibVips.error_clear
+    return false
+  end
+  names = Pointer(UInt8*).new(0_u64)
+  flags = Pointer(Int32).new(0_u64)
+  n = 0
+  accepts = false
+  if LibVips.object_get_args(operation, pointerof(names), pointerof(flags), pointerof(n)) == 0
+    n.times do |i|
+      accepts = true if c_string(names[i]) == "page" && optional_input?(flags[i])
+    end
+  end
+  LibVips.object_unref(operation)
+  accepts
+end
+
+# `Introspect#optional_input`: construct-time inputs that aren't required,
+# counting deprecated required ones as optional.
+def optional_input?(flags : Int32) : Bool
+  required = flags & ARGUMENT_REQUIRED != 0 && flags & ARGUMENT_DEPRECATED == 0
+  flags & ARGUMENT_CONSTRUCT != 0 && flags & ARGUMENT_INPUT != 0 && !required
+end

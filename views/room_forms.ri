@@ -1,0 +1,148 @@
+# Views for `reference/app/views/rooms/{opens,closeds,directs,layouts}`:
+# making and editing rooms. A room's form renders on its own (`OpenForm`,
+# `ClosedForm`) and `RoomFormPage` puts it in the new or edit page.
+module views/room_forms
+
+import std/text
+import rils/routes/paths::{room_path, rooms_open_path, rooms_opens_path, rooms_closed_path, rooms_closeds_path, rooms_directs_path, rooms_direct_path, user_sidebar_path, autocompletable_users_path}
+import rils/template/html::{Html, escape}
+import rils/template/recorded::{RecordedPage}
+import rils/template/template::{Template, Buffer}
+import views/context::{ViewContext}
+import views/layouts::{render_in_layout}
+import views/helpers/tag::*
+import views/helpers/forms::{button_to}
+import views/helpers/users::{user_filter_menu_tag, user_filter_search_tag}
+import views/helpers/translations::{translation_button}
+import views/helpers/application::{link_back_to_last_room_visited}
+import views/messages/messages::{UserView}
+import views/users::{AutocompletableTemplate}
+
+# The room a form is for: no id for a new one.
+pub class FormRoom
+  getter id : Int64?
+  getter name : String?
+
+  def initialize(@id : Int64?, @name : String?)
+  end
+
+  # Where the form posts, by the room's type (`form_with model: room`).
+  def action(kind : String) : String
+    if id = @id
+      kind == "open" ? rooms_open_path(id) : rooms_closed_path(id)
+    else
+      kind == "open" ? rooms_opens_path : rooms_closeds_path
+    end
+  end
+
+  def display_name : String
+    @name || ""
+  end
+end
+
+# `rooms/opens/_form.html.erb`: everyone has access.
+pub class OpenForm
+  getter ctx : ViewContext
+  getter room : FormRoom
+  # `Current.user.can_administer?(room)`: administrators, the creator, or a
+  # new room.
+  getter can_administer : Bool
+  # `User.active.ordered`.
+  getter users : Array(UserView)
+  # The other type's page, which the access switch goes to.
+  getter type_change_path : String
+
+  def initialize(@ctx : ViewContext, @room : FormRoom, @can_administer : Bool, @users : Array(UserView), @type_change_path : String)
+  end
+
+  def kind : String
+    "open"
+  end
+
+  Template.def_render("rooms/opens/_form.html.erb")
+end
+
+# `rooms/closeds/_form.html.erb`: the members chosen from the active users.
+pub class ClosedForm
+  getter ctx : ViewContext
+  getter room : FormRoom
+  getter can_administer : Bool
+  getter current_user_id : Int64
+  # Active users with access (none for a new room), and the others.
+  getter selected_users : Array(UserView)
+  getter unselected_users : Array(UserView)
+  getter type_change_path : String
+
+  def initialize(@ctx : ViewContext, @room : FormRoom, @can_administer : Bool, @current_user_id : Int64,
+                 @selected_users : Array(UserView), @unselected_users : Array(UserView), @type_change_path : String)
+  end
+
+  def kind : String
+    "closed"
+  end
+
+  Template.def_render("rooms/closeds/_form.html.erb")
+end
+
+# `render layout: "rooms/layouts/new"` or `"rooms/layouts/edit"` around a
+# room's *form*.
+pub class RoomFormPage
+  getter ctx : ViewContext
+  getter room : FormRoom
+  getter can_administer : Bool
+  getter form : Html
+
+  def initialize(@ctx : ViewContext, @room : FormRoom, @can_administer : Bool, @form : Html)
+  end
+
+  Template.def_page("rooms/layouts/page.html.erb")
+
+  # `rooms/layouts/_new`'s and `_edit`'s `@page_title`.
+  def page_title : String
+    @room.id ? "Edit settings for #{@room.display_name}" : "New chat room"
+  end
+
+  pub def page(frame : Bool = false) : RecordedPage
+    render_in_layout(@ctx, page_title, nil, frame) { |buffer| render_into(buffer) }
+  end
+end
+
+# `button_to room_path(room), method: :delete, ...` on a room's edit page.
+pub def button_to_delete_room(ctx : ViewContext, room_id : Int64, display_name : String) : Html
+  content = Html.new(%(<img aria-hidden="true" src="#{escape(ctx.asset("trash.svg"))}" width="20" height="20" /><span class="overflow-ellipsis">#{escape(display_name)}</span>))
+  options = attrs.method("delete").class("btn btn--negative max-width").aria("label", "Delete #{display_name}")
+    .data("turbo_confirm", "Are you sure you want to delete this room and all messages in it? This can’t be undone.")
+  button_to(ctx.url(room_path(room_id)), options, content)
+end
+
+# `rooms/directs/new.html.erb`: picking whom to ping, in the sidebar's
+# directs frame.
+pub class DirectsNew
+  getter ctx : ViewContext
+
+  def initialize(@ctx : ViewContext)
+  end
+
+  Template.def_page("rooms/directs/new.html.erb")
+
+  pub def page(frame : Bool = false) : RecordedPage
+    render_in_layout(@ctx, nil, nil, frame) { |buffer| render_into(buffer) }
+  end
+end
+
+# `rooms/directs/edit.html.erb`: a ping's members, and deleting it.
+pub class DirectsEdit
+  getter ctx : ViewContext
+  getter room_id : Int64
+  getter display_name : String
+  getter users : Array(UserView)
+
+  def initialize(@ctx : ViewContext, @room_id : Int64, @display_name : String, @users : Array(UserView))
+  end
+
+  Template.def_page("rooms/directs/edit.html.erb")
+
+  pub def page(frame : Bool = false) : RecordedPage
+    render_in_layout(@ctx, "Edit settings for #{@display_name}", nil, frame) { |buffer| render_into(buffer) }
+  end
+end

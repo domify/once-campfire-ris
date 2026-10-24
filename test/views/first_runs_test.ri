@@ -1,0 +1,24 @@
+# `first_runs/show` and `welcome/show` in the application layout, byte for
+# byte as the reference app rendered them (vectors/views).
+module test/views/first_runs_test
+
+import std/text
+import views/first_runs
+import views/welcome
+import test/views/golden::{golden_context, golden_page}
+import test/views/testing::{assert_same}
+import web/web/spec::*
+
+describe "first_runs/show" do
+  it "renders in the layout as the reference does" do
+    assert_same("first_run", golden_page("first_run"), ::Views::FirstRuns::Show.new(golden_context("first_run")).page.to_s)
+  end
+end
+
+describe "welcome/show" do
+  it "renders in the layout as the reference does" do
+    ctx = golden_context("welcome")
+    name = (ctx.current_user || raise "no current user").name
+    assert_same("welcome", golden_page("welcome"), ::Views::Welcome::Show.new(ctx, name).page.to_s)
+  end
+end

@@ -1,0 +1,391 @@
+# The messages page (`GET /rooms/:id/messages?before=`) of the Rust port's
+# benchmark, rendered from the same SQLite database with the same markup
+# (bench/message_markup.ri is generated from the Rust page). Run with `heap`
+# or `tape`: the same renderer writes into a String::Builder, or onto the
+# request's tape, copied out once at the end.
+#
+#   ris build bench/messages_page.ri -o bench/messages_page --release
+#   bench/messages_page tape DB SECRET_KEY_BASE PORT
+module bench/messages_page
+
+import std/text
+import std/time::{Time}
+import rils/rails_compat/clock::{Clock}
+import rils/rails_compat/key_generator::{Secrets}
+import rils/rails_compat/signed_id::{generate_signed_id}
+import rils/routes/paths::{fresh_user_avatar_path}
+import rils/record/sqlite::{Connection, SqlValue}
+import rils/record/schema::{BUSY_TIMEOUT_MS}
+import models/session::{Session}
+import models/user::{User}
+import models/room::{Room}
+import models/message::{Message}
+import rils/record/errors::{RecordNotFound}
+import rils/record/timestamp::{Timestamp}
+import rils/kit/cookies::{CookieJar}
+import std/socket::{IyiSocket}
+import web/web/server::{Server, listen_reuse_port}
+import web/web/config::{Config}
+import web/web/handler::{chain, Handler}
+import web/web/context::{Context}
+import bench/page::*
+
+class Page
+  getter status : Int32
+  getter views : Array(MsgView)
+
+  def initialize(@status, @views)
+  end
+end
+
+class MessagesPage < Handler
+  # message id => {updated_at in ms, the message's rendered markup}. Rails'
+  # fragment cache keys on more (the creator, the room); the benchmark only
+  # changes nothing, so the message's own version is enough here.
+  @cache = {} of Int64 => Tuple(Int64, String)
+  # The Cookie header => its signed-in user. A real app would also drop an
+  # entry when its session ends; the benchmark never signs out.
+  @signed_in = {} of String => Int64
+
+  # `tape-send`: the page goes out with `Response#send`, from the tape,
+  # before the scope ends - web's way to do what `raw` does.
+  @send = false
+
+  def initialize(@conn : Connection, @secrets : Secrets, @clock : Clock, @tape : Bool, @cached : Bool)
+    super()
+  end
+
+  def send=(@send : Bool) : Bool
+  end
+
+  def call(ctx : Context) : Nil
+    return call_cached(ctx) if @cached
+    page = load(ctx.request.path, ctx.request.query_string, ctx.request.headers["Cookie"]?)
+    ctx.response.status_code = page.status
+    return if page.status != 200
+    body = ""
+    if @tape
+      tape do
+        out_text = Str.build(400_000) do |buf|
+          page.views.each { |v| render_message(buf, v) }
+        end
+        body = out_text.to_heap
+      end
+    else
+      buf = HeapBuf.new(400_000)
+      page.views.each { |v| render_message(buf, v) }
+      body = buf.io.to_s
+    end
+    ctx.response.content_type = "text/html; charset=utf-8"
+    ctx.response.set_body(body)
+  end
+
+  PAGE_IDS = %(SELECT "id", "updated_at" FROM "messages" WHERE "room_id" = ? AND "created_at" < ? ORDER BY "created_at" DESC LIMIT 40)
+
+  # A page row: a message's id and its version, one tape entry each, so a
+  # single array grows while the rows are read.
+  struct PageRow
+    getter id : Int64
+    getter version : Int64
+
+    def initialize(@id : Int64, @version : Int64)
+    end
+  end
+
+  # The page from cached fragments: one query for the page's ids and versions,
+  # then the fragments joined. A miss renders the whole page into the cache.
+  def call_cached(ctx : Context) : Nil
+    path = ctx.request.path
+    query = ctx.request.query_string
+    cookie = ctx.request.headers["Cookie"]?
+    a = authorize(path, query, cookie)
+    ctx.response.status_code = a[0]
+    return if a[0] != 200
+    room_id = a[1]
+    created = a[2]
+    body = ""
+    if @tape
+      tape do
+        rows = Ary(PageRow).new(40)
+        @conn.query_all(PAGE_IDS, [room_id, created] of SqlValue) do |row|
+          rows.push(PageRow.new(row.int(0), ms(row.time(1))))
+          nil
+        end
+        total = 0
+        i = 0
+        while i < rows.size
+          hit = @cache[rows[i].id]?
+          if hit.nil? || hit[0] != rows[i].version
+            fill(path, query, cookie)
+            hit = @cache[rows[i].id]? || raise "not cached"
+          end
+          total += hit[1].bytesize
+          i += 1
+        end
+        out_text = Str.build(total) do |buf|
+          j = rows.size - 1
+          while j >= 0
+            buf.append(@cache[rows[j].id][1])
+            j -= 1
+          end
+        end
+        if @send
+          ctx.response.content_type = "text/html; charset=utf-8"
+          ctx.response.send(out_text)
+        else
+          body = out_text.to_heap
+        end
+      end
+      return if @send
+    else
+      ids = [] of Int64
+      versions = [] of Int64
+      @conn.query_all(PAGE_IDS, [room_id, created] of SqlValue) do |row|
+        ids << row.int(0)
+        versions << ms(row.time(1))
+        nil
+      end
+      ids.each_with_index do |id, i|
+        hit = @cache[id]?
+        fill(path, query, cookie) if hit.nil? || hit[0] != versions[i]
+      end
+      buf = String::Builder.new(400_000)
+      ids.reverse_each { |id| buf << @cache[id][1] }
+      body = buf.to_s
+    end
+    ctx.response.content_type = "text/html; charset=utf-8"
+    ctx.response.set_body(body)
+  end
+
+  # `raw` mode: HTTP/1.1 on std/socket without web. The whole response,
+  # head and body, is built on the request's tape and written from there, so
+  # the page is copied once (fragments to tape) and never into the heap.
+  def serve_raw(listener : IyiSocket) : Nil
+    group do |g|
+      while !listener.closed?
+        client = listener.accept
+        spawn_raw(g, client) if client.is_a?(IyiSocket)
+      end
+    end
+  end
+
+  def spawn_raw(g : IyiGroup, sock : IyiSocket) : Nil
+    g.spawn do
+      serve_connection(sock)
+      0
+    end
+  end
+
+  def serve_connection(sock : IyiSocket) : Nil
+    pending = ""
+    while true
+      ending = pending.index("\r\n\r\n")
+      while ending.nil?
+        chunk = sock.read(16384)
+        break unless chunk.is_a?(String) && !chunk.empty?
+        pending = pending + chunk
+        ending = pending.index("\r\n\r\n")
+      end
+      break if ending.nil?
+      head = pending[0, ending]
+      pending = pending[ending + 4, pending.bytesize - ending - 4]
+      line_end = head.index("\r\n") || head.bytesize
+      request_line = head[0, line_end].split(' ')
+      break unless request_line.size == 3
+      target = request_line[1]
+      mark = target.index('?')
+      path = mark ? target[0, mark] : target
+      query = mark ? target[mark + 1, target.bytesize - mark - 1] : ""
+      cookie = header_value(head, "\r\nCookie: ")
+      keep = request_line[2] == "HTTP/1.1" ? !head.includes?("\r\nConnection: close") : head.downcase.includes?("\r\nconnection: keep-alive")
+      break unless respond_raw(sock, path, query, cookie, keep) && keep
+    end
+    sock.close
+  end
+
+  def header_value(head : String, name : String) : String?
+    start = head.index(name) || return nil
+    from = start + name.bytesize
+    stop = head.index("\r\n", from) || head.bytesize
+    head[from, stop - from]
+  end
+
+  def respond_raw(sock : IyiSocket, path : String, query : String, cookie : String?, keep : Bool) : Bool
+    a = authorize(path, query, cookie)
+    connection = keep ? "Connection: keep-alive\r\n" : "Connection: close\r\n"
+    if a[0] != 200
+      return write_all(sock, "HTTP/1.1 #{a[0]} Error\r\nContent-Length: 0\r\n#{connection}\r\n")
+    end
+    room_id = a[1]
+    created = a[2]
+    ok = false
+    tape do
+      rows = Ary(PageRow).new(40)
+      @conn.query_all(PAGE_IDS, [room_id, created] of SqlValue) do |row|
+        rows.push(PageRow.new(row.int(0), ms(row.time(1))))
+        nil
+      end
+      total = 0
+      i = 0
+      while i < rows.size
+        hit = @cache[rows[i].id]?
+        if hit.nil? || hit[0] != rows[i].version
+          fill(path, query, cookie)
+          hit = @cache[rows[i].id]? || raise "not cached"
+        end
+        total += hit[1].bytesize
+        i += 1
+      end
+      out_text = Str.build(total + 256) do |buf|
+        buf.append("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: ")
+        buf.append(total.to_s)
+        buf.append("\r\n")
+        buf.append(connection)
+        buf.append("\r\n")
+        j = rows.size - 1
+        while j >= 0
+          buf.append(@cache[rows[j].id][1])
+          j -= 1
+        end
+      end
+      # Written from the tape whole: the write parks until the kernel takes it.
+      ok = sock.write(out_text, out_text[0, 0]).is_a?(Int32)
+    end
+    ok
+  end
+
+  # `IyiSocket#write` sends every byte or answers why it could not.
+  def write_all(sock : IyiSocket, text : String) : Bool
+    sock.write(text).is_a?(Int32)
+  end
+
+  def fill(path : String, query : String, cookie : String?) : Nil
+    load(path, query, cookie).views.each do |v|
+      buf = HeapBuf.new(10_000)
+      render_message(buf, v)
+      @cache[v.id] = {v.updated_ms, buf.io.to_s}
+    end
+  end
+
+  # {status, room id, the anchor's created_at}, checked as `load` checks them.
+  def authorize(path : String, query : String, cookie : String?) : Tuple(Int32, Int64, Timestamp)
+    zero = Timestamp.from_second(0_i64)
+    parts = path.split('/')
+    return {404, 0_i64, zero} unless parts.size == 4 && parts[1] == "rooms" && parts[3] == "messages"
+    room_id = parts[2].to_i64? || return {404, 0_i64, zero}
+    before = (q = query; q.starts_with?("before=") ? q[7, q.bytesize - 7] : "").to_i64? || return {404, 0_i64, zero}
+    header = cookie || return {401, 0_i64, zero}
+    user_id = @signed_in[header]? || begin
+      token = CookieJar.from_headers([header], @secrets, @clock).signed("session_token") || return {401, 0_i64, zero}
+      session = Session.find_by_token(@conn, token) || return {401, 0_i64, zero}
+      @signed_in[header] = session.user_id
+    end
+    member = @conn.exists?(%(SELECT 1 FROM "memberships" WHERE "room_id" = ? AND "user_id" = ?), [room_id, user_id] of SqlValue)
+    return {404, 0_i64, zero} unless member
+    anchor = Message.find_in_room(@conn, room_id, before)
+    return {404, 0_i64, zero} if anchor.is_a?(RecordNotFound)
+    {200, room_id, anchor.created_at}
+  end
+
+  def load(path : String, query : String, cookie : String?) : Page
+    none = [] of MsgView
+    parts = path.split('/')
+    return Page.new(404, none) unless parts.size == 4 && parts[1] == "rooms" && parts[3] == "messages"
+    room_id = parts[2].to_i64? || return Page.new(404, none)
+    before = (q = query; q.starts_with?("before=") ? q[7, q.bytesize - 7] : "").to_i64? || return Page.new(404, none)
+
+    header = cookie || return Page.new(401, none)
+    token = CookieJar.from_headers([header], @secrets, @clock).signed("session_token") || return Page.new(401, none)
+    session = Session.find_by_token(@conn, token) || return Page.new(401, none)
+    member = @conn.exists?(%(SELECT 1 FROM "memberships" WHERE "room_id" = ? AND "user_id" = ?), [room_id, session.user_id] of SqlValue)
+    return Page.new(404, none) unless member
+    room = Room.find(@conn, room_id)
+    return Page.new(404, none) if room.is_a?(RecordNotFound)
+    anchor = Message.find_in_room(@conn, room_id, before)
+    return Page.new(404, none) if anchor.is_a?(RecordNotFound)
+
+    messages = Message.page_before(@conn, room_id, anchor)
+    bodies = {} of Int64 => String
+    ids = messages.map(&.id.to_s).join(",")
+    @conn.query_all(%(SELECT "record_id", "body" FROM "action_text_rich_texts" WHERE "record_type" = 'Message' AND "name" = 'body' AND "record_id" IN (#{ids})), [] of SqlValue) do |row|
+      bodies[row.int(0)] = row.text?(1) || ""
+    end
+    users = {} of Int64 => Tuple(String, String)
+    room_name = room.name || ""
+    views = messages.map do |m|
+      who = users[m.creator_id]? || begin
+        u = User.find(@conn, m.creator_id)
+        raise "no user #{m.creator_id}" if u.is_a?(RecordNotFound)
+        token = generate_signed_id(@secrets, "User", u.id, "avatar")
+        users[m.creator_id] = {u.name, fresh_user_avatar_path(token, number(u.updated_at.as_second))}
+      end
+      MsgView.new(m.id, room_id, m.creator_id, m.client_message_id, m.created_at.as_second, ms(m.created_at), ms(m.updated_at),
+        who[0], who[1], room_name, bodies[m.id]? || "")
+    end
+    Page.new(200, views)
+  end
+end
+
+mode = Program.args[0]
+db_path = Program.args[1]
+secret = Program.args[2]
+port_number = Program.args[3].to_i
+
+# A connection that waits for a lock as the app's do: the threads open
+# theirs at once, and without a timeout a read meets SQLITE_BUSY and panics.
+def open_database(path : String) : Connection
+  conn = Connection.open(path)
+  conn.busy_timeout(BUSY_TIMEOUT_MS)
+  conn
+end
+raw = mode == "raw"
+if mode == "threads"
+  # One process, a kernel thread per core: each thread opens its own
+  # database connection, keeps its own caches and listens on the shared
+  # port, so nothing mutable crosses threads (SPEC.md III.4.4).
+  count = Program.args[4].to_i
+  threads = (0...count).map do
+    IyiThread.start do
+      listener = listen_reuse_port("127.0.0.1", port_number)
+      page = MessagesPage.new(open_database(db_path), Secrets.new(secret), Clock.new, true, true)
+      page.serve_raw(listener)
+      nil
+    end
+  end
+  puts "threads #{count} listening #{port_number}"
+  STDOUT.flush
+  threads.each(&.join)
+elsif mode == "tape-threads"
+  # `tape-send` on a kernel thread per core: a server, a database
+  # connection and caches each, on the port the servers share.
+  count = Program.args[4].to_i
+  threads = (0...count).map do
+    IyiThread.start do
+      page = MessagesPage.new(open_database(db_path), Secrets.new(secret), Clock.new, true, true)
+      page.send = true
+      server = Server.new(chain([page.as(Handler)]), Config.new)
+      server.bind("127.0.0.1", port_number, reuse_port: true)
+      server.listen
+      nil
+    end
+  end
+  puts "tape-threads #{count} listening #{port_number}"
+  STDOUT.flush
+  threads.each(&.join)
+else
+  conn = open_database(db_path)
+  handler = MessagesPage.new(conn, Secrets.new(secret), Clock.new, raw || mode.starts_with?("tape"), raw || mode.ends_with?("cache") || mode == "tape-send")
+  handler.send = mode == "tape-send"
+  if raw
+    listener = listen_reuse_port("127.0.0.1", port_number)
+    puts "raw listening #{listener.local_port}"
+    STDOUT.flush
+    handler.serve_raw(listener)
+  else
+    server = Server.new(chain([handler.as(Handler)]), Config.new)
+    port = server.bind("127.0.0.1", port_number)
+    puts "#{mode} listening #{port}"
+    STDOUT.flush
+    server.listen
+  end
+end

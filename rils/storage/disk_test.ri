@@ -1,0 +1,26 @@
+module rils/storage/disk_test
+
+import std/file
+import rils/storage/disk::*
+import rils/storage/errors::*
+import rils/storage/key::{checksum}
+import web/web/spec::*
+
+describe "DiskService" do
+  it "verifies an upload with a checksum" do
+    root = make_tempdir("disk")
+    service = DiskService.new(root, "local")
+    assert service.upload("matching", "bytes", checksum("bytes")).nil?
+    assert service.download("matching") == "bytes"
+
+    mismatched = service.upload("mismatched", "bytes", checksum("other bytes"))
+    assert mismatched.is_a?(StorageError) && mismatched.kind == StorageErrorKind::Integrity
+    assert !service.exist?("mismatched")
+
+    assert service.upload("unchecked", "bytes").nil?
+    assert service.download("unchecked") == "bytes"
+    assert service.path_for("abcdef") == "#{root}/ab/cd/abcdef"
+    remove_tree(root)
+    assert !File.exists?(root)
+  end
+end

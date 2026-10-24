@@ -1,0 +1,505 @@
+# `UsersController` and what's under it (reference/app/controllers/users*):
+# joining with the join code, a user's page, the profile, the avatar, the
+# sidebar, bans, push subscriptions, plus the session transfer and the
+# autocompletable users.
+module controllers/users
+
+import rils/template/template::{Buffer}
+import std/text
+import std/time::{Time, Span}
+import rils/rails_compat/signed_id::{generate_signed_id, verify_signed_id}
+import rils/rails_compat/global_id::{GlobalId, attachable_sgid}
+import rils/rails_compat/turbo::{signed_stream_name}
+import rils/record/sqlite::{Connection, SqlValue, placeholders}
+import models/account::{Account}
+import models/user::{User, NewUser, UserChanges, PasswordDigest, USER_SELECT}
+import models/room::{Room, RoomType, Membership}
+import models/push_subscription::{PushSubscription}
+import rils/routes/paths::{root_path, new_session_path, user_path, user_profile_path, user_push_subscriptions_path}
+import rils/kit/ctx::{Ctx, ActionResult, Redirect, Freshness, ExpiresIn}
+import rils/kit/errors::{HttpError, halt}
+import rils/kit/response::{Response, SendOptions}
+import rils/kit/format::{HTML, JSON_MIME, SVG}
+import rils/kit/params::{ParamMap, Param, permit_keys}
+import rils/ruby/integers::{integer_cast}
+import rils/ruby/uri::{cgi_escape}
+import rils/storage/variation::{Variation}
+import rils/storage/blob::{Blob}
+import views/context::{CurrentUser}
+import views/users::{New, Show, ShownUser, ProfileShow, ProfileMembership, SidebarShow, SidebarUser, SidebarRoom, SidebarDirect, MentionUser, AvatarSvg}
+import views/rooms::{room_display_name}
+import views/sessions::{HelpContact, TransferShow}
+import views/push_subscriptions
+import views/autocompletable::{UsersIndex, users_index_json}
+import config/app::{App}
+import views/helpers/user_paths::{avatar_path, to_fs_usec}
+import rils/user_agent::{parse}
+import models/attachments::{Record, AttachmentChange, stage_upload, apply_change, analyze_later, destroy_attachment, processed_variant}
+import channels/broadcasts::{room_param_key, user_gid_param}
+import controllers/concerns::{Passed, Current, Authentication, Before, before_actions, head, ensure_can_administer, start_new_session_for}
+import controllers/messages::{current_user}
+import controllers/rooms::{sidebar_direct}
+import controllers/sessions::{help_contact}
+import controllers/pagination::{Page}
+import integrations/web_push::{deliver_test_notification}
+
+# `User::Transferable::TRANSFER_LINK_EXPIRY_DURATION`
+TRANSFER_LINK_EXPIRY_SECONDS = 4_i64 * 60 * 60
+
+# `user.transfer_id`: a signed id that expires in four hours.
+pub def transfer_id(app : App, user_id : Int64, now : Time) : String
+  generate_signed_id(app.secrets, "User", user_id, "transfer", now + Span.new(seconds: TRANSFER_LINK_EXPIRY_SECONDS))
+end
+
+# A user as the users views show them.
+pub def shown_user(app : App, user : User, now : Time) : ShownUser
+  ShownUser.new(user.id, user.name, user.bio, user.email_address, user.role.name, user.status.name, avatar_path(app.secrets, user), transfer_id(app, user.id, now))
+end
+
+def require_unauthenticated : Before
+  before = Before.new
+  before.authentication = Authentication::RequireUnauthenticated
+  before
+end
+
+# `verify_join_code`: `head :not_found` unless `params[:join_code]` is the
+# account's.
+def verify_join_code(app : App, c : Ctx) : Account | HttpError
+  account = app.db.read { |conn| Account.first(conn) } || return HttpError.internal("undefined method 'join_code' for nil")
+  return halt(c.head(404)) unless c.param_str("join_code") == account.join_code
+  account
+end
+
+# `new` (`require_unauthenticated_access`).
+pub def new_user(app : App, c : Ctx) : ActionResult
+  passed = before_actions(app, c, require_unauthenticated)
+  return passed if passed.is_a?(HttpError)
+  account = verify_join_code(app, c)
+  return account if account.is_a?(HttpError)
+  format = c.respond_to([HTML])
+  return format if format.is_a?(HttpError)
+  ctx = app.layout_context(c, platform: passed.platform)
+  view = New.new(ctx, account.join_code, app.db.read { |conn| help_contact(conn) })
+  app.render_layout(c, 200, "Sign up", "signup", ctx) { |buffer| view.render_into(buffer) }
+end
+
+# `create`: `User.create!(user_params)`, signed in, then the root; an
+# email address that's taken goes to sign in instead.
+pub def create_user(app : App, c : Ctx) : ActionResult
+  passed = before_actions(app, c, require_unauthenticated)
+  return passed if passed.is_a?(HttpError)
+  account = verify_join_code(app, c)
+  return account if account.is_a?(HttpError)
+  params = c.require("user")
+  return params if params.is_a?(HttpError)
+  permitted = params.permit(permit_keys(["name", "avatar", "email_address", "password"]))
+  text = ->(key : String) { (param = permitted[key]?) ? param.to_s? : nil }
+  name = text.call("name") || return HttpError.internal("NOT NULL constraint failed: users.name")
+  email_address = text.call("email_address")
+  password = text.call("password")
+  digest = password && !password.empty? ? PasswordDigest.create(password, app.db.env.bcrypt_cost) : nil
+  avatar = AttachmentChange.from_params(permitted, "avatar")
+  return HttpError.internal("Could not find or build blob: expected attachable") if avatar && avatar.invalid
+  staged = (avatar && (upload = avatar.upload)) ? stage_upload(app, upload) : nil
+  created = app.db.write do |tx|
+    # `rescue ActiveRecord::RecordNotUnique`: writes are serialized, so
+    # the unique email address is checked here.
+    if email_address && User.find_by_email_address(tx.conn, email_address)
+      nil
+    else
+      user = User.create(tx, NewUser.new(name, email_address, digest))
+      {user, apply_change(tx, Record.user(user.id), "avatar", avatar, staged)}
+    end
+  end
+  staged.discard if staged
+  unless created
+    location = c.url_for(new_session_path)
+    location += "?email_address=#{cgi_escape(email_address)}" if email_address
+    return c.redirect_to(location)
+  end
+  user, blob = created
+  analyze_later(app, blob)
+  start_new_session_for(app, c, user)
+  c.redirect_to(c.url_for(root_path))
+end
+
+# `show`: `User.find(params[:id])`.
+pub def show_user(app : App, c : Ctx) : ActionResult
+  passed = before_actions(app, c)
+  return passed if passed.is_a?(HttpError)
+  user = find_user(app, c, "id")
+  return user if user.is_a?(HttpError)
+  format = c.respond_to([HTML])
+  return format if format.is_a?(HttpError)
+  ctx = app.layout_context(c, current_user(passed.user), passed.platform)
+  view = Show.new(ctx, shown_user(app, user, c.now))
+  app.render_layout(c, 200, user.name, nil, ctx) { |buffer| view.render_into(buffer) }
+end
+
+pub def find_user(app : App, c : Ctx, key : String) : User | HttpError
+  raw = c.param_str(key) || return HttpError.not_found
+  id = integer_cast(raw) || return HttpError.not_found
+  app.db.read { |conn| User.find_by_id(conn, id) } || HttpError.not_found
+end
+
+# `Users::ProfilesController#show`: the user's own profile, rooms split
+# into direct and shared.
+pub def show_profile(app : App, c : Ctx) : ActionResult
+  passed = before_actions(app, c)
+  return passed if passed.is_a?(HttpError)
+  format = c.respond_to([HTML])
+  return format if format.is_a?(HttpError)
+  user = passed.user
+  attached, memberships = app.db.read do |conn|
+    {!Blob.attached(conn, "User", user.id, "avatar").nil?, profile_memberships(conn, user)}
+  end
+  direct, shared = memberships
+  ctx = app.layout_context(c, current_user(user), passed.platform)
+  view = ProfileShow.new(ctx, shown_user(app, user, c.now), attached, shared, direct)
+  app.render_layout(c, 200, user.name, nil, ctx) { |buffer| view.render_into(buffer) }
+end
+
+# `Current.user.memberships.with_ordered_room.partition { |m| m.room.direct? }`
+def profile_memberships(conn : Connection, user : User) : Tuple(Array(ProfileMembership), Array(ProfileMembership))
+  direct = [] of ProfileMembership
+  shared = [] of ProfileMembership
+  Membership.with_ordered_room(conn, user.id).each do |membership, room|
+    others = room.direct? ? room.users(conn).reject { |member| member.id == user.id }.map(&.name) : [] of String
+    involvement = membership.involvement
+    view = ProfileMembership.new(room.id, room_param_key(room), room_display_name(room.name, room.direct?, others, user.name), involvement ? involvement.name : "", room.direct?)
+    room.direct? ? direct << view : shared << view
+  end
+  {direct, shared}
+end
+
+# `update`: `@user.update user_params` (`.compact`), then back to the
+# profile with a notice.
+pub def update_profile(app : App, c : Ctx) : ActionResult
+  passed = before_actions(app, c)
+  return passed if passed.is_a?(HttpError)
+  user = passed.user
+  params = c.require("user")
+  return params if params.is_a?(HttpError)
+  permitted = params.permit(permit_keys(["name", "avatar", "email_address", "password", "bio"]))
+  present = ->(key : String) { (param = permitted[key]?) ? param.to_s? : nil }
+  password = present.call("password")
+  changes = UserChanges.new(name: present.call("name"))
+  if email = present.call("email_address")
+    changes.email_address = {email.as(String?)}
+  end
+  if bio = present.call("bio")
+    changes.bio = {bio.as(String?)}
+  end
+  changes.password_digest = PasswordDigest.create(password, app.db.env.bcrypt_cost) if password && !password.empty?
+  # `.compact` drops a nil avatar, so only "" or an upload change it.
+  avatar_param = permitted["avatar"]?
+  avatar = avatar_param && !avatar_param.null? ? AttachmentChange.from_params(permitted, "avatar") : nil
+  return HttpError.internal("Could not find or build blob: expected attachable") if avatar && avatar.invalid
+  staged = (avatar && (upload = avatar.upload)) ? stage_upload(app, upload) : nil
+  blob = app.db.write do |tx|
+    email_taken = (taken = changes.email_address) && (address = taken[0]) && (other = User.find_by_email_address(tx.conn, address)) && other.id != user.id
+    if email_taken
+      nil
+    else
+      user.update(tx, changes)
+      apply_change(tx, Record.user(user.id), "avatar", avatar, staged)
+    end
+  end
+  staged.discard if staged
+  analyze_later(app, blob)
+  notice = avatar_param && !avatar_param.null? ? "It may take up to 30 minutes to change everywhere." : "✓"
+  c.redirect_to(c.url_for(user_profile_path), Redirect.new(notice: notice))
+end
+
+# `Users::AvatarsController#show`'s `ActionView::Digestor.digest` of
+# `users/avatars/show`, as the Rust port has it.
+AVATAR_TEMPLATE_DIGEST = "d500db55e2a67222018ef0156839c3c9"
+# `expires_in 30.minutes, public: true, stale_while_revalidate: 1.week`
+AVATAR_MAX_AGE                = 30_i64 * 60
+AVATAR_STALE_WHILE_REVALIDATE = 7_i64 * 24 * 60 * 60
+
+# `Users::AvatarsController#show`: the uploaded avatar's `:square`
+# variant, the default bot avatar, or the initials.
+pub def show_avatar(app : App, c : Ctx) : ActionResult
+  c.use_live_response
+  passed = before_actions(app, c)
+  return passed if passed.is_a?(HttpError)
+  # `User.from_avatar_token`: a bad signature is a 404, a missing user too.
+  token = c.param_str("user_id") || ""
+  user_id = verify_signed_id(app.secrets, "User", token, "avatar", c.now) || return halt(c.head(404))
+  user = app.db.read { |conn| User.find_by_id(conn, user_id) } || return HttpError.not_found
+  freshness = Freshness.new(etag: "users/#{user.id}-#{to_fs_usec(user.updated_at)}", template: avatar_template_found(c) ? AVATAR_TEMPLATE_DIGEST : nil)
+  if not_modified = c.fresh_when(freshness)
+    return not_modified
+  end
+  c.expires_in(AVATAR_MAX_AGE, ExpiresIn.new(public: true, stale_while_revalidate: AVATAR_STALE_WHILE_REVALIDATE))
+  if variant = processed_variant(app, Record.user(user.id), "avatar", Variation.resize_to_limit(512_i64, 512_i64, "webp"))
+    c.send_file(app.storage.path_for(variant), SendOptions.inline("image/webp"))
+  elsif user.bot?
+    c.send_file("#{__DIR__}/../reference/app/assets/images/default-bot-avatar.svg", SendOptions.inline("image/svg+xml"))
+  else
+    c.render_as(200, "image/svg+xml; charset=utf-8", app.written(->(buffer : Buffer) { AvatarSvg.new(user.id, user.initials).render_into(buffer) }))
+  end
+end
+
+# Whether the template is found for the request's formats: `*/*` or svg,
+# or none at all.
+def avatar_template_found(c : Ctx) : Bool
+  formats = c.formats
+  return false if formats.is_a?(HttpError)
+  formats.empty? || formats.any? { |format| format.symbol == "all" || format == SVG }
+end
+
+# `destroy`: `Current.user.avatar.destroy`, then the profile.
+pub def destroy_avatar(app : App, c : Ctx) : ActionResult
+  c.use_live_response
+  passed = before_actions(app, c)
+  return passed if passed.is_a?(HttpError)
+  app.db.write { |tx| destroy_attachment(tx, Record.user(passed.user.id), "avatar") }
+  c.redirect_to(c.url_for(user_profile_path))
+end
+
+# `Users::SidebarsController::DIRECT_PLACEHOLDERS`
+DIRECT_PLACEHOLDERS = 20
+
+# `Users::SidebarsController#show`.
+pub def show_sidebar(app : App, c : Ctx) : ActionResult
+  passed = before_actions(app, c)
+  return passed if passed.is_a?(HttpError)
+  format = c.respond_to([HTML])
+  return format if format.is_a?(HttpError)
+  user = passed.user
+  ctx = app.layout_context(c, current_user(user), passed.platform)
+  view = app.db.read do |conn|
+    all = Membership.visible_with_ordered_room(conn, user.id)
+    # `select { direct }.sort_by { |m| m.room.updated_at }.reverse`
+    direct = all.select { |_, room| room.direct? }.sorted_by { |_, room| room.updated_at.microseconds }.reversed
+    direct_ids = direct.map { |membership, _| membership.id }
+    others = all.reject { |membership, _| direct_ids.includes?(membership.id) }.map do |membership, room|
+      SidebarRoom.new(room.id, room_param_key(room), room.name || "", membership.unread?)
+    end
+    account = Account.first(conn)
+    restricted = account ? account.settings.restrict_room_creation_to_administrators? : false
+    SidebarShow.new(ctx, sidebar_user(app, user), signed_stream_name(app.secrets, ["rooms"]), signed_stream_name(app.secrets, [user_gid_param(user.id), "rooms"]),
+      direct.map { |membership, _| sidebar_direct(app, conn, membership) }, direct_placeholder_users(app, conn, user), others,
+      user.administrator? || !restricted)
+  end
+  app.render_layout(c, 200, nil, nil, ctx) { |buffer| view.render_into(buffer) }
+end
+
+def sidebar_user(app : App, user : User) : SidebarUser
+  SidebarUser.new(user.id, user.name, avatar_path(app.secrets, user))
+end
+
+# `find_direct_placeholder_users`: `including` appends the user even when
+# already there, and the limit counts that duplicate.
+def direct_placeholder_users(app : App, conn : Connection, user : User) : Array(SidebarUser)
+  direct_room_ids = Room.for_user_of_type(conn, user.id, RoomType::Direct).map(&.id)
+  exclude = [] of Int64
+  unless direct_room_ids.empty?
+    conn.query_all(%(SELECT "memberships"."user_id" FROM "memberships" WHERE "memberships"."room_id" IN (#{placeholders(direct_room_ids.size)})), direct_room_ids.map(&.as(SqlValue))) { |row| row.int(0) }.each do |id|
+      exclude << id unless exclude.includes?(id)
+    end
+  end
+  exclude << user.id
+  limit = DIRECT_PLACEHOLDERS - exclude.size
+  limit = 0 if limit < 0
+  sql = %(#{USER_SELECT} WHERE "users"."status" = 0 AND "users"."id" NOT IN (#{placeholders(exclude.size)}) ORDER BY "users"."created_at" ASC LIMIT #{limit})
+  User.find_by_sql(conn, sql, exclude.map(&.as(SqlValue))).map { |placeholder| sidebar_user(app, placeholder) }
+end
+
+# `Users::BansController#create` (`ensure_can_administer`, `set_user`).
+pub def create_ban(app : App, c : Ctx) : ActionResult
+  ban_action(app, c, true)
+end
+
+pub def destroy_ban(app : App, c : Ctx) : ActionResult
+  ban_action(app, c, false)
+end
+
+def ban_action(app : App, c : Ctx, ban : Bool) : ActionResult
+  passed = before_actions(app, c)
+  return passed if passed.is_a?(HttpError)
+  forbidden = ensure_can_administer(passed.user)
+  return forbidden if forbidden
+  user = find_user(app, c, "user_id")
+  return user if user.is_a?(HttpError)
+  if ban
+    invalid = app.db.write { |tx| user.ban(tx) }
+    return HttpError.status(422, "Validation failed") if invalid
+  else
+    app.db.write { |tx| user.unban(tx) }
+  end
+  c.redirect_to(c.url_for(user_path(user.id)))
+end
+
+# `Users::PushSubscriptionsController#index`.
+pub def index_push_subscriptions(app : App, c : Ctx) : ActionResult
+  passed = before_actions(app, c)
+  return passed if passed.is_a?(HttpError)
+  format = c.respond_to([HTML])
+  return format if format.is_a?(HttpError)
+  ctx = app.layout_context(c, current_user(passed.user), passed.platform)
+  subscriptions = app.db.read { |conn| PushSubscription.for_user(conn, passed.user.id) }.map { |subscription| push_subscription_view(subscription) }
+  view = Views::PushSubscriptions::Index.new(ctx, subscriptions)
+  app.render_layout(c, 200, "Push notification subscriptions", nil, ctx) { |buffer| view.render_into(buffer) }
+end
+
+# A subscription with its user agent parsed like `UserAgent.parse`.
+def push_subscription_view(subscription : PushSubscription) : Views::PushSubscriptions::PushSubscription
+  agent = parse(subscription.user_agent || "")
+  Views::PushSubscriptions::PushSubscription.new(subscription.id, subscription.endpoint || "", agent.browser, agent.version.to_s, agent.platform || "")
+end
+
+# `create`: an existing subscription with these keys must still pass the
+# validations, then it's touched; otherwise a new one.
+pub def create_push_subscription(app : App, c : Ctx) : ActionResult
+  c.wrap_parameters("push_subscription")
+  passed = before_actions(app, c)
+  return passed if passed.is_a?(HttpError)
+  user_id = passed.user.id
+  params = c.require("push_subscription")
+  return params if params.is_a?(HttpError)
+  permitted = params.permit(permit_keys(["endpoint", "p256dh_key", "auth_key"]))
+  resolve = ->(host : String) { (found = app.http.resolve(host)).is_a?(String) ? found : nil.as(String?) }
+  if existing = app.db.read { |conn| find_push_subscription(conn, user_id, permitted) }
+    app.db.release
+    return c.head(422) unless existing.validate(resolve).empty?
+    app.db.write { |tx| tx.conn.execute(%(UPDATE "push_subscriptions" SET "updated_at" = ? WHERE "push_subscriptions"."id" = ?), [tx.now, existing.id] of SqlValue) }
+    return c.head(200)
+  end
+  value = ->(key : String) { (param = permitted[key]?) ? param.to_s? : nil }
+  subscription = PushSubscription.build(user_id, value.call("endpoint"), value.call("p256dh_key"), value.call("auth_key"), c.request.user_agent)
+  created = app.db.write { |tx| PushSubscription.create(tx, subscription, resolve) }
+  c.head(created.is_a?(PushSubscription) ? 200 : 422)
+end
+
+# `@push_subscriptions.find_by(push_subscription_params)`: only the given
+# keys are conditions; nil is `IS NULL`.
+def find_push_subscription(conn : Connection, user_id : Int64, params : ParamMap) : PushSubscription?
+  sql = %(SELECT "push_subscriptions"."id" FROM "push_subscriptions" WHERE "push_subscriptions"."user_id" = ?)
+  values = [user_id] of SqlValue
+  params.each do |key, param|
+    if text = param.to_s?
+      sql += %( AND "push_subscriptions"."#{key}" = ?)
+      values << text
+    else
+      sql += %( AND "push_subscriptions"."#{key}" IS NULL)
+    end
+  end
+  id = conn.query_all(sql + " LIMIT 1", values) { |row| row.int(0) }.first? || return nil
+  found = PushSubscription.find(conn, id)
+  found.is_a?(PushSubscription) ? found : nil
+end
+
+# `destroy`: `@push_subscriptions.destroy_by(id: params[:id])`.
+pub def destroy_push_subscription(app : App, c : Ctx) : ActionResult
+  passed = before_actions(app, c)
+  return passed if passed.is_a?(HttpError)
+  if (raw = c.param_str("id")) && (id = integer_cast(raw))
+    app.db.write do |tx|
+      found = PushSubscription.find(tx.conn, id)
+      found.destroy(tx) if found.is_a?(PushSubscription) && found.user_id == passed.user.id
+    end
+  end
+  c.redirect_to(c.url_for(user_push_subscriptions_path))
+end
+
+# `Sessions::TransfersController#show` (`allow_unauthenticated_access`):
+# a form that PUTs back to this URL as it loads.
+pub def show_transfer(app : App, c : Ctx) : ActionResult
+  passed = before_actions(app, c, Before.unauthenticated)
+  return passed if passed.is_a?(HttpError)
+  format = c.respond_to([HTML])
+  return format if format.is_a?(HttpError)
+  # `allow_unauthenticated_access` skips `require_authentication`, so no
+  # session is resumed and the layout has no `Current.user`.
+  ctx = app.layout_context(c, nil, passed.platform)
+  view = TransferShow.new(ctx, c.request.path)
+  app.render_layout(c, 200, nil, nil, ctx) { |buffer| view.render_into(buffer) }
+end
+
+# `update`: `User.active.find_by_transfer_id(params[:id])`, signed in.
+pub def update_transfer(app : App, c : Ctx) : ActionResult
+  passed = before_actions(app, c, Before.unauthenticated)
+  return passed if passed.is_a?(HttpError)
+  user_id = verify_signed_id(app.secrets, "User", c.param_str("id") || "", "transfer", c.now)
+  user = user_id ? app.db.read { |conn| User.find_by_id(conn, user_id) } : nil
+  return c.head(400) unless user && user.active?
+  start_new_session_for(app, c, user)
+  location = c.session.delete("return_to_after_authenticating")
+  c.redirect_to(location.is_a?(String) ? location : c.url_for(root_path))
+end
+
+# `Autocompletable::UsersController#index`: 20 a page, as prompt items or
+# JSON.
+pub def index_autocompletable_users(app : App, c : Ctx) : ActionResult
+  passed = before_actions(app, c)
+  return passed if passed.is_a?(HttpError)
+  user = passed.user
+  # `params[:room_id].present? ? Current.user.rooms.find(params[:room_id]).users : User.all`
+  room_id = nil.as(Int64?)
+  if (param = c.param("room_id")) && param.present?
+    id = (text = param.as_s?) ? integer_cast(text) : nil
+    room = id ? app.db.read { |conn| Room.find_for_user(conn, user.id, id) } : nil
+    return HttpError.not_found unless room
+    room_id = room.id
+  end
+  # The editor's mentions prompt filters with `filter`, the inputs with
+  # `query`.
+  query = [c.param("filter"), c.param("query")].compact.find(&.present?)
+  users = app.db.read { |conn| autocompletable_users(conn, room_id, query ? query.to_s? : nil) }
+  page = Page.new(c.param_str("page"), users.size.to_i64, [20_i64])
+  shown = page.records(users).map { |found| mention_user(app, found) }
+  format = c.respond_to([HTML, JSON_MIME])
+  return format if format.is_a?(HttpError)
+  page.apply_headers(c)
+  ctx = app.view_context(c.request)
+  if format == JSON_MIME
+    c.render_as(200, "application/json; charset=utf-8", users_index_json(ctx, shown))
+  else
+    # `render layout: false`
+    c.render(200, HTML, app.written(->(buffer : Buffer) { UsersIndex.new(ctx, shown).render_into(buffer) }))
+  end
+end
+
+def mention_user(app : App, user : User) : MentionUser
+  MentionUser.new(user.id, user.name, user.bio, attachable_sgid(app.secrets, GlobalId.new("User", user.id)), avatar_path(app.secrets, user))
+end
+
+# `users_scope.active[.filtered_by(query)].ordered`
+def autocompletable_users(conn : Connection, room_id : Int64?, query : String?) : Array(User)
+  sql = USER_SELECT
+  values = [] of SqlValue
+  if room_id
+    sql += %( INNER JOIN "memberships" ON "users"."id" = "memberships"."user_id" WHERE "memberships"."room_id" = ? AND)
+    values << room_id
+  else
+    sql += " WHERE"
+  end
+  sql += %( "users"."status" = 0)
+  if query
+    sql += " AND (name like ?)"
+    values << "%#{query}%"
+  end
+  User.find_by_sql(conn, sql + " ORDER BY LOWER(name)", values)
+end
+
+# `Users::PushSubscriptions::TestNotificationsController#create`: a test
+# notification to one of the user's subscriptions, delivered inline.
+pub def create_test_notification(app : App, c : Ctx) : ActionResult
+  passed = before_actions(app, c)
+  return passed if passed.is_a?(HttpError)
+  raw = c.param_str("push_subscription_id") || return HttpError.not_found
+  id = integer_cast(raw) || return HttpError.not_found
+  found = app.db.read do |conn|
+    subscription = PushSubscription.find(conn, id)
+    subscription.is_a?(PushSubscription) && subscription.user_id == passed.user.id ? {subscription, subscription.badge(conn)} : nil
+  end
+  return HttpError.not_found unless found
+  subscription, badge = found
+  failed = deliver_test_notification(app, subscription, badge, c.url_for(user_push_subscriptions_path))
+  # Errors propagate, as in Rails.
+  return HttpError.internal("#{failed.kind}: #{failed.message}") if failed
+  c.redirect_to(c.url_for(user_push_subscriptions_path))
+end

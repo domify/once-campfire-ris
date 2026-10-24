@@ -1,0 +1,10 @@
+<%# reference/app/views/accounts/bots/new.html.erb %>
+<% content_for "nav" do %>  <div class="flex-item-justify-start">
+    <%= link_back_to(ctx, account_bots_path) %>
+  </div>
+<% end %>
+<section class="panel">
+  <% form = form_with(account_bots_path).model("user").multipart.class("flex flex-column gap") %><%= form.wrap do %>
+    <% include "accounts/bots/_form.html.erb" %>
+<% end %></section>
+

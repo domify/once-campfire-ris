@@ -1,0 +1,100 @@
+# The Jbuilder views: `users/_user.json`, `messages/_message.json`,
+# `messages/by_bots/{index,show}.json`, `messages/boosts/_boost.json` and
+# `messages/boosts/by_bots/show.json`. Keys go in the order Jbuilder emits
+# them; `rails_compat/json.encode` writes them as `render json:` does.
+module views/messages/json
+
+import std/json::{Any}
+import std/time::{Time}
+import rils/rails_compat/json::{encode}
+import views/messages/support::{json_time}
+
+# `users/_user.json.jbuilder`: `json.(user, :id, :name, :role)` and
+# `avatar_url`.
+pub class UserJson
+  getter id : Int64
+  getter name : String
+  # "member", "administrator" or "bot".
+  getter role : String
+  # `fresh_user_avatar_url(user)`: a full URL.
+  getter avatar_url : String
+
+  def initialize(@id : Int64, @name : String, @role : String, @avatar_url : String)
+  end
+
+  def to_any : Any
+    Any.new({"id" => Any.new(@id), "name" => Any.new(@name), "role" => Any.new(@role), "avatar_url" => Any.new(@avatar_url)})
+  end
+
+  def to_json : String
+    encode(to_any)
+  end
+end
+
+# `messages/_message.json.jbuilder`.
+pub class MessageJson
+  getter id : Int64
+  getter created_at : Time
+  # `message.plain_text_body`.
+  getter plain_text : String
+  # `message.body.to_s`: the rich text rendered with its layout.
+  getter html : String
+  getter creator : UserJson
+  getter room_id : Int64
+  # `room_message_url(message.room, message)`.
+  getter url : String
+
+  def initialize(@id : Int64, @created_at : Time, @plain_text : String, @html : String, @creator : UserJson, @room_id : Int64, @url : String)
+  end
+
+  def to_any : Any
+    Any.new({
+      "id"         => Any.new(@id),
+      "created_at" => Any.new(json_time(@created_at)),
+      "body"       => Any.new({"plain_text" => Any.new(@plain_text), "html" => Any.new(@html)}),
+      "creator"    => @creator.to_any,
+      "room"       => Any.new({"id" => Any.new(@room_id)}),
+      "url"        => Any.new(@url),
+    })
+  end
+end
+
+# `messages/boosts/_boost.json.jbuilder`.
+pub class BoostJson
+  getter id : Int64
+  getter content : String
+  getter created_at : Time
+  getter booster : UserJson
+  getter message_id : Int64
+  # `room_message_url(boost.message.room, boost.message)`.
+  getter message_url : String
+
+  def initialize(@id : Int64, @content : String, @created_at : Time, @booster : UserJson, @message_id : Int64, @message_url : String)
+  end
+
+  def to_any : Any
+    Any.new({
+      "id"         => Any.new(@id),
+      "content"    => Any.new(@content),
+      "created_at" => Any.new(json_time(@created_at)),
+      "booster"    => @booster.to_any,
+      "message"    => Any.new({"id" => Any.new(@message_id), "url" => Any.new(@message_url)}),
+    })
+  end
+end
+
+# `messages/by_bots/index.json.jbuilder`:
+# `json.array! @messages, partial: "messages/message"`.
+pub def by_bots_index(messages : Array(MessageJson)) : String
+  encode(Any.new(messages.map(&.to_any)))
+end
+
+# `messages/by_bots/show.json.jbuilder`.
+pub def by_bots_show(message : MessageJson) : String
+  encode(message.to_any)
+end
+
+# `messages/boosts/by_bots/show.json.jbuilder`.
+pub def boosts_by_bots_show(boost : BoostJson) : String
+  encode(boost.to_any)
+end

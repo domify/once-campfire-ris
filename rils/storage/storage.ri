@@ -1,0 +1,294 @@
+# The Active Storage flows Campfire drives, over one disk service and the
+# app verifier: uploads (`create_and_upload!`), analysis, tracked variants
+# (`VariantWithRecord`) and video previews (`ActiveStorage::Preview`).
+#
+# Each flow is split in two so the slow part never holds the database's
+# writer: the file work (copying, checksumming, libvips, ffmpeg) takes no
+# connection and leaves a `Staged` blob whose file is already uploaded;
+# the record step saves rows inside the caller's transaction and is quick.
+# The methods taking a connection that do both are for tests and tools.
+module rils/storage/storage
+
+import std/file
+import std/json::{Any}
+import rils/record/sqlite::{Connection}
+import rils/record/timestamp::{Timestamp}
+import rils/rails_compat/message_verifier::{MessageVerifier}
+import rils/storage/errors::{StorageError, StorageErrorKind}
+import rils/storage/analyze::{Analyzer, analyzer_for, analyzer_metadata}
+import rils/storage/blob::{Blob, NewBlob, find_variant_record, insert_variant_record, insert_attachment}
+import rils/storage/disk::{DiskService, copy_file}
+import rils/storage/filename::{Filename}
+import rils/storage/json::{json_merge, json_set, object}
+import rils/storage/key::{checksum_file}
+import rils/storage/marshal::{Value}
+import rils/storage/process::{transform, video_preview}
+import rils/storage/variation::{Variation}
+
+# A new blob whose file is in the service but whose row isn't saved yet.
+# There are no destructors, so the caller ends it: `keep` once the row is
+# committed, `discard` otherwise (`defer staged.discard` deletes the file
+# unless it was kept, so a write that rolls back leaves no orphan).
+pub class Staged
+  getter blob : NewBlob
+  getter service : DiskService
+  getter kept : Bool
+
+  def initialize(@blob : NewBlob, @service : DiskService)
+    @kept = false
+  end
+
+  # Inserts the blob's row.
+  pub def insert(conn : Connection, now : Timestamp) : Blob
+    @blob.insert(conn, now)
+  end
+
+  # The row is saved for good: keep the file.
+  pub def keep : Nil
+    @kept = true
+  end
+
+  # Deletes the file unless it was kept.
+  pub def discard : Nil
+    @service.delete(@blob.key) unless @kept
+  end
+end
+
+pub class Storage
+  getter service : DiskService
+  # `ActiveStorage.verifier`: `app_verifier(secrets, "ActiveStorage")`. It
+  # signs blob ids ("blob_id", not Active Record's signed-id scheme),
+  # variation keys ("variation"), disk URLs ("blob_key") and upload tokens
+  # ("blob_token"), as encoded JSON, since key order is signed too.
+  getter verifier : MessageVerifier
+
+  def initialize(@service : DiskService, @verifier : MessageVerifier)
+  end
+
+  # --- File work: no connection ---
+
+  # The file half of `Blob.create_and_upload!(io:, filename:,
+  # content_type:)` as attaching an upload does (`identify: true`).
+  pub def stage_file(source : String, filename : Filename, declared_type : String?) : Staged
+    blob = NewBlob.unfurl_file(source, filename, declared_type, @service.name)
+    stage(blob) { |path| copy_file(source, path) }
+  end
+
+  # `stage_file` for bytes in memory.
+  pub def stage_bytes(data : String, filename : Filename, declared_type : String?) : Staged
+    blob = NewBlob.unfurl(data, filename, declared_type, @service.name)
+    stage(blob) { |path| File.write(path, data) }
+  end
+
+  # Copies the blob's bytes into the service, without reading the copy back
+  # (the checksum was just computed from the same local bytes; `open`
+  # verifies before analysis and processing). A copy that fails deletes
+  # what it wrote, then the panic goes on.
+  pub def stage(blob : NewBlob, & : String -> Nil) : Staged
+    path = @service.make_path_for(blob.key)
+    # Deletes the file on the way out unless the copy finished.
+    guard = Staged.new(blob, @service)
+    defer guard.discard
+    yield path
+    guard.keep
+    Staged.new(blob, @service)
+  end
+
+  # `blob.open`: a checksum-verified tempfile named
+  # `ActiveStorage-<id>-…<.ext>`. The caller deletes it.
+  pub def open(blob : Blob) : String | StorageError
+    source = @service.path_for(blob.key)
+    return StorageError.file_not_found unless File.exists?(source)
+    path = File.tempfile("ActiveStorage-#{blob.id}-", blob.filename.extension_with_delimiter)
+    copy_file(source, path)
+    expected = blob.checksum
+    if expected && checksum_file(path) != expected
+      File.delete(path)
+      return StorageError.integrity
+    end
+    path
+  end
+
+  # What `blob.analyze` saves:
+  # `metadata.merge(analyzer.metadata.merge(analyzed: true))`.
+  pub def analyzed_metadata(blob : Blob) : Any | StorageError
+    analyzer = analyzer_for(blob.content_type_s)
+    return analyzed(blob.metadata, object) if analyzer == Analyzer::Null
+    path = open(blob)
+    return path if path.is_a?(StorageError)
+    extracted = analyzer_metadata(analyzer, path)
+    File.delete(path)
+    extracted.is_a?(StorageError) ? extracted : analyzed(blob.metadata, extracted)
+  end
+
+  # The file half of `VariantWithRecord#processed` for a defaulted
+  # variation (see `variation_for`): the variant image, staged and already
+  # analyzed (Rails analyzes it in an `AnalyzeJob` after commit).
+  pub def transform_variant(blob : Blob, variation : Variation) : Staged | StorageError
+    format = variation.format
+    return format if format.is_a?(StorageError)
+    content_type = variation.content_type
+    return content_type if content_type.is_a?(StorageError)
+    input = open(blob)
+    return input if input.is_a?(StorageError)
+    output = transform(input, variation)
+    File.delete(input)
+    return output if output.is_a?(StorageError)
+    staged = stage_analyzed(output, Filename.new("#{blob.filename.base}.#{format.downcase}"), content_type)
+    File.delete(output)
+    staged
+  end
+
+  # The file half of `Preview#process`: the video's frame from ffmpeg,
+  # staged as `<base>.jpg` (`image/jpeg`), already analyzed.
+  pub def draw_preview_image(blob : Blob) : Staged | StorageError
+    return StorageError.new(StorageErrorKind::Unpreviewable, blob.content_type_s) unless blob.previewable?
+    input = open(blob)
+    return input if input.is_a?(StorageError)
+    frame = video_preview(input)
+    File.delete(input)
+    return frame if frame.is_a?(StorageError)
+    output = File.tempfile("ActiveStorage-", ".jpg")
+    File.write(output, frame)
+    staged = stage_analyzed(output, Filename.new("#{blob.filename.base}.jpg"), "image/jpeg")
+    File.delete(output)
+    staged
+  end
+
+  # Stages a generated image with the metadata its analysis would save.
+  def stage_analyzed(path : String, filename : Filename, content_type : String) : Staged | StorageError
+    staged = stage_file(path, filename, content_type)
+    analyzer = analyzer_for(staged.blob.content_type || "")
+    extracted = analyzer_metadata(analyzer, path)
+    if extracted.is_a?(StorageError)
+      staged.discard
+      return extracted
+    end
+    staged.blob.metadata = analyzed(staged.blob.metadata, extracted)
+    staged
+  end
+
+  # --- Record work: quick, inside the caller's transaction ---
+
+  # `blob.variant(transformations)`: defaulted to the blob's variant format.
+  pub def variation_for(blob : Blob, transformations : Variation) : Variation | StorageError
+    return StorageError.new(StorageErrorKind::Invariable, blob.content_type_s) unless blob.variable?
+    transformations.default_to([{"format", Value.str(blob.default_variant_format)}] of Tuple(String, Value))
+  end
+
+  # The processed variant's image blob, if `variant_records` has it.
+  pub def existing_variant(conn : Connection, blob : Blob, variation : Variation) : Blob?
+    record_id = find_variant_record(conn, blob.id, variation.digest)
+    record_id ? Blob.attached(conn, "ActiveStorage::VariantRecord", record_id, "image") : nil
+  end
+
+  # The record half of `VariantWithRecord#processed`: the variant record,
+  # its image blob and attachment. Nil when another request recorded it
+  # first; that one is then `existing_variant`, and *image* is discarded.
+  pub def record_variant(conn : Connection, blob : Blob, variation : Variation, image : Staged, now : Timestamp) : Blob?
+    record_id = insert_variant_record(conn, blob.id, variation.digest)
+    return nil unless record_id
+    saved = image.insert(conn, now)
+    insert_attachment(conn, "image", "ActiveStorage::VariantRecord", record_id, saved.id, now)
+    saved
+  end
+
+  # `blob.preview_image`, if it has been generated.
+  pub def existing_preview_image(conn : Connection, blob : Blob) : Blob?
+    Blob.attached(conn, "ActiveStorage::Blob", blob.id, "preview_image")
+  end
+
+  # The record half of `Preview#process`: attaches the frame as the blob's
+  # `preview_image`. Nil when another request attached one first.
+  pub def record_preview_image(conn : Connection, blob : Blob, image : Staged, now : Timestamp) : Blob?
+    return nil if existing_preview_image(conn, blob)
+    saved = image.insert(conn, now)
+    insert_attachment(conn, "preview_image", "ActiveStorage::Blob", blob.id, saved.id, now)
+    saved
+  end
+
+  # --- Both at once, for tests and tools ---
+
+  # `Blob.create_and_upload!(io:, filename:, content_type:)`.
+  pub def create_and_upload(conn : Connection, data : String, filename : Filename, declared_type : String?, now : Timestamp) : Blob
+    staged = stage_bytes(data, filename, declared_type)
+    defer staged.discard
+    blob = staged.insert(conn, now)
+    staged.keep
+    blob
+  end
+
+  # `blob.analyze`. Rails then touches the blob's attachment records (see
+  # `attachment_records`).
+  pub def analyze(conn : Connection, blob : Blob) : StorageError?
+    metadata = analyzed_metadata(blob)
+    return metadata if metadata.is_a?(StorageError)
+    blob.update_metadata(conn, metadata)
+    nil
+  end
+
+  # `VariantWithRecord#processed`: the recorded variant, or a new one.
+  pub def process_variant(conn : Connection, blob : Blob, variation : Variation, now : Timestamp) : Blob | StorageError
+    if image = existing_variant(conn, blob, variation)
+      return image
+    end
+    staged = transform_variant(blob, variation)
+    return staged if staged.is_a?(StorageError)
+    defer staged.discard
+    if recorded = record_variant(conn, blob, variation, staged, now)
+      staged.keep
+      return recorded
+    end
+    existing_variant(conn, blob, variation) || StorageError.file_not_found
+  end
+
+  # `blob.preview_image`, generated with ffmpeg when missing.
+  pub def preview_image(conn : Connection, blob : Blob, now : Timestamp) : Blob | StorageError
+    if image = existing_preview_image(conn, blob)
+      return image
+    end
+    staged = draw_preview_image(blob)
+    return staged if staged.is_a?(StorageError)
+    defer staged.discard
+    if recorded = record_preview_image(conn, blob, staged, now)
+      staged.keep
+      return recorded
+    end
+    existing_preview_image(conn, blob) || StorageError.file_not_found
+  end
+
+  # `blob.preview(transformations).processed`: the preview image itself for
+  # empty transformations, otherwise its processed variant.
+  pub def process_preview(conn : Connection, blob : Blob, transformations : Variation, now : Timestamp) : Blob | StorageError
+    image = preview_image(conn, blob, now)
+    return image if image.is_a?(StorageError) || transformations.empty?
+    variation = variation_for(image, transformations)
+    return variation if variation.is_a?(StorageError)
+    process_variant(conn, image, variation, now)
+  end
+
+  # `blob.representation(transformations).processed`.
+  pub def process_representation(conn : Connection, blob : Blob, transformations : Variation, now : Timestamp) : Blob | StorageError
+    return process_preview(conn, blob, transformations, now) if blob.previewable?
+    return StorageError.new(StorageErrorKind::Unrepresentable, blob.content_type_s) unless blob.variable?
+    variation = variation_for(blob, transformations)
+    return variation if variation.is_a?(StorageError)
+    process_variant(conn, blob, variation, now)
+  end
+
+  pub def path_for(blob : Blob) : String
+    @service.path_for(blob.key)
+  end
+
+  # Deletes the blob's files (`Blob#delete`); rows are the caller's.
+  pub def delete_files(blob : Blob) : Nil
+    blob.delete_files(@service)
+  end
+end
+
+# `metadata.merge(extracted.merge(analyzed: true))`.
+def analyzed(metadata : Any, extracted : Any) : Any
+  merged = json_merge(extracted, object)
+  json_set(merged, "analyzed", Any.new(true))
+  json_merge(metadata, merged)
+end

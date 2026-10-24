@@ -1,0 +1,68 @@
+# The meta tags as libxml2 reads them (probed against Nokogiri 1.19.4, the
+# Rust port's tests).
+module test/integrations/opengraph/html_test
+
+import integrations/opengraph/html::*
+import web/web/spec::*
+
+def title(html : String) : String?
+  meta = meta_elements("<meta charset=utf-8>#{html}").reversed.find { |m| m.attr("property") == "og:title" }
+  content = meta ? meta.attr("content") : nil
+  content && !content.empty? ? content : nil
+end
+
+def title_of(content : String) : String?
+  title("<meta property=\"og:title\" content=\"a#{content}b\">")
+end
+
+describe "the meta tag scanner" do
+  it "decodes references like libxml2" do
+    [{"&apos;", "a'b"}, {"&eacute", "a&eacuteb"}, {"&eacute;x", "aéxb"}, {"&#233", "aéb"}, {"&#233x", "aéxb"}, {"&#xE9", "a\u{0E9B}"},
+     {"&#xe9;", "aéb"}, {"&AMP;", "a&AMP;b"}, {"&Eacute;", "aÉb"}, {"&unknown;", "a&unknown;b"}, {"& x", "a& xb"}, {"&#65;&#x41;", "aAAb"},
+     {"&#128;", "a\u{80}b"}, {"&#xD800;", "a"}, {"&#1114112;", "a"}, {"&lt", "a&ltb"}, {"&amp;amp;", "a&amp;b"}, {"&hellip;", "a…b"},
+     {"&nbsp", "a&nbspb"}, {"&#;", "a"}, {"&#x;", "a"}].each do |reference, expected|
+      assert title_of(reference) == expected, reference
+    end
+  end
+
+  it "tokenizes like libxml2" do
+    [{"<script><meta property=\"og:title\" content=\"in script\"></script><meta property=\"og:title\" content=\"after\">", "after"},
+     {"<style><meta property=\"og:title\" content=\"in style\"></style>", nil},
+     {"<textarea><meta property=\"og:title\" content=\"in textarea\"></textarea>", "in textarea"},
+     {"<!-- <meta property=\"og:title\" content=\"comment\"> --><p>", nil},
+     {"<meta property=og:title content=unquoted>", "unquoted"},
+     {"<meta property='og:title' content='single'>", "single"},
+     {"<meta property = \"og:title\" content = \"spaced\">", "spaced"},
+     {"<META PROPERTY=\"og:title\" CONTENT=\"upper\">", "upper"},
+     {"<meta property=\"og:title\"content=\"nospace\">", "nospace"},
+     {"<meta/property=\"og:title\"/content=\"slashes\">", nil},
+     {"<meta property=\"og:title\" content=\"a\">b\">", "a"},
+     {"<meta property=\"og:title\" content=\"unterminated>", "unterminated>"},
+     {"<meta property=\"og:title\" content=unq\"uoted>", "unq\"uoted"},
+     {"<meta property=\"og:title\" content=a&amp;b>", "a&b"},
+     {"<!--> <meta property=\"og:title\" content=\"after empty comment\"> -->", "after empty comment"},
+     {"<!---> <meta property=\"og:title\" content=\"after dash comment\"> -->", "after dash comment"},
+     {"<!DOCTYPE html><meta property=\"og:title\" content=\"doctype\">", "doctype"},
+     {"<?xml version=\"1.0\"?><meta property=\"og:title\" content=\"pi\">", "pi"},
+     {"<![CDATA[ <meta property=\"og:title\" content=\"cdata\"> ]]>", nil},
+     {"<p <meta property=\"og:title\" content=\"broken\">", nil},
+     {"< meta property=\"og:title\" content=\"space\">", nil},
+     {"<meta property=\"og:title\" content=\"\u0000nul\">", nil}].each do |html, expected|
+      assert title(html) == expected, html
+    end
+  end
+
+  it "reads bytes like libxml2 reading UTF-8" do
+    assert decode("caf\xc3\xa9 \xff x") == "café ÿ x"
+    assert decode("\x93q\x94") == "\u{93}q\u{94}"
+  end
+
+  it "finds the meta encoding like Nokogiri" do
+    encoding = ->(html : String) { meta_encoding(meta_elements(html)) }
+    assert encoding.call("<meta charset=\"iso-8859-1\">") == "iso-8859-1"
+    assert encoding.call("<meta charset=\"\">") == ""
+    assert encoding.call("<meta http-equiv=\"content-type\" content=\"text/html; charset=iso-8859-1\">") == "iso-8859-1"
+    assert encoding.call("<meta http-equiv=\"refresh\" content=\"charset=utf-8\">").nil?
+    assert encoding.call("<meta property=\"og:title\" content=\"x\">").nil?
+  end
+end

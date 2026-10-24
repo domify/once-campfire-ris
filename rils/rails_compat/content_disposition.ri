@@ -1,0 +1,57 @@
+# `ActionDispatch::Http::ContentDisposition.format` (actionpack's
+# `action_dispatch/http/content_disposition.rb`), as `send_file`, `send_data`
+# and Active Storage name a download: an ASCII `filename=` for old clients,
+# transliterated with I18n's default approximations, and the full name in
+# RFC 5987's `filename*=`.
+module rils/rails_compat/content_disposition
+
+import std/text
+import std/int
+import rils/rails_compat/approximations::{APPROXIMATIONS}
+
+# `ContentDisposition.format(disposition:, filename:)` for a filename
+# (without one it's just the disposition).
+pub def content_disposition(disposition : String, filename : String) : String
+  "#{disposition}; filename=\"#{percent_escape(transliterate(filename), false)}\"; filename*=UTF-8''#{percent_escape(filename, true)}"
+end
+
+# `TRADITIONAL_ESCAPED_CHAR` leaves ``[ A-Za-z0-9!#$+.^_`|~-]`` alone, and
+# `RFC_5987_ESCAPED_CHAR` ``[A-Za-z0-9!#$&+.^_`|~-]``.
+def kept?(byte : UInt8, rfc_5987 : Bool) : Bool
+  return true if (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
+  return true if "!#$+.^_`|~-".byte_index(byte.unsafe_chr.to_s)
+  rfc_5987 ? byte == '&'.ord : byte == ' '.ord
+end
+
+HEX = "0123456789ABCDEF"
+
+# `percent_escape(string, pattern)`: each escaped character's bytes as
+# `%XX`. The kept characters are all ASCII, so going byte by byte is the
+# same.
+def percent_escape(s : String, rfc_5987 : Bool) : String
+  String.build(s.bytesize) do |io|
+    s.each_byte do |byte|
+      if kept?(byte, rfc_5987)
+        io.write_byte(byte)
+      else
+        io << '%'
+        io.write_byte(HEX.as_tape[(byte >> 4).to_i32])
+        io.write_byte(HEX.as_tape[(byte & 15).to_i32])
+      end
+    end
+  end
+end
+
+# `I18n.transliterate` with the default approximations, and "?" for anything
+# else non-ASCII.
+def transliterate(s : String) : String
+  String.build(s.bytesize) do |io|
+    s.each_char do |c|
+      if c.ord < 128
+        io << c
+      else
+        io << (APPROXIMATIONS[c.ord]? || "?")
+      end
+    end
+  end
+end

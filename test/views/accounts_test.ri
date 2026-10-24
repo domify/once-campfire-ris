@@ -1,0 +1,74 @@
+# `accounts/custom_styles/edit` and `accounts/bots` in the application layout, byte for byte as
+# the reference app rendered it (vectors/views).
+module test/views/accounts_test
+
+import std/text
+import views/accounts::{UsersIndexTurboStream, Edit, AccountUser, Bot, BotRoom, BotForm, BotsIndex, BotsNew, BotsEdit, CustomStylesEdit}
+import std/json::{Any}
+import test/views/golden::{golden_case, golden_context, golden_page}
+import test/views/testing::{assert_same}
+import web/web/spec::*
+
+describe "accounts/custom_styles/edit" do
+  it "renders in the layout as the reference does, with and without styles" do
+    ["custom_styles_edit", "custom_styles_layout"].each do |name|
+      custom_styles = golden_case(name)["account"]["custom_styles"].as_s?
+      assert_same(name, golden_page(name), CustomStylesEdit.new(golden_context(name), custom_styles).page.to_s)
+    end
+  end
+end
+
+def bot(name : String) : Bot
+  b = golden_case(name)["bot"]
+  Bot.new(b["id"].as_i64, b["name"].as_s, b["bio"].as_s?, b["avatar_path"].as_s, b["bot_key"].as_s,
+    b["rooms"].as_a.map { |room| BotRoom.new(room["id"].as_i64, room["name"].as_s) })
+end
+
+def bot_form(name : String) : BotForm
+  b = golden_case(name)["bot"]
+  attachment = b.as_h["avatar_attachment_url"]?
+  BotForm.new(b["name"].as_s, b["webhook_url"].as_s?, attachment ? attachment.as_s : nil)
+end
+
+describe "accounts/bots" do
+  it "renders the index as the reference does" do
+    name = "bots_index"
+    assert_same(name, golden_page(name), BotsIndex.new(golden_context(name), [bot(name)]).page.to_s)
+  end
+
+  it "renders a new bot's form as the reference does" do
+    name = "bots_new"
+    assert_same(name, golden_page(name), BotsNew.new(golden_context(name)).page.to_s)
+  end
+
+  it "renders a bot's edit page, with and without an avatar, as the reference does" do
+    ["bots_edit", "bots_edit_with_avatar"].each do |name|
+      assert_same(name, golden_page(name), BotsEdit.new(golden_context(name), bot(name).id, bot_form(name)).page.to_s)
+    end
+  end
+end
+
+def account_users(list : Any) : Array(AccountUser)
+  list.as_a.map { |u| AccountUser.new(u["id"].as_i64, u["name"].as_s, u["bio"].as_s?, u["role"].as_s, u["status"].as_s, u["avatar_path"].as_s) }
+end
+
+describe "accounts/edit" do
+  it "renders for administrators and members, with a logo, a notice and more pages, as the reference does" do
+    ["account_edit_admin", "account_edit_member", "account_edit_notice", "account_edit_paginated", "account_edit_with_logo", "account_edit_with_logo_member"].each do |name|
+      c = golden_case(name)
+      account = c["account"]
+      next_page = c.as_h["next_page"]?
+      page = Edit.new(golden_context(name), account["id"].as_i64, account["join_code"].as_s, account["restrict_room_creation_to_administrators"].as_bool,
+        account_users(c["administrators"]), account_users(c["members"]), next_page ? next_page.as_s : nil).page
+      assert_same(name, golden_page(name), page.to_s)
+    end
+  end
+end
+
+describe "accounts/users/index.turbo_stream" do
+  it "renders the next page of users as the reference does" do
+    name = "account_users_page_2"
+    html = UsersIndexTurboStream.new(golden_context(name), account_users(golden_case(name)["users"])).render
+    assert_same(name, golden_page("#{name}.turbo_stream"), html.to_s)
+  end
+end

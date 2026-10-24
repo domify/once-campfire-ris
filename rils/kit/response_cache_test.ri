@@ -1,0 +1,120 @@
+# The versioned response cache on a database file (an in-memory one has no
+# second connection to watch it): a repeat is a hit, a commit anywhere is a
+# new generation, and the key keeps one session's page from another's.
+module rils/kit/response_cache_test
+
+import std/file::{File}
+import std/dir::{Dir}
+import std/time::{Time}
+import std/text
+import rils/rails_compat/clock::{Clock}
+import rils/rails_compat/key_generator::{Secrets}
+import rils/record/database::{Database, Config, Env}
+import rils/record/events::{RecordingSink}
+import test/models/fixtures::{load_fixtures, fixtures_dir, identify}
+import test/models/testing::{BasicRichText}
+import rils/record/sqlite::{Connection, SqlValue}
+import models/session::{Session}
+import rils/kit/app::{Stack, KitConfig}
+import rils/kit/cookies::{CookieJar, Cookie}
+import rils/kit/ctx::{Ctx}
+import rils/kit/params::{ParamMap, from_query_string}
+import rils/kit/request::{Request, ProxyConfig}
+import rils/kit/response::{Response, HeaderList}
+import config/app::{App}
+import config/routes::{campfire_router}
+import web/web/spec::*
+
+class FileClient
+  getter app : App
+  getter path : String
+  getter clock : Clock
+
+  def initialize(name : String)
+    @path = "#{Dir.tempdir}/campfire_response_cache_#{name}_#{Time.monotonic.total_nanoseconds.to_i64}.sqlite3"
+    File.delete(@path) if File.exists?(@path)
+    @clock = Clock.new
+    db = Database.open(Config.new(@path, true, "test"), Env.new(@clock, RecordingSink.new, BasicRichText.new, 4))
+    raise db if db.is_a?(String)
+    db.write { |tx| load_fixtures(tx.conn, fixtures_dir, tx.now, 4) }
+    @app = App.new(Stack.new(KitConfig.new, Secrets.new("a" * 128), @clock), db)
+  end
+
+  # A `session_token` for *user*, a session started for them when the
+  # fixtures have none.
+  def cookie(user : String) : String
+    sessions = Session.for_user(@app.db.conn, identify(user))
+    session = sessions.empty? ? @app.db.write { |tx| Session.start(tx, identify(user), "test", "127.0.0.1") } : sessions.first
+    jar = CookieJar.from_headers([] of String, @app.secrets, @clock)
+    jar.set_signed("session_token", Cookie.new(session.token, permanent: true, httponly: true))
+    jar.set_cookie_headers(false, "once.campfire.test").first.split(';').first
+  end
+
+  def get(path : String, cookie : String) : Response
+    headers = HeaderList.new
+    headers.append("host", "once.campfire.test")
+    headers.append("cookie", cookie)
+    found = campfire_router(@app).find("GET", path) || raise "no route for #{path}"
+    request = Request.new("GET", "GET", path, "", headers, nil, "", ProxyConfig.new)
+    jar = CookieJar.from_headers(headers.all("cookie"), @app.secrets, @clock)
+    c = Ctx.new(@app.stack, request, found[1], ParamMap.new, ParamMap.new, jar)
+    c.keep_page(c.finish(found[0].action.call(c)))
+  end
+
+  def close : Nil
+    File.delete(@path) if File.exists?(@path)
+  end
+end
+
+def room_path : String
+  "/rooms/#{identify("watercooler")}/messages"
+end
+
+describe "the response cache" do
+  it "serves a repeat from the cache, the same bytes and headers" do
+    client = FileClient.new("repeat")
+    cookie = client.cookie("david")
+    # The first request refreshes the session, a commit made before the
+    # lookup reads the generation: its page is kept under the new one.
+    first = client.get(room_path, cookie)
+    second = client.get(room_path, cookie)
+    assert first.status == 200 && second.status == 200
+    assert client.app.responses.hits == 1
+    assert (second.body_text || "") == (first.body_text || "")
+    assert second["etag"] == first["etag"]
+    client.close
+  end
+
+  it "misses once another connection commits" do
+    client = FileClient.new("commit")
+    cookie = client.cookie("david")
+    client.get(room_path, cookie)
+    client.get(room_path, cookie)
+    hits = client.app.responses.hits
+    other = Connection.open(client.path)
+    # A body changed and its message touched, as `update!` does: the
+    # fragment cache keys on the message's version.
+    other.execute(%(UPDATE "action_text_rich_texts" SET "body" = '<div>changed elsewhere</div>' WHERE "record_type" = 'Message'))
+    other.execute(%(UPDATE "messages" SET "updated_at" = '2030-01-01 00:00:00.000000'))
+    after = client.get(room_path, cookie)
+    assert client.app.responses.hits == hits
+    assert (after.body_text || "").includes?("changed elsewhere")
+    other.close
+    client.close
+  end
+
+  it "keeps one user's page from another" do
+    client = FileClient.new("users")
+    david = client.cookie("david")
+    jason = client.cookie("jason")
+    # Each user's first page is kept under their own key and their second
+    # is a hit. Had the keys been one, Jason's first would have been David's.
+    client.get(room_path, david)
+    client.get(room_path, jason)
+    assert client.app.responses.hits == 0
+    client.get(room_path, david)
+    client.get(room_path, jason)
+    assert client.app.responses.hits == 2
+    client.close
+  end
+end

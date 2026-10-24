@@ -1,0 +1,36 @@
+# `users/push_subscriptions/index` and its partial, byte for byte as the
+# reference app rendered them (vectors/views).
+module test/views/push_subscriptions_test
+
+import std/text
+import views/push_subscriptions::{Index, PushSubscription, PushSubscriptionItem}
+import test/views/golden::{golden_case, golden_context, golden_page}
+import test/views/testing::{assert_same}
+import web/web/spec::*
+
+def push_subscriptions(name : String) : Array(PushSubscription)
+  golden_case(name)["push_subscriptions"].as_a.map do |ps|
+    PushSubscription.new(ps["id"].as_i64, ps["endpoint"].as_s, ps["browser"].as_s, ps["version"].as_s, ps["platform"].as_s)
+  end
+end
+
+describe "users/push_subscriptions/index" do
+  it "renders in the layout as the reference does" do
+    name = "push_subscriptions"
+    page = Index.new(golden_context(name), push_subscriptions(name)).page
+    assert_same(name, golden_page(name), page.to_s)
+  end
+end
+
+describe "users/push_subscriptions/_push_subscription" do
+  it "renders as the reference does" do
+    name = "push_subscriptions"
+    ps = push_subscriptions(name)[0]
+    html = PushSubscriptionItem.new(golden_context(name), ps).render.to_s
+    # The item is the page's `<li>` up to its `</li>`.
+    golden = golden_page(name)
+    start = golden.byte_index("<li class=") || raise "no item"
+    close = golden.byte_index("</li>", start) || raise "unclosed item"
+    assert_same(name, golden[start, close + "</li>".bytesize - start], html)
+  end
+end

@@ -1,0 +1,38 @@
+# turbo-rails helpers: `turbo_frame_tag`, `turbo_stream_from`,
+# `turbo_page_requires_reload`, and `dom_id`.
+module views/helpers/turbo
+
+import rils/template/html::{Html}
+import views/helpers/tag::*
+
+# `turbo_frame_tag(id, src:, target:, **attributes)`'s attributes: the
+# given ones first, then `id`, `src` and `target` (nil ones dropped).
+pub def turbo_frame_options(id : String, src : String?, target : String?, attributes : Attrs) : Attrs
+  attributes.dup.attr("id", id).attr("src", src).attr("target", target)
+end
+
+# `turbo_frame_tag(id, **options) do ... end`; `src` and `target` may be in
+# *options* and are moved after the id as turbo-rails does.
+pub def turbo_frame_tag(id : String, options : Attrs, & : -> Html) : Html
+  options = options.dup
+  src = options.remove("src")
+  target = options.remove("target")
+  content_tag("turbo-frame", turbo_frame_options(id, src.nil? ? nil : value_to_s(src), target.nil? ? nil : value_to_s(target), options), yield)
+end
+
+# `turbo_stream_from(*streamables)`. The signed stream name comes from the
+# caller (`Turbo::StreamsChannel.signed_stream_name`).
+pub def turbo_stream_from(signed_stream_name : String) : Html
+  builder_tag("turbo-cable-stream-source", attrs.attr("channel", "Turbo::StreamsChannel").attr("signed-stream-name", signed_stream_name))
+end
+
+# `turbo_page_requires_reload_tag`, which `turbo_page_requires_reload`
+# provides to `:head`.
+pub def turbo_page_requires_reload_tag : Html
+  builder_tag("meta", attrs.name("turbo-visit-control").attr("content", "reload"))
+end
+
+# `dom_id(record, prefix)`: "prefix_model_id".
+pub def dom_id(model : String, id : Int64, prefix : String? = nil) : String
+  prefix ? "#{prefix}_#{model}_#{id}" : "#{model}_#{id}"
+end

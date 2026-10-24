@@ -1,0 +1,195 @@
+# Views for `reference/app/views/accounts`.
+module views/accounts
+
+import std/text
+import rils/routes/paths::{account_path, account_join_code_path, account_user_path, user_profile_path, edit_account_custom_styles_path, join_path, account_custom_styles_path, edit_account_path, account_bots_path, new_account_bot_path, account_bot_path, edit_account_bot_path, account_bot_key_path, room_bot_messages_path}
+import rils/template/html::{Html}
+import rils/template/recorded::{RecordedPage}
+import rils/template/template::{Template, Buffer}
+import views/context::{ViewContext}
+import views/layouts::{render_in_layout}
+import views/helpers/tag::*
+import views/helpers/assets::{image_tag}
+import views/helpers/forms::{form_with, button_tag, button_to}
+import views/helpers/links::{link_to}
+import views/helpers/users::{AvatarUser, avatar_tag, user_title, profile_form_submit_button, account_logo_tag}
+import views/helpers/application::{link_back_to, link_back_to_last_room_visited, button_to_copy_to_clipboard, link_to_zoom_qr_code, web_share_session_button, version_badge}
+import views/helpers/turbo::{turbo_frame_tag, dom_id}
+import rils/ruby/uri::{cgi_escape}
+import views/helpers/translations::{translation_button}
+
+# `accounts/custom_styles/edit.html.erb`: the account's CSS, in a textarea.
+# `custom_styles` is `account.custom_styles`, nil when none is set.
+pub class CustomStylesEdit
+  getter ctx : ViewContext
+  getter custom_styles : String?
+
+  def initialize(@ctx : ViewContext, @custom_styles : String?)
+  end
+
+  Template.def_page("accounts/custom_styles/edit.html.erb")
+
+  pub def page(frame : Bool = false) : RecordedPage
+    render_in_layout(@ctx, "Custom styles", nil, frame) { |buffer| render_into(buffer) }
+  end
+end
+
+# A room a bot is in (`bot.rooms.without_directs.ordered`).
+pub class BotRoom
+  getter id : Int64
+  getter name : String
+
+  def initialize(@id : Int64, @name : String)
+  end
+end
+
+# What `accounts/bots/_bot` shows of a bot.
+pub class Bot
+  getter id : Int64
+  getter name : String
+  getter bio : String?
+  getter avatar_path : String
+  getter bot_key : String
+  getter rooms : Array(BotRoom)
+
+  def initialize(@id : Int64, @name : String, @bio : String?, @avatar_path : String, @bot_key : String, @rooms : Array(BotRoom))
+  end
+
+  def avatar : AvatarUser
+    AvatarUser.new(@id, user_title(@name, @bio), @avatar_path)
+  end
+end
+
+# What `accounts/bots/_form` fills in: blank for a new bot.
+pub class BotForm
+  getter name : String?
+  getter webhook_url : String?
+  # `bot.avatar` when attached, else the default avatar shows.
+  getter avatar_attachment_url : String?
+
+  def initialize(@name : String? = nil, @webhook_url : String? = nil, @avatar_attachment_url : String? = nil)
+  end
+end
+
+# `accounts/bots/index.html.erb`: the account's active bots.
+pub class BotsIndex
+  getter ctx : ViewContext
+  getter bots : Array(Bot)
+
+  def initialize(@ctx : ViewContext, @bots : Array(Bot))
+  end
+
+  Template.def_page("accounts/bots/index.html.erb")
+
+  pub def page(frame : Bool = false) : RecordedPage
+    render_in_layout(@ctx, "Chat bots", nil, frame) { |buffer| render_into(buffer) }
+  end
+end
+
+# `accounts/bots/new.html.erb`.
+pub class BotsNew
+  getter ctx : ViewContext
+  getter bot : BotForm
+
+  def initialize(@ctx : ViewContext, @bot : BotForm = BotForm.new)
+  end
+
+  Template.def_page("accounts/bots/new.html.erb")
+
+  pub def page(frame : Bool = false) : RecordedPage
+    render_in_layout(@ctx, "New chat bot", nil, frame) { |buffer| render_into(buffer) }
+  end
+end
+
+# `accounts/bots/edit.html.erb`.
+pub class BotsEdit
+  getter ctx : ViewContext
+  getter bot_id : Int64
+  getter bot : BotForm
+
+  def initialize(@ctx : ViewContext, @bot_id : Int64, @bot : BotForm)
+  end
+
+  Template.def_page("accounts/bots/edit.html.erb")
+
+  pub def page(frame : Bool = false) : RecordedPage
+    render_in_layout(@ctx, "Edit bot", nil, frame) { |buffer| render_into(buffer) }
+  end
+end
+
+# A user in the account's list (`accounts/users/_user`).
+pub class AccountUser
+  getter id : Int64
+  getter name : String
+  getter bio : String?
+  # "administrator", "member" or "bot".
+  getter role : String
+  # "active", "deactivated" or "banned".
+  getter status : String
+  getter avatar_path : String
+
+  def initialize(@id : Int64, @name : String, @bio : String?, @role : String, @status : String, @avatar_path : String)
+  end
+
+  def administrator? : Bool
+    @role == "administrator"
+  end
+
+  def bot? : Bool
+    @role == "bot"
+  end
+
+  def active? : Bool
+    @status == "active"
+  end
+
+  def banned? : Bool
+    @status == "banned"
+  end
+
+  def avatar : AvatarUser
+    AvatarUser.new(@id, user_title(@name, @bio), @avatar_path)
+  end
+end
+
+# `accounts/edit.html.erb`: the account's settings, invitation and people.
+pub class Edit
+  getter ctx : ViewContext
+  getter account_id : Int64
+  getter join_code : String
+  getter restrict_room_creation_to_administrators : Bool
+  # `AccountsController#account_users`, the administrators first.
+  getter administrators : Array(AccountUser)
+  getter members : Array(AccountUser)
+  # The page `next_page_container` loads, when there are more users.
+  getter next_page : String?
+
+  def initialize(@ctx : ViewContext, @account_id : Int64, @join_code : String, @restrict_room_creation_to_administrators : Bool,
+                 @administrators : Array(AccountUser), @members : Array(AccountUser), @next_page : String? = nil)
+  end
+
+  Template.def_page("accounts/edit.html.erb")
+
+  # `form_with model: Current.account` with `url: account_path`: Rails puts
+  # the singular resource's id after a dot.
+  def account_action : String
+    "#{account_path}.#{@account_id}"
+  end
+
+  pub def page(frame : Bool = false) : RecordedPage
+    render_in_layout(@ctx, "Account settings", nil, frame) { |buffer| render_into(buffer) }
+  end
+end
+
+# `accounts/users/index.turbo_stream.erb`: the next page of the account's
+# users, in place of the container that loaded it.
+pub class UsersIndexTurboStream
+  getter ctx : ViewContext
+  getter users : Array(AccountUser)
+  getter next_page : String?
+
+  def initialize(@ctx : ViewContext, @users : Array(AccountUser), @next_page : String? = nil)
+  end
+
+  Template.def_render("accounts/users/index.turbo_stream.erb")
+end

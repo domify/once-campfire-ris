@@ -1,0 +1,147 @@
+# Ruby's `JSON.parse` and `Object#to_s`/`#inspect` of what it parses, as
+# Action Text applies them to Trix attachment attributes and to a signed
+# GlobalID's payload (the Rust port's richtext/src/ruby.rs).
+module rils/richtext/ruby_json
+
+import std/int
+import std/text
+import std/json::{JSON, Any}
+import rils/rails_compat/json::{parse}
+import rils/ruby/floats::{float_to_s}
+
+# Ruby's `JSON.parse`, which also skips `/* */` and `//` comments; nil
+# where it raises.
+pub def json_parse(text : String) : Any?
+  stripped = strip_json_comments(text)
+  return nil unless stripped
+  parse(stripped)
+end
+
+private def strip_json_comments(s : String) : String?
+  bytes = s.as_tape
+  failed = false
+  output = String.build(s.bytesize) do |io|
+    in_string = false
+    i = 0
+    while i < bytes.bytesize
+      c = bytes[i]
+      if in_string
+        io.write_byte(c)
+        if c == '\\'.ord
+          if i + 1 >= bytes.bytesize
+            failed = true
+            break
+          end
+          io.write_byte(bytes[i + 1])
+          i = i + 2
+          next
+        elsif c == '"'.ord
+          in_string = false
+        end
+        i = i + 1
+        next
+      end
+      if c == '"'.ord
+        in_string = true
+        io.write_byte(c)
+        i = i + 1
+      elsif c == '/'.ord && i + 1 < bytes.bytesize && bytes[i + 1] == '*'.ord
+        i = i + 2
+        closed = false
+        while i < bytes.bytesize
+          if bytes[i] == '*'.ord && i + 1 < bytes.bytesize && bytes[i + 1] == '/'.ord
+            i = i + 2
+            closed = true
+            break
+          end
+          i = i + 1
+        end
+        unless closed
+          failed = true
+          break
+        end
+        io << ' '
+      elsif c == '/'.ord && i + 1 < bytes.bytesize && bytes[i + 1] == '/'.ord
+        i = i + 2
+        while i < bytes.bytesize
+          newline = bytes[i] == '\n'.ord
+          i = i + 1
+          break if newline
+        end
+        io << ' '
+      else
+        io.write_byte(c)
+        i = i + 1
+      end
+    end
+  end
+  failed ? nil : output
+end
+
+# `Object#to_s` of a parsed value, as Nokogiri's `create_element` applies
+# it to attribute values.
+pub def json_value_to_s(value : Any) : String
+  raw = value.raw
+  case raw
+  when String then raw
+  when Nil    then ""
+  else             inspect(value)
+  end
+end
+
+# `Object#inspect` for parsed values, in Ruby 3.4's format.
+pub def inspect(value : Any) : String
+  raw = value.raw
+  case raw
+  when Nil     then "nil"
+  when Bool    then raw ? "true" : "false"
+  when Int64   then raw.to_s
+  when Float64 then float_to_s(raw)
+  when String  then string_inspect(raw)
+  when Array(Any)
+    "[" + raw.map { |item| inspect(item) }.join(", ") + "]"
+  when Hash(String, Any)
+    return "{}" if raw.empty?
+    parts = [] of String
+    raw.each { |key, item| parts << "#{string_inspect(key)} => #{inspect(item)}" }
+    "{" + parts.join(", ") + "}"
+  else
+    ""
+  end
+end
+
+HEX = "0123456789ABCDEF"
+
+private def string_inspect(s : String) : String
+  String.build(s.bytesize + 2) do |io|
+    io << '"'
+    chars = s.chars
+    i = 0
+    while i < chars.size
+      c = chars[i]
+      following = i + 1 < chars.size ? chars[i + 1] : '\0'
+      case c
+      when '"'      then io << "\\\""
+      when '\\'     then io << "\\\\"
+      when '\n'     then io << "\\n"
+      when '\t'     then io << "\\t"
+      when '\r'     then io << "\\r"
+      when '\u{0c}' then io << "\\f"
+      when '\u{0b}' then io << "\\v"
+      when '\u{08}' then io << "\\b"
+      when '\u{07}' then io << "\\a"
+      when '\u{1b}' then io << "\\e"
+      else
+        if c == '#' && i + 1 < chars.size && (following == '{' || following == '$' || following == '@')
+          io << "\\#"
+        elsif c.ord < 0x20 || c.ord == 0x7f
+          io << "\\x" << HEX[c.ord >> 4] << HEX[c.ord & 15]
+        else
+          io << c
+        end
+      end
+      i = i + 1
+    end
+    io << '"'
+  end
+end

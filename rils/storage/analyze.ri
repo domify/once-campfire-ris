@@ -1,0 +1,238 @@
+# The Active Storage analyzers Campfire runs, in
+# `config.active_storage.analyzers` order: `ImageAnalyzer::Vips`,
+# `VideoAnalyzer` and `AudioAnalyzer` (ImageMagick never accepts, the
+# variant processor being `:vips`), falling back to `NullAnalyzer`.
+module rils/storage/analyze
+
+import std/float
+import std/text
+import std/json::{Any}
+import std/process::{ProcessResult, ProcessError}
+import rils/storage/errors::{StorageError}
+import rils/storage/json::{json_parse, object}
+import rils/storage/content_types::{FFPROBE}
+import rils/storage/process::{output_within, TimedOut}
+import rils/storage/vips::{Image}
+
+# How long ffprobe may read a file's streams before it's killed. Rails
+# sets no limit.
+pub FFPROBE_TIMEOUT_MS = 30_000
+
+pub enum Analyzer
+  Image
+  Video
+  Audio
+  Null
+end
+
+pub def analyzer_for(content_type : String) : Analyzer
+  if content_type.starts_with?("image")
+    Analyzer::Image
+  elsif content_type.starts_with?("video")
+    Analyzer::Video
+  elsif content_type.starts_with?("audio")
+    Analyzer::Audio
+  else
+    Analyzer::Null
+  end
+end
+
+# `analyze_later?`: only the null analyzer runs inline.
+pub def analyze_later?(analyzer : Analyzer) : Bool
+  analyzer != Analyzer::Null
+end
+
+# `analyzer.metadata` for a local copy of the blob.
+pub def analyzer_metadata(analyzer : Analyzer, path : String) : Any | StorageError
+  case analyzer
+  when Analyzer::Image then image_metadata(path)
+  when Analyzer::Video
+    probed = probe(path)
+    probed.is_a?(StorageError) ? probed : video_metadata(probed)
+  when Analyzer::Audio
+    probed = probe(path)
+    probed.is_a?(StorageError) ? probed : audio_metadata(probed)
+  else
+    object
+  end
+end
+
+ROTATIONS = ["Right-top", "Left-bottom", "Top-right", "Bottom-left"]
+
+# `ImageAnalyzer::Vips#metadata`: dimensions, swapped for EXIF orientations
+# that rotate by 90°. Files libvips can't read yield `{}`.
+def image_metadata(path : String) : Any
+  image = Image.open_sequential(path)
+  return object if image.is_a?(StorageError)
+  orientation = image.get_string("exif-ifd0-Orientation")
+  rotated = !orientation.nil? && ROTATIONS.any? { |r| orientation.includes?(r) }
+  width = rotated ? image.height : image.width
+  height = rotated ? image.width : image.height
+  image.release
+  h = {} of String => Any
+  h["width"] = Any.new(width.to_i64)
+  h["height"] = Any.new(height.to_i64)
+  Any.new(h)
+end
+
+# `ffprobe -print_format json -show_streams -show_format -v error <path>`;
+# `{}` without ffprobe.
+def probe(path : String) : Any | StorageError
+  args = ["-print_format", "json", "-show_streams", "-show_format", "-v", "error", path]
+  result = output_within(FFPROBE, args, FFPROBE_TIMEOUT_MS)
+  case result
+  when TimedOut then return StorageError.analyze("ffprobe #{result.message}")
+  when ProcessError
+    return object if result.not_found?
+    raise result.message
+  end
+  json_parse(result.stdout) || StorageError.analyze("ffprobe output: not JSON")
+end
+
+def field(h : Any?, name : String) : Any?
+  return nil unless h
+  entries = h.as_h?
+  value = entries ? entries[name]? : nil
+  value && !value.raw.nil? ? value : nil
+end
+
+def stream(probe : Any, codec_type : String) : Any?
+  streams = field(probe, "streams")
+  list = streams ? streams.as_a? : nil
+  return nil unless list
+  list.each do |s|
+    kind = field(s, "codec_type")
+    return s if kind && kind.as_s? == codec_type
+  end
+  nil
+end
+
+def present?(stream : Any?) : Bool
+  return false unless stream
+  h = stream.as_h?
+  !h.nil? && !h.empty?
+end
+
+# Ruby's `Float(value)` for the numbers and numeric strings ffprobe emits.
+def ruby_float(value : Any) : Float64 | StorageError
+  raw = value.raw
+  case raw
+  when Int64   then raw.to_f64
+  when Float64 then raw
+  when String  then raw.strip.to_f? || StorageError.analyze("invalid value for Float(): #{raw.inspect}")
+  else              StorageError.analyze("can't convert #{value.kind} into Float")
+  end
+end
+
+# Ruby's `Integer(value)`.
+def ruby_integer(value : Any) : Int64 | StorageError
+  raw = value.raw
+  case raw
+  when Int64   then raw
+  when Float64 then raw.finite? ? raw.trunc.to_i64 : StorageError.analyze("can't convert #{raw} into Integer")
+  when String  then raw.strip.to_i64? || StorageError.analyze("invalid value for Integer(): #{raw.inspect}")
+  else              StorageError.analyze("can't convert #{value.kind} into Integer")
+  end
+end
+
+# `VideoAnalyzer#metadata`: `{ width:, height:, duration:, angle:,
+# display_aspect_ratio:, audio:, video: }.compact`.
+pub def video_metadata(probe : Any) : Any | StorageError
+  video = stream(probe, "video")
+  audio = stream(probe, "audio")
+
+  angle = nil.as(Int64?)
+  if rotate = field(field(video, "tags"), "rotate")
+    a = ruby_integer(rotate)
+    return a if a.is_a?(StorageError)
+    angle = a
+  else
+    list = field(video, "side_data_list")
+    items = list ? list.as_a? : nil
+    if items
+      matrix = items.find { |d| side_data_type(d) == "Display Matrix" }
+      if rotation = field(matrix, "rotation")
+        a = ruby_integer(rotation)
+        return a if a.is_a?(StorageError)
+        angle = a
+      end
+    end
+  end
+
+  ratio = nil.as(Tuple(Int64, Int64)?)
+  if descriptor = field(video, "display_aspect_ratio")
+    text = descriptor.as_s? || return StorageError.analyze("display_aspect_ratio")
+    numerator_text, colon, denominator_text = text.partition(":")
+    numerator = ruby_integer(Any.new(numerator_text))
+    return numerator if numerator.is_a?(StorageError)
+    return StorageError.analyze("can't convert nil into Integer") if colon.empty?
+    denominator = ruby_integer(Any.new(denominator_text))
+    return denominator if denominator.is_a?(StorageError)
+    ratio = {numerator, denominator} if numerator != 0
+  end
+
+  encoded_width = nil.as(Float64?)
+  if w = field(video, "width")
+    f = ruby_float(w)
+    return f if f.is_a?(StorageError)
+    encoded_width = f
+  end
+  encoded_height = nil.as(Float64?)
+  if h = field(video, "height")
+    f = ruby_float(h)
+    return f if f.is_a?(StorageError)
+    encoded_height = f
+  end
+  computed_height = nil.as(Float64?)
+  if ratio && encoded_width
+    computed_height = encoded_width * (ratio[1].to_f64 / ratio[0].to_f64)
+  end
+  rotated = angle == 90 || angle == 270 || angle == -90 || angle == -270
+  width = rotated ? (computed_height || encoded_height) : encoded_width
+  height = rotated ? encoded_width : (computed_height || encoded_height)
+
+  duration = nil.as(Float64?)
+  if d = field(video, "duration") || field(field(probe, "format"), "duration")
+    f = ruby_float(d)
+    return f if f.is_a?(StorageError)
+    duration = f
+  end
+
+  metadata = {} of String => Any
+  metadata["width"] = Any.new(width) if width
+  metadata["height"] = Any.new(height) if height
+  metadata["duration"] = Any.new(duration) if duration
+  metadata["angle"] = Any.new(angle) if angle
+  metadata["display_aspect_ratio"] = Any.new([Any.new(ratio[0]), Any.new(ratio[1])]) if ratio
+  metadata["audio"] = Any.new(present?(audio))
+  metadata["video"] = Any.new(present?(video))
+  Any.new(metadata)
+end
+
+# `AudioAnalyzer#metadata`: `{ duration:, bit_rate:, sample_rate:, tags:
+# }.compact`.
+pub def audio_metadata(probe : Any) : Any | StorageError
+  audio = stream(probe, "audio")
+  metadata = {} of String => Any
+  if d = field(audio, "duration")
+    f = ruby_float(d)
+    return f if f.is_a?(StorageError)
+    metadata["duration"] = Any.new(f)
+  end
+  ["bit_rate", "sample_rate"].each do |name|
+    if v = field(audio, name)
+      i = ruby_integer(v)
+      return i if i.is_a?(StorageError)
+      metadata[name] = Any.new(i)
+    end
+  end
+  if tags = field(audio, "tags")
+    metadata["tags"] = tags
+  end
+  Any.new(metadata)
+end
+
+def side_data_type(d : Any) : String?
+  t = field(d, "side_data_type")
+  t ? t.as_s? : nil
+end

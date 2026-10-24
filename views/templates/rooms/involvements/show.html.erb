@@ -1,0 +1,5 @@
+<%# reference/app/views/rooms/involvements/show.html.erb, with Rooms::InvolvementsHelper's turbo_frame_for_involvement_tag -%>
+<turbo-frame data-controller="turbo-frame" data-action="notifications:ready@window-&gt;turbo-frame#load" data-turbo-frame-url-param="<%= room_involvement_path(room.id) %>" id="<%= room.dom_id("involvement") %>">
+  <%= button_to_change_involvement(ctx, InvolvementRoom.new(room.id, "rooms_#{room.kind}", room.direct?), involvement) %>
+</turbo-frame>
+

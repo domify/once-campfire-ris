@@ -1,0 +1,149 @@
+# `test/models/room_test.rb`, `rooms/direct_test.rb`, `rooms/open_test.rb`
+module test/models/room_test
+
+import rils/record/sqlite::{SqlValue}
+import rils/record/errors::{RecordInvalid}
+import rils/record/events::{DisconnectUser}
+import test/models/testing::*
+import models/user::{User}
+import models/room::*
+import models/message::{Message, destroy_room}
+import web/web/spec::*
+
+def member_ids(t : TestDb, room_id : Int64) : Array(Int64)
+  found(Room.find(t.conn, room_id)).user_ids(t.conn)
+end
+
+def room(t : TestDb, label : String) : Room
+  found(Room.find(t.conn, id(label)))
+end
+
+describe "rooms" do
+  it "grant membership to a user" do
+    t = TestDb.new
+    watercooler = room(t, "watercooler")
+    t.write { |tx| watercooler.grant_to(tx, [id("kevin")]) }
+    assert member_ids(t, id("watercooler")).includes?(id("kevin"))
+  end
+
+  it "revoke membership from a user" do
+    t = TestDb.new
+    watercooler = room(t, "watercooler")
+    t.write { |tx| watercooler.revoke_from(tx, [id("david")]) }
+    assert !member_ids(t, id("watercooler")).includes?(id("david"))
+    assert t.events.size == 1
+    event = t.events[0]
+    assert event.is_a?(DisconnectUser) && event.user_id == id("david") && event.reconnect
+  end
+
+  it "revise memberships" do
+    t = TestDb.new
+    watercooler = room(t, "watercooler")
+    t.write { |tx| watercooler.revise(tx, [id("kevin")], [id("david")]) }
+    members = member_ids(t, id("watercooler"))
+    assert members.includes?(id("kevin"))
+    assert !members.includes?(id("david"))
+  end
+
+  it "give their users membership when created for them" do
+    t = TestDb.new
+    created = t.write { |tx| Room.create_for(tx, RoomType::Closed, "Hello!", id("david"), [id("kevin"), id("david")]) }
+    members = member_ids(t, created.id)
+    assert members.includes?(id("kevin")) && members.includes?(id("david"))
+  end
+
+  it "know their type" do
+    t = TestDb.new
+    assert room(t, "pets").open?
+    assert !room(t, "pets").direct?
+    assert room(t, "david_and_jason").direct?
+    assert room(t, "designers").closed?
+  end
+
+  it "give new members the default involvement" do
+    t = TestDb.new
+    created = t.write { |tx| Room.create_for(tx, RoomType::Closed, "Hello!", id("david"), [id("kevin"), id("david")]) }
+    memberships = created.memberships(t.conn)
+    assert memberships.size == 2
+    assert memberships.all?(&.involved_in?(Involvement::Mentions))
+  end
+
+  it "have their granted memberships stamped by SQLite" do
+    # insert_all lets SQLite fill the timestamps:
+    # STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW').
+    t = TestDb.new
+    created = t.write { |tx| Room.create_for(tx, RoomType::Closed, "Hello!", id("david"), [id("kevin")]) }
+    created_at = t.conn.query_one("SELECT created_at FROM memberships WHERE room_id = ?", [created.id] of SqlValue) { |row| row.text(0) }
+    assert !created_at.nil? && created_at.bytesize == "2026-09-26 12:25:26.826".bytesize
+  end
+
+  it "keep a direct room's type" do
+    t = TestDb.new
+    direct = room(t, "david_and_jason")
+    result = t.write { |tx| direct.update(tx, room_type: RoomType::Open) }
+    assert result.is_a?(RecordInvalid) && result.errors.on("type") == ["can't be changed for a direct room"]
+  end
+
+  it "destroy their messages and memberships" do
+    t = TestDb.new
+    watercooler = room(t, "watercooler")
+    t.write { |tx| destroy_room(tx, watercooler) }
+    assert Message.for_room(t.conn, id("watercooler")).empty?
+    assert Membership.for_room(t.conn, id("watercooler")).empty?
+    assert Room.find_by_id(t.conn, id("watercooler")).nil?
+    assert t.conn.count("SELECT COUNT(*) FROM boosts WHERE message_id IN (?, ?)", [id("thirteenth"), id("fourth")] of SqlValue) == 0
+  end
+end
+
+describe "direct rooms" do
+  it "are created for the same users" do
+    t = TestDb.new
+    created = t.write { |tx| Room.find_or_create_direct_for(tx, [id("jz"), id("kevin")], id("jz")) }
+    members = member_ids(t, created.id)
+    assert members.includes?(id("jz")) && members.includes?(id("kevin"))
+    assert !members.includes?(id("jason"))
+  end
+
+  it "exist only once for the same users" do
+    t = TestDb.new
+    room1 = t.write { |tx| Room.find_or_create_direct_for(tx, [id("jz"), id("kevin")], id("jz")) }
+    room2 = t.write { |tx| Room.find_or_create_direct_for(tx, [id("kevin"), id("jz")], id("kevin")) }
+    assert room1.id == room2.id
+    existing = t.write { |tx| Room.find_or_create_direct_for(tx, [id("david"), id("kevin")], id("david")) }
+    assert existing.id == id("david_and_kevin")
+  end
+
+  it "involve new users in everything" do
+    t = TestDb.new
+    created = t.write { |tx| Room.find_or_create_direct_for(tx, [id("jz"), id("kevin")], id("jz")) }
+    assert created.memberships(t.conn).all?(&.involved_in?(Involvement::Everything))
+  end
+end
+
+describe "open rooms" do
+  it "grant every user access after creation" do
+    t = TestDb.new
+    created = t.write { |tx| Room.create(tx, RoomType::Open, "My open room with everyone!", id("david")) }
+    assert member_ids(t, created.id).size == User.count(t.conn)
+  end
+
+  it "grant every user access after becoming open" do
+    t = TestDb.new
+    watercooler = room(t, "watercooler")
+    t.write { |tx| watercooler.update(tx, room_type: RoomType::Open) }
+    assert member_ids(t, id("watercooler")).size == User.count(t.conn)
+    assert room(t, "watercooler").room_type.open?
+    stored = t.conn.query_one("SELECT type FROM rooms WHERE id = ?", [id("watercooler")] of SqlValue) { |row| row.text(0) }
+    assert stored == "Rooms::Open"
+  end
+
+  it "scope a user's rooms" do
+    t = TestDb.new
+    david = id("david")
+    assert Room.for_user_of_type(t.conn, david, RoomType::Direct).size == 2
+    assert Room.for_user_without_directs(t.conn, david).size == 4
+    assert Room.find_for_user(t.conn, id("kevin"), id("pets")).nil?
+    names = Membership.visible_with_ordered_room(t.conn, david).map { |pair| pair[1].name }
+    assert tail(names, 4) == ["All Pets", "All Talk", "Designers", "HQ"]
+  end
+end

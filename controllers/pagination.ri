@@ -1,0 +1,106 @@
+# geared_pagination's `set_page_and_extract_portion_from`: a page number
+# from `params[:page]`, records per page by ratio (the last one repeating),
+# and the `X-Total-Count` and `Link` headers for JSON.
+module controllers/pagination
+
+import std/text
+import rils/kit/ctx::{Ctx}
+import rils/kit/errors::{HttpError}
+import rils/kit/params::{decode_www_form_component}
+import rils/ruby/integers::{to_i}
+import rils/ruby/uri::{url_encode}
+
+pub class Page
+  getter number : Int64
+  getter records_count : Int64
+  getter ratios : Array(Int64)
+
+  def initialize(page_param : String?, @records_count : Int64, @ratios : Array(Int64))
+    number = page_param ? to_i(page_param) : 0_i64
+    @number = number < 1 ? 1_i64 : (number > 1_000_000_000 ? 1_000_000_000_i64 : number)
+  end
+
+  def ratio(page_number : Int64) : Int64
+    index = page_number - 1
+    index >= 0 && index < @ratios.size ? @ratios[index.to_i32] : @ratios.last
+  end
+
+  pub def limit : Int64
+    ratio(@number)
+  end
+
+  pub def offset : Int64
+    size = @ratios.size.to_i64
+    variable = 0_i64
+    last_variable = (@number - 1) < (size - 1) ? @number - 1 : size - 1
+    (0_i64...last_variable).each { |index| variable += ratio(index + 1) }
+    fixed_pages = @number - size
+    fixed_pages = 0_i64 if fixed_pages < 0
+    variable + fixed_pages * ratio(size)
+  end
+
+  pub def records(all : Array(T)) : Array(T) forall T
+    start = offset
+    return [] of T if start >= all.size
+    all.skip(start.to_i32).first(limit.to_i32)
+  end
+
+  pub def page_count : Int64
+    count = 0_i64
+    residual = @records_count
+    while residual > 0
+      count += 1
+      residual -= ratio(count)
+    end
+    count < 1 ? 1_i64 : count
+  end
+
+  pub def last? : Bool
+    @number == page_count
+  end
+
+  pub def next_param : Int64
+    @number + 1
+  end
+
+  # For a JSON request: the total, and a `Link` to the next page.
+  pub def apply_headers(c : Ctx) : Nil
+    formats = c.formats
+    return if formats.is_a?(HttpError)
+    first = formats.first?
+    return unless first && first.symbol == "json"
+    c.set_header("x-total-count", @records_count.to_s)
+    c.set_header("link", %(<#{with_page(c.request.url, next_param.to_s)}>; rel="next")) unless last?
+  end
+end
+
+# *url* with its `page` parameter set, the query's keys sorted as
+# `Hash#to_query` writes them.
+pub def with_page(url : String, page : String) : String
+  base, hash, fragment = url.partition('#')
+  path, _, query = base.partition('?')
+  values = [] of Tuple(String, String?)
+  query.split('&').each do |pair|
+    next if pair.empty?
+    key_text, eq, value_text = pair.partition('=')
+    key = unencode(key_text)
+    value = eq.empty? ? nil : unencode(value_text.gsub("+", " "))
+    if at = values.index { |entry| entry[0] == key }
+      values[at] = {key, value}
+    else
+      values << {key, value}
+    end
+  end
+  if at = values.index { |entry| entry[0] == "page" }
+    values[at] = {"page", page.as(String?)}
+  else
+    values << {"page", page.as(String?)}
+  end
+  joined = values.sorted_by(&.[0]).map { |key, value| value ? "#{url_encode(key)}=#{url_encode(value)}" : url_encode(key) }.join("&")
+  hash.empty? ? "#{path}?#{joined}" : "#{path}?#{joined}##{fragment}"
+end
+
+def unencode(text : String) : String
+  decoded = decode_www_form_component(text)
+  decoded.is_a?(String) ? decoded : text
+end

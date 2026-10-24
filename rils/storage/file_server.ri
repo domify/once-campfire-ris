@@ -1,0 +1,105 @@
+# `ActiveStorage::FileServer#serve_file` on `Rack::Files#serving` (rack
+# 3.2): conditional GET on mtime, single and multipart byte ranges, and
+# 416s. The result describes the response; the caller streams the parts.
+module rils/storage/file_server
+
+import std/file
+import std/text
+import std/indexable
+import std/time::{Time}
+import rils/ruby/rack::{byte_ranges}
+import web/web/http_date::{http_date}
+
+pub MULTIPART_BOUNDARY = "AaB03x"
+
+# An inclusive byte range of a file.
+pub struct FilePart
+  getter path : String
+  getter start : Int64
+  getter stop : Int64
+
+  def initialize(@path : String, @start : Int64, @stop : Int64)
+  end
+end
+
+pub alias BodyPart = String | FilePart
+
+pub class Served
+  getter status : Int32
+  # In Rack's order; FileServer sets content-type and
+  # content-disposition last.
+  getter headers : Array(Tuple(String, String))
+  getter body : Array(BodyPart)
+
+  def initialize(@status : Int32, @headers : Array(Tuple(String, String)), @body : Array(BodyPart))
+  end
+
+  def set_header(name : String, value : String) : Nil
+    if i = @headers.index { |h| h[0].downcase == name.downcase }
+      @headers[i] = {@headers[i][0], value}
+    else
+      @headers << {name, value}
+    end
+  end
+
+  def remove_header(name : String) : Nil
+    @headers = @headers.reject { |h| h[0].downcase == name.downcase }
+  end
+end
+
+# `serve_file(path, content_type:, disposition:)` as `DiskController#show`
+# calls it.
+pub def serve_file(method : String, range : String?, if_modified_since : String?, path : String,
+                   content_type : String?, disposition : String?) : Served
+  served = serving(method, range, if_modified_since, path)
+  served.remove_header("x-cascade") if served.status == 416
+  served.set_header("content-type", content_type || "application/octet-stream")
+  served.set_header("content-disposition", disposition || "attachment")
+  served
+end
+
+def serving(method : String, range : String?, if_modified_since : String?, path : String) : Served
+  if method == "OPTIONS"
+    return Served.new(200, [{"allow", "GET, HEAD, OPTIONS"}, {"content-length", "0"}], [] of BodyPart)
+  end
+  info = File.info(path)
+  last_modified = http_date(Time.unix(info.modification_time))
+  return Served.new(304, [] of Tuple(String, String), [] of BodyPart) if if_modified_since == last_modified
+
+  # Disk keys have no extension, so Rack's mime lookup falls back to its
+  # default.
+  mime_type = "text/plain"
+  served = Served.new(200, [{"last-modified", last_modified}, {"content-type", mime_type}], [] of BodyPart)
+  size = File.size(path)
+  ranges = byte_ranges(range, size)
+  status = 200
+  parts = [] of BodyPart
+  if ranges.nil?
+    parts << FilePart.new(path, 0_i64, size > 0 ? size - 1 : 0_i64)
+    length = size
+  elsif ranges.empty?
+    body = "Byte range unsatisfiable\n"
+    return Served.new(416, [{"content-type", "text/plain"}, {"content-length", body.bytesize.to_s},
+      {"x-cascade", "pass"}, {"content-range", "bytes */#{size}"}], [body.as(BodyPart)])
+  else
+    status = 206
+    if ranges.size == 1
+      start, stop = ranges[0]
+      served.headers << {"content-range", "bytes #{start}-#{stop}/#{size}"}
+      parts << FilePart.new(path, start, stop)
+    else
+      served.set_header("content-type", "multipart/byteranges; boundary=#{MULTIPART_BOUNDARY}")
+      ranges.each do |r|
+        parts << "\r\n--#{MULTIPART_BOUNDARY}\r\ncontent-type: #{mime_type}\r\ncontent-range: bytes #{r[0]}-#{r[1]}/#{size}\r\n\r\n"
+        parts << FilePart.new(path, r[0], r[1])
+      end
+      parts << "\r\n--#{MULTIPART_BOUNDARY}--\r\n"
+    end
+    length = 0_i64
+    parts.each do |part|
+      length += part.is_a?(FilePart) ? part.stop - part.start + 1 : part.bytesize.to_i64
+    end
+  end
+  served.headers << {"content-length", length.to_s}
+  Served.new(status, served.headers, method == "HEAD" || size == 0 ? [] of BodyPart : parts)
+end

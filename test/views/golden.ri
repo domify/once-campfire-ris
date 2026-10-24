@@ -1,0 +1,105 @@
+# The views tests' goldens (vectors/views): pages the reference app
+# rendered, and the context each was rendered with.
+module test/views/golden
+
+import std/text
+import std/file::{File}
+import std/json::{JSON, Any}
+import views/context::{ViewContext, AccountSummary, Assets, CurrentUser, Platform}
+
+VECTORS = "#{__DIR__}/../../vectors/views"
+FACTS   = JSON.parse(File.read("#{VECTORS}/facts.json"))
+
+# The facts of case *name*.
+pub def golden_case(name : String) : Any
+  FACTS["cases"][name]
+end
+
+# The context the reference rendered case *name* with: its own asset
+# paths and tags, so the overridden assets' digests are Rails'. Before the
+# first run there is no account; the summary is blank.
+pub def golden_context(name : String, flash_alert : String? = nil) : ViewContext
+  facts = FACTS.as_h
+  paths = {} of String => String
+  facts["assets"].as_h.each { |logical, path| paths[logical] = path.as_s }
+  assets = Assets.new(->(logical : String) { paths[logical]? || raise "unknown asset #{logical}" }, facts["importmap_tags"].as_s, facts["stylesheet_tags"].as_s)
+  c = golden_case(name)
+  account = c["account"]
+  summary = if account.as_h?
+              AccountSummary.new(account["name"].as_s, account["logo_path"].as_s, account["has_logo"].as_bool)
+            else
+              AccountSummary.new("")
+            end
+  custom_styles = account.as_h? ? account["custom_styles"].as_s? : nil
+  current_user = nil.as(CurrentUser?)
+  if user = c.as_h["current_user"]?
+    role = user["role"].as_s
+    current_user = CurrentUser.new(user["id"].as_i64, user["name"].as_s, role == "administrator", role == "bot")
+  end
+  base_url = facts["base_url"].as_s
+  notice = c.as_h["flash_notice"]?
+  ViewContext.new(summary, assets, current_user, flash_notice: notice ? notice.as_s : nil, flash_alert: flash_alert, platform: golden_platform(c["ua"].as_s), vapid_public_key: facts["vapid_public_key"].as_s,
+    custom_styles: custom_styles, base_url: base_url, request_url: base_url + c["path"].as_s, app_version: facts["app_version"].as_s,
+    last_room_visited_id: (room = c.as_h["last_room_visited_id"]?) ? room.as_i64 : nil,
+    referrer: (referrer = c.as_h["referrer"]?) ? referrer.as_s : nil)
+end
+
+# `ApplicationPlatform` for the user agent the reference called *label*.
+pub def golden_platform(label : String) : Platform
+  facts = FACTS["platforms"][label]
+  platform = Platform.new
+  platform.ios = facts["ios"].as_bool
+  platform.android = facts["android"].as_bool
+  platform.mac = facts["mac"].as_bool
+  platform.windows = facts["windows"].as_bool
+  platform.chrome = facts["chrome"].as_bool
+  platform.firefox = facts["firefox"].as_bool
+  platform.safari = facts["safari"].as_bool
+  platform.edge = facts["edge"].as_bool
+  platform.mobile = facts["mobile"].as_bool
+  platform.desktop = facts["desktop"].as_bool
+  platform.apple_messages = facts["apple_messages"].as_bool
+  platform.browser = facts["browser"].as_s? || ""
+  platform.operating_system = facts["operating_system"].as_s? || ""
+  platform
+end
+
+# The user agents the reference rendered the platform cases for.
+pub def golden_platform_labels : Array(String)
+  FACTS["platforms"].as_h.keys
+end
+
+# The golden page *name*, without `csrf_meta_tags` and the forms' hidden
+# `authenticity_token` fields: this app is protected by `Sec-Fetch-Site`
+# and renders none.
+pub def golden_page(name : String) : String
+  without_forgery_tokens(File.read("#{VECTORS}/#{name}.html"))
+end
+
+# A golden that isn't a page (`avatar_david.svg`, `user_json.json`), as
+# the reference wrote it.
+pub def golden_file(name : String, extension : String) : String
+  File.read("#{VECTORS}/#{name}.#{extension}")
+end
+
+def without_forgery_tokens(html : String) : String
+  String.build do |io|
+    at = 0
+    loop do
+      meta = html.index("<meta name=\"csrf-param\"", at)
+      input = html.index("<input type=\"hidden\" name=\"authenticity_token\"", at)
+      found = [meta, input].compact
+      break if found.empty?
+      start = found.sorted[0]
+      io << html[at, start - at]
+      stop = html.index("/>", start) || raise "unclosed tag"
+      stop += 2
+      if start == meta
+        stop = (html.index("/>", stop) || raise "no csrf-token") + 2
+        raise "csrf-token doesn't follow csrf-param" unless html[start, stop - start].includes?("csrf-token")
+      end
+      at = stop
+    end
+    io << html[at, html.bytesize - at]
+  end
+end

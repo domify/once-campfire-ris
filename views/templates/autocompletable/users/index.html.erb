@@ -1,0 +1,3 @@
+<%# reference/app/views/autocompletable/users/index.html.erb -%>
+<% users.each do |user| %><%= PromptItem.new(ctx, user).render %><% end %>
+

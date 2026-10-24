@@ -1,0 +1,12 @@
+<%# reference/app/views/welcome/show.html.erb -%>
+<% content_for "sidebar" do %><%= sidebar_turbo_frame_tag(user_sidebar_path, Html.new("")) %><% end %>
+
+<div id="message-area" class="message-area">
+  <div class="message-area--empty min-width center">
+    <figure class="center pad">
+      <%= image_tag(ctx, "messages-empty.svg", attrs.aria_hidden.class("colorize--black translucent")) %>
+      <span class="for-screen-reader"><%= current_user_name %></span>
+    </figure>
+  </div>
+</div>
+

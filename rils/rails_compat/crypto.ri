@@ -1,0 +1,311 @@
+# The primitives Rails' signing and encryption stand on, from OpenSSL's
+# libcrypto: HMAC, PBKDF2, AES-256-GCM and random bytes, and bcrypt from the
+# system's libcrypt. Binary data travels as a String of bytes.
+@[Ffi]
+module rils/rails_compat/crypto
+import std/text
+import std/int
+import std/static_array
+
+@[Link("crypto")]
+lib LibCrypto
+  fun sha1 = EVP_sha1 : Void*
+  fun sha256 = EVP_sha256 : Void*
+  fun hmac = HMAC(digest : Void*, key : UInt8*, key_size : Int32, data : UInt8*, size : UInt64, output : UInt8*, output_size : UInt32*) : UInt8*
+  fun pbkdf2 = PKCS5_PBKDF2_HMAC(password : UInt8*, password_size : Int32, salt : UInt8*, salt_size : Int32, iterations : Int32, digest : Void*, key_size : Int32, output : UInt8*) : Int32
+  fun sha1_init = SHA1_Init(context : Void*) : Int32
+  fun sha1_update = SHA1_Update(context : Void*, data : UInt8*, size : UInt64) : Int32
+  fun sha1_final = SHA1_Final(output : UInt8*, context : Void*) : Int32
+  fun sha256_init = SHA256_Init(context : Void*) : Int32
+  fun sha256_update = SHA256_Update(context : Void*, data : UInt8*, size : UInt64) : Int32
+  fun sha256_final = SHA256_Final(output : UInt8*, context : Void*) : Int32
+  fun random = RAND_bytes(output : UInt8*, size : Int32) : Int32
+  fun aes_256_gcm = EVP_aes_256_gcm : Void*
+  fun context_new = EVP_CIPHER_CTX_new : Void*
+  fun context_free = EVP_CIPHER_CTX_free(context : Void*) : Void
+  fun context_ctrl = EVP_CIPHER_CTX_ctrl(context : Void*, type : Int32, arg : Int32, pointer : Void*) : Int32
+  fun encrypt_init = EVP_EncryptInit_ex(context : Void*, cipher : Void*, engine : Void*, key : UInt8*, iv : UInt8*) : Int32
+  fun encrypt_update = EVP_EncryptUpdate(context : Void*, output : UInt8*, output_size : Int32*, data : UInt8*, size : Int32) : Int32
+  fun encrypt_final = EVP_EncryptFinal_ex(context : Void*, output : UInt8*, output_size : Int32*) : Int32
+  fun decrypt_init = EVP_DecryptInit_ex(context : Void*, cipher : Void*, engine : Void*, key : UInt8*, iv : UInt8*) : Int32
+  fun decrypt_update = EVP_DecryptUpdate(context : Void*, output : UInt8*, output_size : Int32*, data : UInt8*, size : Int32) : Int32
+  fun decrypt_final = EVP_DecryptFinal_ex(context : Void*, output : UInt8*, output_size : Int32*) : Int32
+end
+
+@[Link("crypt")]
+lib LibXCrypt
+  fun crypt_rn(phrase : UInt8*, setting : UInt8*, data : UInt8*, size : Int32) : UInt8*
+  fun crypt_gensalt_rn(prefix : UInt8*, count : UInt64, random : UInt8*, random_size : Int32, output : UInt8*, output_size : Int32) : UInt8*
+end
+
+GCM_SET_IVLEN = 0x9
+GCM_GET_TAG   = 0x10
+GCM_SET_TAG   = 0x11
+
+pub enum Digest
+  Sha1
+  Sha256
+end
+
+def evp(digest : Digest) : Void*
+  digest.sha1? ? LibCrypto.sha1 : LibCrypto.sha256
+end
+
+pub def digest_size(digest : Digest) : Int32
+  digest.sha1? ? 20 : 32
+end
+
+pub def hmac(digest : Digest, key : String, data : String) : String
+  size = 0_u32
+  String.new(digest_size(digest)) do |output|
+    LibCrypto.hmac(evp(digest), key.to_unsafe, key.bytesize, data.to_unsafe, data.bytesize.to_u64, output, pointerof(size))
+  end
+end
+
+pub def pbkdf2(digest : Digest, password : String, salt : String, iterations : Int32, size : Int32) : String
+  String.new(size) do |output|
+    LibCrypto.pbkdf2(password.to_unsafe, password.bytesize, salt.to_unsafe, salt.bytesize, iterations, evp(digest), size, output)
+  end
+end
+
+pub def random_bytes(size : Int32) : String
+  String.new(size) do |output|
+    raise "RAND_bytes failed" unless LibCrypto.random(output, size) == 1
+  end
+end
+
+# AES-256-GCM with no associated data: the ciphertext and the 16-byte tag.
+pub def gcm_encrypt(key : String, iv : String, plaintext : String) : Tuple(String, String)
+  context = LibCrypto.context_new
+  written = 0
+  LibCrypto.encrypt_init(context, LibCrypto.aes_256_gcm, Pointer(Void).new(0_u64), Pointer(UInt8).new(0_u64), Pointer(UInt8).new(0_u64))
+  LibCrypto.context_ctrl(context, GCM_SET_IVLEN, iv.bytesize, Pointer(Void).new(0_u64))
+  LibCrypto.encrypt_init(context, Pointer(Void).new(0_u64), Pointer(Void).new(0_u64), key.to_unsafe, iv.to_unsafe)
+  ciphertext = String.new(plaintext.bytesize) do |output|
+    LibCrypto.encrypt_update(context, output, pointerof(written), plaintext.to_unsafe, plaintext.bytesize) if plaintext.bytesize > 0
+    LibCrypto.encrypt_final(context, output + written, pointerof(written))
+  end
+  tag = String.new(16) do |output|
+    LibCrypto.context_ctrl(context, GCM_GET_TAG, 16, output.as(Void*))
+  end
+  LibCrypto.context_free(context)
+  {ciphertext, tag}
+end
+
+# The plaintext, or nil when the tag doesn't authenticate it.
+pub def gcm_decrypt(key : String, iv : String, ciphertext : String, tag : String) : String?
+  context = LibCrypto.context_new
+  written = 0
+  LibCrypto.decrypt_init(context, LibCrypto.aes_256_gcm, Pointer(Void).new(0_u64), Pointer(UInt8).new(0_u64), Pointer(UInt8).new(0_u64))
+  LibCrypto.context_ctrl(context, GCM_SET_IVLEN, iv.bytesize, Pointer(Void).new(0_u64))
+  LibCrypto.decrypt_init(context, Pointer(Void).new(0_u64), Pointer(Void).new(0_u64), key.to_unsafe, iv.to_unsafe)
+  authentic = false
+  plaintext = String.new(ciphertext.bytesize) do |output|
+    LibCrypto.decrypt_update(context, output, pointerof(written), ciphertext.to_unsafe, ciphertext.bytesize) if ciphertext.bytesize > 0
+    LibCrypto.context_ctrl(context, GCM_SET_TAG, tag.bytesize, tag.to_unsafe.as(Void*))
+    authentic = LibCrypto.decrypt_final(context, output + written, pointerof(written)) == 1
+  end
+  LibCrypto.context_free(context)
+  authentic ? plaintext : nil
+end
+
+# `crypt(3)` for a bcrypt setting: the digest, or nil for a setting libcrypt
+# refuses.
+pub def bcrypt(password : String, setting : String) : String?
+  data = Pointer(UInt8).malloc(32768)
+  result = LibXCrypt.crypt_rn(password.to_unsafe, setting.to_unsafe, data, 32768)
+  return nil if result.address == 0 || result.value == '*'.ord
+  c_string(result)
+end
+
+# A `$2a$` setting at *cost* with 16 random bytes of salt, or nil for a cost
+# libcrypt refuses.
+pub def bcrypt_setting(cost : Int32) : String?
+  random = random_bytes(16)
+  output = Pointer(UInt8).malloc(64)
+  result = LibXCrypt.crypt_gensalt_rn("$2a$".to_unsafe, cost.to_u64, random.to_unsafe, 16, output, 64)
+  result.address == 0 ? nil : c_string(result)
+end
+
+# `ActiveSupport::SecurityUtils.secure_compare`-style comparison (length
+# leaks, contents don't).
+pub def constant_time_eq?(a : String, b : String) : Bool
+  return false unless a.bytesize == b.bytesize
+  difference = 0_u8
+  a.bytesize.times { |i| difference |= a.as_tape[i] ^ b.as_tape[i] }
+  difference == 0
+end
+
+# An HMAC key worked out once: the digest's state after the inner and the
+# outer pad. A sum copies them onto the stack, so it allocates nothing and
+# threads can share the key. OpenSSL's one-shot `HMAC` looks the digest up,
+# allocates and sets up the pads on every call, several times the hash
+# itself for a cookie.
+pub class HmacKey
+  BLOCK = 64
+
+  getter digest : Digest
+  # SHA_CTX is 96 bytes and SHA256_CTX 112, both 4-byte aligned.
+  @inner : UInt64[14]
+  @outer : UInt64[14]
+
+  def initialize(@digest : Digest, key : String)
+    key = hmac_digest(@digest, key) if key.bytesize > BLOCK
+    @inner = padded(key, 0x36_u8)
+    @outer = padded(key, 0x5c_u8)
+  end
+
+  # The digest's state after *key*, zero-filled to a block, each byte
+  # xored with *mask*.
+  def padded(key : String, mask : UInt8) : UInt64[14]
+    pad = uninitialized UInt8[64]
+    BLOCK.times { |i| pad[i] = (i < key.bytesize ? key.as_tape[i] : 0_u8) ^ mask }
+    state = uninitialized UInt64[14]
+    context = pointerof(state).as(Void*)
+    init(context)
+    update(context, pointerof(pad).as(UInt8*), BLOCK)
+    state
+  end
+
+  # The HMAC of *data*'s first *size* bytes into *output*, digest-size
+  # bytes.
+  def sum(data : String, size : Int32, output : UInt8*) : Nil
+    inner = uninitialized UInt8[32]
+    state = @inner
+    context = pointerof(state).as(Void*)
+    update(context, data.to_unsafe, size)
+    finish(pointerof(inner).as(UInt8*), context)
+    state = @outer
+    update(context, pointerof(inner).as(UInt8*), digest_size(@digest))
+    finish(output, context)
+  end
+
+  def init(context : Void*) : Nil
+    @digest.sha1? ? LibCrypto.sha1_init(context) : LibCrypto.sha256_init(context)
+  end
+
+  def update(context : Void*, data : UInt8*, size : Int32) : Nil
+    if @digest.sha1?
+      LibCrypto.sha1_update(context, data, size.to_u64)
+    else
+      LibCrypto.sha256_update(context, data, size.to_u64)
+    end
+  end
+
+  def finish(output : UInt8*, context : Void*) : Nil
+    @digest.sha1? ? LibCrypto.sha1_final(output, context) : LibCrypto.sha256_final(output, context)
+  end
+end
+
+# The plain digest of *data*, for a key longer than a block.
+def hmac_digest(digest : Digest, data : String) : String
+  String.new(digest_size(digest)) do |output|
+    state = uninitialized UInt64[14]
+    context = pointerof(state).as(Void*)
+    if digest.sha1?
+      LibCrypto.sha1_init(context)
+      LibCrypto.sha1_update(context, data.to_unsafe, data.bytesize.to_u64)
+      LibCrypto.sha1_final(output, context)
+    else
+      LibCrypto.sha256_init(context)
+      LibCrypto.sha256_update(context, data.to_unsafe, data.bytesize.to_u64)
+      LibCrypto.sha256_final(output, context)
+    end
+  end
+end
+
+# Whether *expected* is the lowercase hex HMAC of *data*'s first *size*
+# bytes, compared in constant time, the HMAC worked out on the stack:
+# nothing is allocated.
+pub def hmac_hex_matches?(
+  key : HmacKey,
+  data : String,
+  size : Int32,
+  expected : Str,
+) : Bool
+  return false unless 0 <= size <= data.bytesize
+  length = digest_size(key.digest)
+  return false unless expected.bytesize == length * 2
+  storage = uninitialized UInt8[32]
+  key.sum(data, size, pointerof(storage).as(UInt8*))
+  digits = "0123456789abcdef"
+  difference = 0_u8
+  length.times do |i|
+    byte = storage[i]
+    difference |= expected[2 * i] ^ digits.as_tape[(byte >> 4).to_i32]
+    difference |= expected[2 * i + 1] ^ digits.as_tape[(byte & 15).to_i32]
+  end
+  difference == 0
+end
+
+pub def hex(data : String) : String
+  digits = "0123456789abcdef"
+  String.build(data.bytesize * 2) do |io|
+    data.each_byte do |byte|
+      io.write_byte(digits.as_tape[(byte >> 4).to_i32])
+      io.write_byte(digits.as_tape[(byte & 15).to_i32])
+    end
+  end
+end
+
+# The NUL-terminated bytes at *pointer*.
+def c_string(pointer : Pointer(UInt8)) : String
+  size = 0
+  while pointer[size] != 0
+    size += 1
+  end
+  String.new(size) { |output| size.times { |i| output[i] = pointer[i] } }
+end
+
+# Random bytes drawn 4 KB at a time, per thread: a request id is not a
+# secret, and one `RAND_bytes` a request was 1.2 % of it. Bytes only, as
+# the collector does not scan a thread-local.
+class RandomPool
+  SIZE = 4096
+
+  @[ThreadLocal]
+  @@bytes = uninitialized UInt8[4096]
+  # Zero in a new thread: the pool is drawn first.
+  @[ThreadLocal]
+  @@left = 0
+
+  # 16 bytes, on the stack.
+  def self.take16 : UInt8[16]
+    if @@left < 16
+      raise "RAND_bytes failed" unless LibCrypto.random(@@bytes.to_unsafe, SIZE) == 1
+      @@left = SIZE
+    end
+    @@left -= 16
+    bytes = uninitialized UInt8[16]
+    16.times { |i| bytes[i] = @@bytes[@@left + i] }
+    bytes
+  end
+end
+
+# `SecureRandom.uuid`: version 4, variant 1.
+# `uuid` written into *io*: its random bytes on the stack, its hex digits
+# where *io* writes, no string made.
+pub def write_uuid(io : Str::Builder) : Nil
+  bytes = RandomPool.take16
+  bytes[6] = (bytes[6] & 0x0f) | 0x40
+  bytes[8] = (bytes[8] & 0x3f) | 0x80
+  digits = "0123456789abcdef".as_tape
+  16.times do |i|
+    io.push(45_u8) if i == 4 || i == 6 || i == 8 || i == 10
+    io.push(digits[(bytes[i] >> 4).to_i32])
+    io.push(digits[(bytes[i] & 15).to_i32])
+  end
+end
+
+pub def uuid : String
+  bytes = random_bytes(16)
+  text = hex(String.build(16) do |io|
+    16.times do |i|
+      byte = bytes.as_tape[i]
+      byte = (byte & 0x0f) | 0x40 if i == 6
+      byte = (byte & 0x3f) | 0x80 if i == 8
+      io.write_byte(byte)
+    end
+  end)
+  "#{text[0, 8]}-#{text[8, 4]}-#{text[12, 4]}-#{text[16, 4]}-#{text[20, 12]}"
+end

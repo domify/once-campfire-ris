@@ -1,0 +1,38 @@
+# Broadcasting names: `Channel::Naming#channel_name`,
+# `Channel::Broadcasting#broadcasting_for` and Turbo's `stream_name_from`.
+#
+# Callers pass each streamable already converted with `to_gid_param`
+# (records, see `gid_param`) or `to_param` (symbols and strings, which are
+# themselves).
+module rils/cable/naming
+
+import std/text
+import rils/rails_compat/global_id::{GlobalId}
+import rils/rails_compat/signed_id::{underscore}
+
+# `GlobalID#to_param`: the URL-safe, unpadded Base64 of `gid://app/Model/id`.
+# Records use their STI class name, e.g. `Rooms::Open`.
+pub def gid_param(gid : GlobalId) : String
+  gid.to_param
+end
+
+# `ActionCable::Channel::Naming.channel_name`:
+# `name.delete_suffix("Channel").gsub("::", ":").underscore` (no acronym
+# inflections; Campfire defines none).
+pub def channel_name(class_name : String) : String
+  base = class_name.ends_with?("Channel") ? class_name[0, class_name.bytesize - 7] : class_name
+  underscore(base.gsub("::", ":"))
+end
+
+# `Channel::Broadcasting.broadcasting_for`: the channel name followed by each
+# broadcastable, joined with `:`. `stream_for @room` in `RoomChannel` streams
+# from `room:<gid param>`.
+pub def broadcasting_for(class_name : String, broadcastables : Array(String)) : String
+  ([channel_name(class_name)] + broadcastables).join(":")
+end
+
+# `Turbo::Streams::StreamName#stream_name_from`: `turbo_stream_from @room,
+# :messages` names the stream `<room gid param>:messages`.
+pub def stream_name_from(streamables : Array(String)) : String
+  streamables.join(":")
+end

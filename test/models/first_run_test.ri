@@ -1,0 +1,54 @@
+# `test/models/first_run_test.rb`
+module test/models/first_run_test
+
+import test/models/testing::*
+import models/user::{User, PasswordDigest}
+import models/room::{Room}
+import models/first_run::{first_run}
+import web/web/spec::*
+
+def fresh : TestDb
+  t = TestDb.new
+  # Account.destroy_all, Room.destroy_all, User.destroy_all
+  t.write do |tx|
+    tx.conn.execute_batch("DELETE FROM accounts; DELETE FROM boosts; DELETE FROM action_text_rich_texts; DELETE FROM messages; DELETE FROM memberships; DELETE FROM rooms; DELETE FROM sessions; DELETE FROM searches; DELETE FROM push_subscriptions; DELETE FROM webhooks; DELETE FROM bans; DELETE FROM users;")
+  end
+  t
+end
+
+def create_first_run_user(t : TestDb) : User
+  digest = PasswordDigest.create("secret123456", 4)
+  t.write { |tx| first_run(tx, "User", "user@example.com", digest) }
+end
+
+describe "first run" do
+  it "makes the first user an administrator" do
+    assert create_first_run_user(fresh).administrator?
+  end
+
+  it "gives the first user the first room" do
+    t = fresh
+    user = create_first_run_user(t)
+    rooms = Room.for_user(t.conn, user.id)
+    assert rooms.size == 1
+    assert rooms[0].name == "All Talk"
+  end
+
+  it "makes the first room an open one" do
+    t = fresh
+    create_first_run_user(t)
+    room = Room.original(t.conn)
+    assert !room.nil? && room.open?
+  end
+
+  it "lets the first user sign in" do
+    t = fresh
+    create_first_run_user(t)
+    found_user = User.find_active_by_email_address(t.conn, "user@example.com")
+    assert !User.authenticated(found_user, "secret123456").nil?
+    assert User.authenticated(found_user, "wrong").nil?
+    assert User.authenticated(found_user, "").nil?
+    missing = User.find_active_by_email_address(t.conn, "nobody@example.com")
+    assert User.authenticated(missing, "secret123456").nil?
+  end
+end

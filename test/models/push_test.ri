@@ -1,0 +1,160 @@
+# `test/models/room/push_test.rb` (who gets pushed; delivery is the app's)
+# and `test/models/push/subscription_test.rb` (validation and endpoint
+# pinning).
+module test/models/push_test
+
+import rils/rails_compat/json::{generate_string}
+import rils/record/sqlite::{Connection}
+import test/models/testing::*
+import rils/record/errors::{RecordInvalid}
+import models/room::{Membership, Involvement}
+import models/message::{Message, NewMessage}
+import models/push_subscription::*
+import web/web/spec::*
+
+WEB_PUSH_PUBLIC_TEST_IP = "142.250.185.206"
+
+# A body's rich text, mentioning these users.
+class Mentions < BasicRichText
+  @ids : Array(Int64)
+
+  def initialize(@ids : Array(Int64))
+  end
+
+  pub def mentioned_user_ids(conn : Connection, html : String) : Array(Int64)
+    @ids
+  end
+end
+
+# How many deliveries `Room::MessagePusher#push` would queue for a new
+# message.
+def deliveries(t : TestDb, room : String, body : String, mentioned : Array(Int64)) : Int32
+  message = t.write { |tx| Message.create(tx, NewMessage.new(id(room), id("david"), "earth", body)) }
+  pushes = found(Pushes.for(t.conn, Mentions.new(mentioned), message, t.now))
+  pushes.everything.size + pushes.mentions.size
+end
+
+def build(endpoint : String) : PushSubscription
+  PushSubscription.build(id("david"), endpoint, "test_key", "test_auth", nil)
+end
+
+PUBLIC  = ->(host : String) { WEB_PUSH_PUBLIC_TEST_IP.as(String?) }
+PRIVATE = ->(host : String) { nil.as(String?) }
+
+def errors(subscription : PushSubscription, resolve : Resolver) : Array(String)
+  subscription.validate(resolve).on("endpoint")
+end
+
+describe "pushes" do
+  it "go to the room's other users with subscriptions" do
+    t = TestDb.new
+    all = PushSubscription.count(t.conn)
+    davids = PushSubscription.for_user(t.conn, id("david")).size
+    assert deliveries(t, "hq", "This is from earth", [] of Int64) == all - davids
+  end
+
+  it "notify subscribed users" do
+    t = TestDb.new
+    assert deliveries(t, "designers", "This is from earth", [] of Int64) == 2
+    assert deliveries(t, "designers", "Hey @Kevin", [id("kevin")]) == 3
+  end
+
+  it "skip connected rooms" do
+    t = TestDb.new
+    t.write { |tx| found(Membership.find(tx.conn, id("kevin_designers"))).connected(tx) }
+    assert deliveries(t, "designers", "Hey @Kevin", [id("kevin")]) == 2
+  end
+
+  it "skip invisible rooms" do
+    t = TestDb.new
+    t.write { |tx| found(Membership.find(tx.conn, id("kevin_designers"))).update_involvement(tx, Involvement::Invisible) }
+    assert deliveries(t, "designers", "Hey @Kevin", [id("kevin")]) == 2
+  end
+
+  it "carry payloads" do
+    t = TestDb.new
+    message = t.write { |tx| Message.create(tx, NewMessage.new(id("designers"), id("david"), body: "Hi")) }
+    payload = found(PushSubscription.payload_for(t.conn, BasicRichText.new, found(message.room(t.conn)), message))
+    assert payload.title == "Designers" && payload.body == "David: Hi"
+    assert payload.path == "/rooms/#{id("designers")}"
+
+    message = t.write { |tx| Message.create(tx, NewMessage.new(id("david_and_jason"), id("david"), body: "Hi")) }
+    payload = found(PushSubscription.payload_for(t.conn, BasicRichText.new, found(message.room(t.conn)), message))
+    assert payload.title == "David" && payload.body == "Hi"
+  end
+
+  it "cut long payloads short to fit a push message" do
+    t = TestDb.new
+    body = "é" * 1000 + "\"" + "x" * 2000
+    message = t.write { |tx| Message.create(tx, NewMessage.new(id("designers"), id("david"), body: body)) }
+    payload = found(PushSubscription.payload_for(t.conn, BasicRichText.new, found(message.room(t.conn)), message))
+    json_length = generate_string(payload.body).bytesize - 2
+    assert payload.body.starts_with?("David: éé")
+    assert payload.body.ends_with?("xx…")
+    assert json_length <= MAX_PAYLOAD_BODY_BYTES
+    assert json_length > MAX_PAYLOAD_BODY_BYTES - 4
+  end
+end
+
+describe "push subscriptions" do
+  it "are valid with a permitted endpoint" do
+    assert errors(build("https://fcm.googleapis.com/fcm/send/abc123"), PUBLIC).empty?
+  end
+
+  it "refuse a non-HTTPS endpoint" do
+    assert errors(build("http://fcm.googleapis.com/fcm/send/abc123"), PUBLIC).includes?("must use HTTPS")
+  end
+
+  it "refuse a host that isn't permitted" do
+    assert errors(build("https://attacker.example.com/webhook"), PUBLIC).includes?("is not a permitted push service")
+  end
+
+  it "refuse a host that only suffix-matches a permitted one" do
+    assert errors(build("https://evilfcm.googleapis.com.attacker.example/webhook"), PUBLIC).includes?("is not a permitted push service")
+  end
+
+  it "refuse a blank endpoint" do
+    assert errors(build(""), PUBLIC).includes?("can't be blank")
+  end
+
+  it "refuse a non-default port" do
+    assert errors(build("https://fcm.googleapis.com:8443/fcm/send/abc123"), PUBLIC).includes?("must use the default HTTPS port")
+  end
+
+  it "refuse an endpoint resolving to a private address" do
+    subscription = build("https://fcm.googleapis.com/fcm/send/abc123")
+    assert errors(subscription, PRIVATE).includes?("resolves to a private or invalid IP address")
+    assert subscription.resolved_endpoint_ip(PRIVATE).nil?
+  end
+
+  it "pin the public address" do
+    assert build("https://fcm.googleapis.com/fcm/send/abc123").resolved_endpoint_ip(PUBLIC) == WEB_PUSH_PUBLIC_TEST_IP
+  end
+
+  it "skip delivery for a host or port that isn't permitted" do
+    assert build("https://attacker.example.com/collect").resolved_endpoint_ip(PUBLIC).nil?
+    assert build("https://fcm.googleapis.com:22/fcm/send/abc123").resolved_endpoint_ip(PUBLIC).nil?
+  end
+
+  it "accept every permitted push service" do
+    ["https://fcm.googleapis.com/fcm/send/token123", "https://jmt17.google.com/fcm/send/token123", "https://updates.push.services.mozilla.com/wpush/v2/token123", "https://web.push.apple.com/QaBC123", "https://wns2-db5p.notify.windows.com/w/?token=abc123"].each do |endpoint|
+      assert errors(build(endpoint), PUBLIC).empty?, endpoint
+    end
+  end
+
+  it "validate on create" do
+    t = TestDb.new
+    assert t.write { |tx| PushSubscription.create(tx, build("http://fcm.googleapis.com/x"), PUBLIC) }.is_a?(RecordInvalid)
+    created = t.write { |tx| PushSubscription.create(tx, build("https://fcm.googleapis.com/x"), PUBLIC) }
+    raise "invalid" unless created.is_a?(PushSubscription)
+    assert found(PushSubscription.find(t.conn, created.id)).endpoint == "https://fcm.googleapis.com/x"
+  end
+
+  it "truncate by JSON-escaped length" do
+    assert truncate_json_string("short", 5) == "short"
+    assert truncate_json_string("longer", 5) == "lo…"
+    assert truncate_json_string("\u0001" * 10, 16) == "\u0001" * 2 + "…"
+    assert truncate_json_string("\"\"\"", 5) == "\"…"
+    assert truncate_json_string("😀😀", 7) == "😀…"
+  end
+end

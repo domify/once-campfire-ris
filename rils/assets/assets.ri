@@ -1,0 +1,28 @@
+# Propshaft's digested asset paths and the layout's asset tags, from the
+# reference's load path (`assets/pipeline`), worked out once at boot.
+module rils/assets/assets
+
+import std/text
+import rils/assets/pipeline::{LoadPath, PREFIX, stylesheet_link_tag_all}
+import rils/assets/importmap::{javascript_importmap_tags}
+
+RAILS_ROOT = "#{__DIR__}/../../reference"
+
+pub class Digests
+  getter load_path : LoadPath
+  getter importmap_tags : String
+  getter stylesheet_tags : String
+  getter stylesheet_preload_links : Array(String)
+
+  def initialize(@load_path : LoadPath = LoadPath.reference)
+    @importmap_tags = javascript_importmap_tags(@load_path, RAILS_ROOT)
+    stylesheets = stylesheet_link_tag_all(@load_path, [{"data-turbo-track", "reload"}])
+    @stylesheet_tags = stylesheets.html
+    @stylesheet_preload_links = stylesheets.preload_links
+  end
+
+  pub def path(logical_path : String) : String
+    index = @load_path.find(logical_path) || raise "The asset '#{logical_path}' was not found in the load path."
+    "#{PREFIX}/#{@load_path.digested_path(index)}"
+  end
+end

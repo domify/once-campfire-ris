@@ -1,0 +1,41 @@
+# Views for `reference/app/views/autocompletable/users`: the prompt items the
+# editor's autocomplete offers for users.
+module views/autocompletable
+
+import rils/template/template::{Template}
+import views/context::{ViewContext}
+import views/helpers/users::{avatar_tag}
+import views/users::{Mention, MentionUser}
+import rils/template/html::{escape}
+import std/json::{Any}
+import rils/rails_compat/json::{encode}
+
+# `autocompletable/users/index.html.erb`: a prompt item per user.
+pub class UsersIndex
+  getter ctx : ViewContext
+  getter users : Array(MentionUser)
+
+  def initialize(@ctx : ViewContext, @users : Array(MentionUser))
+  end
+
+  Template.def_render("autocompletable/users/index.html.erb")
+end
+
+# `autocompletable/users/_prompt_item.html.erb`.
+pub class PromptItem
+  getter ctx : ViewContext
+  getter user : MentionUser
+
+  def initialize(@ctx : ViewContext, @user : MentionUser)
+  end
+
+  Template.def_render("autocompletable/users/_prompt_item.html.erb")
+end
+
+# `autocompletable/users/index.json.jbuilder` with its `_user` partial: the
+# name HTML-escaped (`h(user.name)`), the avatar as a full URL.
+pub def users_index_json(ctx : ViewContext, users : Array(MentionUser)) : String
+  encode(Any.new(users.map do |user|
+    Any.new({"name" => Any.new(escape(user.name)), "value" => Any.new(user.id), "avatar_url" => Any.new(ctx.url(user.avatar_path)), "sgid" => Any.new(user.attachable_sgid)})
+  end))
+end

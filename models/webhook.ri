@@ -1,0 +1,53 @@
+# `reference/app/models/webhook.rb`: the row. The payload is built where the
+# message is known (`db/models/message`), and delivery (HTTP, replies) lives
+# in the app.
+module models/webhook
+
+import rils/record/sqlite::{Connection, Row, SqlValue}
+import rils/record/timestamp::{Timestamp}
+import rils/record/database::{Tx}
+
+# `Webhook::ENDPOINT_TIMEOUT`
+pub ENDPOINT_TIMEOUT_SECONDS = 7
+
+WEBHOOK_COLUMNS = %("webhooks"."id", "webhooks"."user_id", "webhooks"."url", "webhooks"."created_at", "webhooks"."updated_at")
+
+pub class Webhook
+  getter id : Int64
+  getter user_id : Int64
+  getter url : String?
+  getter created_at : Timestamp
+  getter updated_at : Timestamp
+
+  def initialize(@id : Int64, @user_id : Int64, @url : String?, @created_at : Timestamp, @updated_at : Timestamp)
+  end
+
+  def self.from_row(row : Row) : Webhook
+    Webhook.new(row.int(0), row.int(1), row.text?(2), row.time(3), row.time(4))
+  end
+
+  pub def self.find_by_user(conn : Connection, user_id : Int64) : Webhook?
+    conn.query_one(%(SELECT #{WEBHOOK_COLUMNS} FROM "webhooks" WHERE "webhooks"."user_id" = ? LIMIT 1), [user_id] of SqlValue) { |row| Webhook.from_row(row) }
+  end
+
+  # `create_webhook!(url:)`
+  pub def self.create(tx : Tx, user_id : Int64, url : String?) : Webhook
+    now = tx.now
+    id = tx.conn.query_one(%(INSERT INTO "webhooks" ("created_at", "updated_at", "url", "user_id") VALUES (?, ?, ?, ?) RETURNING "id"), [now, now, url, user_id] of SqlValue) { |row| row.int(0) }
+    raise "insert into webhooks returned no id" unless id
+    Webhook.new(id, user_id, url, now, now)
+  end
+
+  # `webhook.update!(url:)`
+  pub def update_url(tx : Tx, url : String) : Nil
+    return if @url == url
+    now = tx.now
+    tx.conn.execute(%(UPDATE "webhooks" SET "updated_at" = ?, "url" = ? WHERE "webhooks"."id" = ?), [now, url, @id] of SqlValue)
+    @url = url
+    @updated_at = now
+  end
+
+  pub def destroy(tx : Tx) : Nil
+    tx.conn.execute(%(DELETE FROM "webhooks" WHERE "webhooks"."id" = ?), [@id] of SqlValue)
+  end
+end

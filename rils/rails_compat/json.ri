@@ -1,0 +1,157 @@
+# The JSON Rails writes: the json gem's `JSON.generate`, and
+# `ActiveSupport::JSON.encode` on top of it, which messages, cookies, Action
+# Cable, Jbuilder views, webhooks and Active Storage use. Both emit keys in
+# insertion order, which `Hash` keeps.
+#
+# The json gem (2.21.2 in the reference) escapes the quote, the backslash and
+# control characters (in lowercase hex) and leaves `/` and DEL alone. Floats
+# are laid out its own way (see `float`).
+module rils/rails_compat/json
+
+pub import std/json
+import std/json::{JSON, Any}
+import std/text
+import std/int
+
+pub alias Value = Any
+
+# `::JSON.generate` / `JSON.dump`: plain JSON, non-ASCII left as UTF-8.
+pub def generate(value : Value) : String
+  String.build { |io| write(io, value, false) }
+end
+
+# `ActiveSupport::JSON.encode` with `escape_html_entities_in_json` (the
+# default): like `JSON.generate`, plus `<`, `>` and `&` escaped as `<`,
+# `>` and `&`. U+2028/U+2029 are *not* escaped: `load_defaults`
+# 8.1+ turns `escape_js_separators_in_json` off.
+pub def encode(value : Value) : String
+  String.build { |io| write(io, value, true) }
+end
+
+# A string as `ActiveSupport::JSON.encode` writes it.
+pub def encode_string(text : String) : String
+  String.build(text.bytesize + 2) { |io| write_string(io, text, true) }
+end
+
+# A string as `JSON.generate` writes it.
+pub def generate_string(text : String) : String
+  String.build(text.bytesize + 2) { |io| write_string(io, text, false) }
+end
+
+# `JSON.parse`; nil for anything that isn't a JSON document.
+pub def parse(text : String) : Value?
+  JSON.parse?(text)
+end
+
+pub def string(text : String) : Value
+  Any.new(text)
+end
+
+pub def null : Value
+  Any.new(nil)
+end
+
+def write(io : String::Builder, value : Value, html : Bool) : Nil
+  raw = value.raw
+  case raw
+  when Nil     then io << "null"
+  when Bool    then io << (raw ? "true" : "false")
+  when Int64   then io << raw
+  when Float64 then io << float(raw)
+  when String  then write_string(io, raw, html)
+  when Array(Any)
+    io << '['
+    raw.each_with_index do |item, i|
+      io << ',' if i > 0
+      write(io, item, html)
+    end
+    io << ']'
+  when Hash(String, Any)
+    io << '{'
+    first = true
+    raw.each do |key, item|
+      io << ',' unless first
+      first = false
+      write_string(io, key, html)
+      io << ':'
+      write(io, item, html)
+    end
+    io << '}'
+  end
+end
+
+HEX = "0123456789abcdef"
+
+def write_string(io : String::Builder, text : String, html : Bool) : Nil
+  io << '"'
+  text.each_byte do |byte|
+    if byte == '"'.ord
+      io << "\\\""
+    elsif byte == '\\'.ord
+      io << "\\\\"
+    elsif byte == '\n'.ord
+      io << "\\n"
+    elsif byte == '\r'.ord
+      io << "\\r"
+    elsif byte == '\t'.ord
+      io << "\\t"
+    elsif byte == 8
+      io << "\\b"
+    elsif byte == 12
+      io << "\\f"
+    elsif byte < 0x20
+      io << "\\u00"
+      io.write_byte(HEX.as_tape[(byte >> 4).to_i32])
+      io.write_byte(HEX.as_tape[(byte & 15).to_i32])
+    elsif html && byte == '<'.ord
+      io << "\\u003c"
+    elsif html && byte == '>'.ord
+      io << "\\u003e"
+    elsif html && byte == '&'.ord
+      io << "\\u0026"
+    else
+      io.write_byte(byte)
+    end
+  end
+  io << '"'
+end
+
+# A float as the json gem writes it, which is not `Float#to_s`: json
+# 2.21.2's `fpconv_dtoa` (`ext/json/ext/vendor/fpconv.c`, `emit_digits`)
+# writes `1e15` as `1e+15` and `1e-5` as `0.00001`. A non-finite float is
+# `null`, as `ActiveSupport::JSON` writes it (`Float#as_json`).
+pub def float(f : Float64) : String
+  return "null" if f != f || f - f != 0.0
+  sign = f < 0.0 || (f == 0.0 && 1.0 / f < 0.0) ? "-" : ""
+  return "#{sign}0.0" if f == 0.0
+  # The shortest round-trip digits, and fpconv's `K`: the power of ten of
+  # the last digit.
+  text = f.abs.to_s
+  mantissa, _, power = text.partition('e')
+  exponent = power.empty? ? 0 : power.lchop('+').to_i
+  whole, _, fraction = mantissa.partition('.')
+  digits = whole + fraction
+  point = whole.bytesize + exponent
+  lead = 0
+  while lead < digits.bytesize - 1 && digits.as_tape[lead] == '0'.ord
+    lead += 1
+  end
+  digits = digits[lead, digits.bytesize - lead].rstrip('0')
+  digits = "0" if digits.empty?
+  point -= lead
+  exponent = point - 1
+  k = exponent + 1 - digits.bytesize
+  body = if k >= 0 && exponent < 15
+           "#{digits}#{"0" * k}.0"
+         elsif k < 0 && (k > -7 || exponent.abs < 10)
+           if point <= 0
+             "0.#{"0" * -point}#{digits}"
+           else
+             "#{digits[0, point]}.#{digits[point, digits.bytesize - point]}"
+           end
+         else
+           fraction_part = digits.bytesize > 1 ? ".#{digits[1, digits.bytesize - 1]}" : ""
+           "#{digits[0, 1]}#{fraction_part}e#{exponent < 0 ? '-' : '+'}#{exponent.abs}"
+         end
+  "#{sign}#{body}"
+end

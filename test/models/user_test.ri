@@ -1,0 +1,254 @@
+# `test/models/user_test.rb`, `user/bot_test.rb`, `user/role_test.rb`, plus
+# Bannable.
+module test/models/user_test
+
+import rils/record/sqlite::{SqlValue}
+import rils/record/errors::{RecordInvalid}
+import rils/record/events::{DisconnectUser, RemoveBannedContent, DeliverWebhook}
+import test/models/testing::*
+import models/user::*
+import models/room::{Room, RoomType, Membership, Involvement}
+import models/message::{Message, remove_banned_content, webhook_payload}
+import models/session::{Session}
+import models/search::{Search}
+import models/ban::{Ban}
+import models/webhook::{Webhook}
+import models/push_subscription::{PushSubscription}
+import web/web/spec::*
+
+def user(t : TestDb, label : String) : User
+  found(User.find(t.conn, id(label)))
+end
+
+def create_new_user(t : TestDb) : User
+  digest = PasswordDigest.create("secret123456", 4)
+  t.write { |tx| User.create(tx, NewUser.new("User", "user@example.com", digest)) }
+end
+
+# *user* with another name, bio or role, as an unsaved change would have it.
+def changed(user : User, name : String? = nil, bio : String? = nil, role : Role? = nil) : User
+  User.new(user.id, name || user.name, user.email_address, user.password_digest, role || user.role, user.status, bio || user.bio, user.bot_token, user.created_at, user.updated_at)
+end
+
+describe "users" do
+  it "take very long passwords" do
+    t = TestDb.new
+    david = user(t, "david")
+    t.write { |tx| david.update(tx, UserChanges.new(password_digest: PasswordDigest.create("secret" * 50, 4))) }
+    assert user(t, "david").authenticate?("secret" * 50)
+  end
+
+  it "get the open rooms when created" do
+    t = TestDb.new
+    before = Membership.count(t.conn)
+    open_rooms = Room.count_of_type(t.conn, RoomType::Open)
+    created = create_new_user(t)
+    assert Membership.count(t.conn) == before + open_rooms
+    # grant_membership_to_open_rooms leaves involvement to the column
+    # default.
+    assert Membership.for_user(t.conn, created.id).all?(&.involved_in?(Involvement::Mentions))
+  end
+
+  it "are members when created after the first" do
+    created = create_new_user(TestDb.new)
+    assert created.member?
+    assert created.active?
+    digest = created.password_digest
+    assert !digest.nil? && digest.starts_with?("$2a$04$")
+  end
+
+  it "lose push subscriptions, searches, non-direct memberships and their email address when deactivated" do
+    t = TestDb.new
+    david = id("david")
+    memberships = Membership.count(t.conn)
+    without_directs = Membership.count_without_direct_rooms(t.conn, david)
+    subscriptions = PushSubscription.count(t.conn)
+    davids_subscriptions = PushSubscription.for_user(t.conn, david).size
+    searches = Search.count(t.conn)
+    davids_searches = Search.count_for_user(t.conn, david)
+
+    deactivated = user(t, "david")
+    t.write { |tx| deactivated.deactivate(tx) }
+
+    assert Membership.count(t.conn) == memberships - without_directs
+    assert PushSubscription.count(t.conn) == subscriptions - davids_subscriptions
+    assert Search.count(t.conn) == searches - davids_searches
+
+    reloaded = found(User.find(t.conn, david))
+    email = reloaded.email_address || ""
+    assert email.starts_with?("david-deactivated-") && email.ends_with?("@37signals.com"), email
+    assert email.bytesize == "david-deactivated-2e7de450-cf04-4fa8-9b02-ff5ab2d733e7@37signals.com".bytesize
+    assert reloaded.status.deactivated?
+    assert t.events.size == 1
+    event = t.events[0]
+    assert event.is_a?(DisconnectUser) && event.user_id == david && !event.reconnect
+  end
+
+  it "lose their sessions when deactivated" do
+    t = TestDb.new
+    assert Session.count_for_user(t.conn, id("david")) == 1
+    david = user(t, "david")
+    t.write { |tx| david.deactivate(tx) }
+    assert Session.count_for_user(t.conn, id("david")) == 0
+  end
+
+  it "have initials and a title" do
+    t = TestDb.new
+    jz = user(t, "jz")
+    assert jz.initials == "J"
+    assert jz.title == "JZ – Designer"
+    assert user(t, "bender").initials == "BB"
+    assert changed(jz, name: "Émile Zola").initials == "Z", "Ruby's \\b sees É as a word character, \\w doesn't"
+    assert changed(jz, name: "Émile Zola", bio: "  ").title == "Émile Zola"
+  end
+end
+
+describe "bots" do
+  it "are created with a token" do
+    t = TestDb.new
+    bot = t.write { |tx| User.create_bot(tx, "Bender", nil) }
+    token = bot.bot_token || ""
+    assert token.bytesize == 12
+    assert bot.bot_key == "#{bot.id}-#{token}"
+    assert bot.role.bot?
+    assert bot.password_digest.nil?
+  end
+
+  it "are created with a webhook" do
+    t = TestDb.new
+    bot = t.write { |tx| User.create_bot(tx, "Bot", "http://x") }
+    assert bot.webhook_url(t.conn) == "http://x"
+    t.write { |tx| bot.update_bot(tx, UserChanges.new(name: "Bot2"), "") }
+    assert Webhook.find_by_user(t.conn, bot.id).nil?
+    assert found(User.find(t.conn, bot.id)).name == "Bot2"
+  end
+
+  it "reset their key" do
+    t = TestDb.new
+    bot = t.write { |tx| User.create_bot(tx, "Bender", nil) }
+    first = bot.bot_key
+    t.write { |tx| bot.reset_bot_key(tx) }
+    second = bot.bot_key
+    assert first != second
+    assert User.authenticate_bot(t.conn, first).nil?
+    assert !User.authenticate_bot(t.conn, second).nil?
+  end
+
+  it "authenticate by key" do
+    t = TestDb.new
+    bot = t.write { |tx| User.create_bot(tx, "Bender", nil) }
+    authenticated = User.authenticate_bot(t.conn, bot.bot_key)
+    assert !authenticated.nil? && authenticated.id == bot.id
+    assert User.authenticate_bot(t.conn, "nonsense").nil?
+    assert User.authenticate_bot(t.conn, "#{bot.id}-").nil?
+  end
+
+  it "get messages by webhook" do
+    t = TestDb.new
+    bender = user(t, "bender")
+    t.write { |tx| bender.deliver_webhook_later(tx, id("first")) }
+    assert t.events.size == 1
+    event = t.events[0]
+    assert event.is_a?(DeliverWebhook) && event.bot_id == id("bender") && event.message_id == id("first")
+    # No webhook, no job.
+    jz = user(t, "jz")
+    t.write { |tx| jz.deliver_webhook_later(tx, id("first")) }
+    assert t.events.size == 1
+  end
+
+  it "are sent a payload" do
+    t = TestDb.new
+    message = found(Message.find(t.conn, id("first")))
+    webhook = Webhook.find_by_user(t.conn, id("bender")) || raise("no webhook")
+    payload = webhook_payload(t.conn, BasicRichText.new, webhook, message, "/rooms/1/bot/key/messages", "/rooms/1/@2")
+    expected = %({"user":{"id":#{id("jason")},"name":"Jason"},"room":{"id":#{id("designers")},"name":"Designers","path":"/rooms/1/bot/key/messages"},"message":{"id":#{message.id},"body":{"html":"First post!","plain":"First post!"},"path":"/rooms/1/@2"}})
+    assert payload == expected
+  end
+
+  # `ActiveSupport::JSON` escapes `<`, `>` and `&`, and an unnamed room's
+  # name is `null`.
+  it "are sent a payload with HTML entities escaped" do
+    t = TestDb.new
+    first = id("first")
+    designers = id("designers")
+    t.write do |tx|
+      tx.conn.execute("UPDATE rooms SET name = NULL WHERE id = ?", [designers] of SqlValue)
+      tx.conn.execute("UPDATE action_text_rich_texts SET body = '<p>Tom & Jerry</p>' WHERE record_type = 'Message' AND record_id = ?", [first] of SqlValue)
+    end
+    message = found(Message.find(t.conn, first))
+    webhook = Webhook.find_by_user(t.conn, id("bender")) || raise("no webhook")
+    payload = webhook_payload(t.conn, BasicRichText.new, webhook, message, "/rooms/1/bot/key/messages", "/rooms/1/@2")
+    expected = %({"user":{"id":#{id("jason")},"name":"Jason"},"room":{"id":#{designers},"name":null,"path":"/rooms/1/bot/key/messages"},"message":{"id":#{first},"body":{"html":"\\u003cp\\u003eTom \\u0026 Jerry\\u003c/p\\u003e","plain":"Tom \\u0026 Jerry"},"path":"/rooms/1/@2"}})
+    assert payload == expected
+  end
+end
+
+describe "roles" do
+  it "decide who can administer" do
+    t = TestDb.new
+    admin = user(t, "david")
+    assert admin.can_administer?(nil)
+    assert !changed(admin, role: Role::Member).can_administer?(nil)
+    member = user(t, "kevin")
+    assert member.can_administer?(member.id), "creator"
+    assert member.can_administer?(id("jz"), true), "new record"
+    designers = found(Room.find(t.conn, id("designers")))
+    assert !member.can_administer?(designers.creator_id)
+  end
+end
+
+describe "bans" do
+  it "are created from session IPs, and remove the sessions" do
+    t = TestDb.new
+    kevin = id("kevin")
+    t.write do |tx|
+      Session.start(tx, kevin, "ua", "8.8.8.8")
+      Session.start(tx, kevin, "ua", "8.8.8.8")
+      Session.start(tx, kevin, "ua", "")
+    end
+    banned = user(t, "kevin")
+    t.write { |tx| banned.ban(tx) }
+
+    assert Ban.for_user(t.conn, kevin).map(&.ip_address) == ["8.8.8.8"]
+    assert Ban.banned?(t.conn, "8.8.8.8")
+    assert Session.count_for_user(t.conn, kevin) == 0
+    assert found(User.find(t.conn, kevin)).status.banned?
+    assert t.events.size == 2
+    disconnect = t.events[0]
+    remove = t.events[1]
+    assert disconnect.is_a?(DisconnectUser) && disconnect.user_id == kevin && !disconnect.reconnect
+    assert remove.is_a?(RemoveBannedContent) && remove.user_id == kevin
+
+    unbanned = found(User.find(t.conn, kevin))
+    t.write { |tx| unbanned.unban(tx) }
+    assert !Ban.banned?(t.conn, "8.8.8.8")
+    assert found(User.find(t.conn, kevin)).status.active?
+  end
+
+  it "refuse private session IPs" do
+    t = TestDb.new
+    kevin = id("kevin")
+    t.write { |tx| Session.start(tx, kevin, nil, "192.168.1.1") }
+    banned = user(t, "kevin")
+    assert t.write { |tx| banned.ban(tx) }.is_a?(RecordInvalid)
+    assert found(User.find(t.conn, kevin)).status.active?, "rolled back"
+  end
+
+  it "remove the banned user's content" do
+    t = TestDb.new
+    jz = user(t, "jz")
+    removed = t.write { |tx| remove_banned_content(tx, jz) }
+    assert removed.size == 5
+    assert Message.by_creator(t.conn, id("jz")).empty?
+  end
+
+  it "check addresses are public" do
+    assert Ban.validate("8.8.8.8").empty?
+    assert Ban.validate("2001:4860:4860::8888").empty?
+    ["127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1", "169.254.169.254", "::1", "fc00::1", "fd12::1", "fe80::1", "::ffff:10.0.0.1", "::ffff:127.0.0.1"].each do |ip|
+      assert Ban.validate(ip).on("ip_address") == ["cannot be a private or internal IP address"], ip
+    end
+    assert Ban.validate("not an ip").on("ip_address") == ["is not a valid IP address"]
+    assert Ban.validate("").on("ip_address") == ["is not a valid IP address"]
+  end
+end

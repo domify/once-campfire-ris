@@ -1,0 +1,77 @@
+module rils/assets/pipeline_test
+
+import std/text
+import std/file::{File}
+import rils/assets/pipeline::*
+import rils/assets/importmap::{javascript_importmap_tags}
+import web/web/spec::*
+
+VECTORS = "#{__DIR__}/../../vectors/assets"
+LOAD_PATH = LoadPath.reference
+
+def vector(name : String) : String
+  File.read("#{VECTORS}/#{name}")
+end
+
+# What `assets:precompile` named each overridden file, and what we name it:
+# `overrides/` differs from the reference on purpose, so only these may.
+def overridden : Array(Tuple(String, String))
+  reference = vector("manifest.json")
+  pairs = [] of Tuple(String, String)
+  LOAD_PATH.assets.each_with_index do |asset, index|
+    next unless asset.source.includes?("/assets/overrides/")
+    key = "#{json(asset.logical_path)}:{\"digested_path\":\""
+    at = reference.index(key) || next
+    start = at + key.bytesize
+    stop = reference.index('"', start) || next
+    pairs << {reference[start, stop - start], LOAD_PATH.digested_path(index)}
+  end
+  pairs
+end
+
+# *text* with our digested paths for overridden files put back as the
+# reference's.
+def as_reference(text : String) : String
+  overridden.each { |(theirs, ours)| text = text.gsub(ours, theirs) }
+  text
+end
+
+describe "the asset pipeline" do
+  it "digest images as Propshaft does" do
+    index = LOAD_PATH.find("campfire-icon.png") || raise "missing"
+    assert LOAD_PATH.digested_path(index) == "campfire-icon-3d9986c5.png"
+    assert LOAD_PATH.digested_path(LOAD_PATH.find("bot.svg") || raise "missing") == "bot-8a69692e.svg"
+    assert LOAD_PATH.digested_path(LOAD_PATH.find("56k.mp3") || raise "missing") == "56k-67359aa6.mp3"
+  end
+end
+
+describe "the compilers" do
+  it "digest what an asset references with it, as the Rust port's build does" do
+    application = LOAD_PATH.find("application.js") || raise "missing"
+    assert LOAD_PATH.digested_path(application) == "application-a54c74a7.js"
+    composer = LOAD_PATH.find("composer.css") || raise "missing"
+    assert LOAD_PATH.digested_path(composer) == "composer-e490638a.css"
+    assert (LOAD_PATH.compiled_content(composer) || "").includes?("url(\"/assets/common-file-text-9043d980.svg\")")
+  end
+end
+
+describe "the reference's helpers" do
+  it "stylesheet_link_tag :all and its Link header, as Rails renders them" do
+    tags = stylesheet_link_tag_all(LOAD_PATH, [{"data-turbo-track", "reload"}])
+    assert as_reference(tags.html) == vector("stylesheet_link_tag_all.html")
+    assert as_reference(append_preload_links("", tags.preload_links)) == vector("link_header.txt")
+  end
+
+  it "javascript_importmap_tags, as Rails renders them" do
+    tags = javascript_importmap_tags(LOAD_PATH, "#{__DIR__}/../../reference")
+    assert as_reference(tags) == vector("javascript_importmap_tags.html")
+  end
+
+  it "a Link header keeps what's there, and leaves out a link past 1,000 bytes" do
+    long = "<#{"x" * 980}>"
+    header = append_preload_links("</a.css>; rel=preload", [long, "</b.css>"])
+    assert header == "</a.css>; rel=preload,</b.css>"
+    # 21 bytes there and 979 more is 1,000 exactly: it fits.
+    assert append_preload_links("</a.css>; rel=preload", ["<#{"x" * 977}>"]).bytesize == 1001
+  end
+end

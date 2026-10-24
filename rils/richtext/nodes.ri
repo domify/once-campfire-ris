@@ -1,0 +1,481 @@
+# The Nokogiri HTML5 trees Action Text works on, over htmlparse's tree on
+# the tape: what the Rust port's dom.rs does over html5ever. Every parse
+# is Gumbo's (`Options.gumbo`), in the context Nokogiri gives it, into
+# the one tree, so a node's markup can be replaced by parsing new markup
+# in its place. Serialization is Nokogiri's `html_standard_serialize`.
+module rils/richtext/nodes
+
+import std/int
+import htmlparse/htmlparse/dom::{Dom, NodeKind, Namespace}
+import htmlparse/htmlparse/tokenizer::{Attr}
+import htmlparse/htmlparse/tags::{Tag, tag_of}
+import htmlparse/htmlparse/parse::{parse_fragment_into, Options, ParseError}
+
+NO_NODE = -1
+
+# Something Ruby would have raised while rendering. Callers do what the
+# Rails code does with the exception.
+pub class Failure
+  getter message : String
+  # The exception's message isn't valid UTF-8, so logging it raises too.
+  getter unrenderable : Bool
+
+  def initialize(@message : String, @unrenderable : Bool = false)
+  end
+
+  # Gumbo's limit errors, as Nokogiri raises them.
+  def self.parse(error : ParseError) : Failure
+    case error
+    when ParseError::TreeDepthExceeded then Failure.new("Document tree depth limit exceeded")
+    else                                    Failure.new("Attributes per element limit exceeded")
+    end
+  end
+
+  def self.raised(name : String) : Failure
+    Failure.new("raised #{name}")
+  end
+
+  def self.unrenderable(name : String) : Failure
+    Failure.new("raised #{name} with an unloggable message", true)
+  end
+end
+
+impl Error for Failure
+end
+
+@[OnTape]
+pub struct Html
+  getter dom : Dom
+  @empty : Str
+
+  def initialize
+    @empty = "".as_tape
+    @dom = Dom.new(Ary(Attr).new, @empty)
+  end
+
+  def initialize(@dom : Dom)
+    @empty = "".as_tape
+  end
+
+  # A tree of its own with the same nodes: what the Rust port's
+  # `Dom::clone` is.
+  def duplicate : Html
+    Html.new(@dom.duplicate)
+  end
+
+  # --- reading ------------------------------------------------------------
+
+  def element?(node : Int32) : Bool
+    @dom.element?(node)
+  end
+
+  def text?(node : Int32) : Bool
+    @dom.text?(node)
+  end
+
+  def html_element?(node : Int32) : Bool
+    @dom.element?(node) && @dom.namespace(node) == Namespace::Html
+  end
+
+  # Whether *node* is an element named *name*, in any namespace.
+  def named?(node : Int32, name : ::String) : Bool
+    @dom.element?(node) && @dom.name(node) == name
+  end
+
+  def local_name(node : Int32) : Str
+    @dom.name(node)
+  end
+
+  # Nokogiri's `Node#name`: an element's local name, "text", "comment",
+  # "#document-fragment", "document", or a doctype's name.
+  def node_name(node : Int32) : Str
+    case @dom.kind(node)
+    when NodeKind::Element  then @dom.name(node)
+    when NodeKind::Text     then "text".as_tape
+    when NodeKind::Comment  then "comment".as_tape
+    when NodeKind::Fragment then "#document-fragment".as_tape
+    when NodeKind::Document then "document".as_tape
+    else                         @dom.name(node)
+    end
+  end
+
+  def parent(node : Int32) : Int32
+    @dom.parent(node)
+  end
+
+  def first_child(node : Int32) : Int32
+    @dom.first_child(node)
+  end
+
+  def next_sibling(node : Int32) : Int32
+    @dom.next_sibling(node)
+  end
+
+  def text(node : Int32) : Str
+    @dom.data(node)
+  end
+
+  # An attribute's name as Nokogiri reports and serializes it: with its
+  # prefix (`xlink:href`), and `xmlns` with the empty one html5ever gives
+  # it (`:xmlns`).
+  def attr_name_matches?(attr : Attr, name : ::String) : Bool
+    if !attr.prefix.empty?
+      p = attr.prefix.bytesize
+      return false unless name.bytesize == p + 1 + attr.name.bytesize
+      tape = name.as_tape
+      tape[0, p] == attr.prefix && tape[p] == 0x3a_u8 && tape[p + 1, attr.name.bytesize] == attr.name
+    elsif attr.namespace == Namespace::Xmlns.value
+      tape = name.as_tape
+      name.bytesize == attr.name.bytesize + 1 && tape[0] == 0x3a_u8 && tape[1, attr.name.bytesize] == attr.name
+    else
+      attr.name == name
+    end
+  end
+
+  # The index of *node*'s attribute named *name*, or -1.
+  def attr_index(node : Int32, name : ::String) : Int32
+    return -1 unless @dom.element?(node)
+    i = 0
+    count = @dom.attrs_count(node)
+    while i < count
+      return i if attr_name_matches?(@dom.attr(node, i), name)
+      i = i + 1
+    end
+    -1
+  end
+
+  def has_attr?(node : Int32, name : ::String) : Bool
+    attr_index(node, name) >= 0
+  end
+
+  # The value of *node*'s attribute *name*; check `has_attr?` first.
+  def attr(node : Int32, name : ::String) : Str
+    index = attr_index(node, name)
+    index >= 0 ? @dom.attr(node, index).value : @empty
+  end
+
+  def attrs_count(node : Int32) : Int32
+    @dom.element?(node) ? @dom.attrs_count(node) : 0
+  end
+
+  def attr_at(node : Int32, index : Int32) : Attr
+    @dom.attr(node, index)
+  end
+
+  # Nokogiri's `node[name] = value`: in place, or a new attribute last.
+  def set_attr(node : Int32, name : ::String, value : Str) : Nil
+    return unless @dom.element?(node)
+    index = attr_index(node, name)
+    if index >= 0
+      old = @dom.attr(node, index)
+      @dom.put_attr(node, index, Attr.new(old.name, value, old.prefix, old.namespace))
+    else
+      @dom.put_attr(
+        node, @dom.attrs_count(node),
+        Attr.new(Str.new(name), value, @empty, 0_u8),
+      )
+    end
+  end
+
+  def remove_attr(node : Int32, name : ::String) : Nil
+    index = attr_index(node, name)
+    @dom.delete_attr(node, index) if index >= 0
+  end
+
+  def remove_attr_at(node : Int32, index : Int32) : Nil
+    @dom.delete_attr(node, index)
+  end
+
+  def put_attr_at(node : Int32, index : Int32, attr : Attr) : Nil
+    @dom.put_attr(node, index, attr)
+  end
+
+  # All descendants in document order, not *node* itself.
+  def descendants(node : Int32) : Ary(Int32)
+    output = Ary(Int32).new
+    add_descendants(node, output)
+    output
+  end
+
+  private def add_descendants(node : Int32, output : Ary(Int32)) : Nil
+    child = @dom.first_child(node)
+    while child != NO_NODE
+      output << child
+      add_descendants(child, output)
+      child = @dom.next_sibling(child)
+    end
+  end
+
+  def children(node : Int32) : Ary(Int32)
+    output = Ary(Int32).new
+    child = @dom.first_child(node)
+    while child != NO_NODE
+      output << child
+      child = @dom.next_sibling(child)
+    end
+    output
+  end
+
+  # Element children only (Nokogiri's `Node#elements`).
+  def element_children(node : Int32) : Ary(Int32)
+    output = Ary(Int32).new
+    child = @dom.first_child(node)
+    while child != NO_NODE
+      output << child if @dom.element?(child)
+      child = @dom.next_sibling(child)
+    end
+    output
+  end
+
+  def ancestors(node : Int32) : Ary(Int32)
+    output = Ary(Int32).new
+    current = @dom.parent(node)
+    while current != NO_NODE
+      output << current
+      current = @dom.parent(current)
+    end
+    output
+  end
+
+  # libxml2's `xmlNodeGetContent`.
+  def text_content(node : Int32) : Str
+    writer = Str::Builder.new(64)
+    @dom.text_content(node, writer)
+    writer.finish
+  end
+
+  # --- changing -----------------------------------------------------------
+
+  def new_fragment : Int32
+    @dom.create_fragment
+  end
+
+  def create_text(text : Str) : Int32
+    @dom.create_text(text)
+  end
+
+  # An HTML element with *attrs*' names and values, in order.
+  def create_element(name : ::String, attrs : Ary(Attr)) : Int32
+    start = @dom.attrs.size
+    attrs.each { |attr| @dom.attrs << attr }
+    tape_name = name.as_tape
+    @dom.create_element(Namespace::Html, tape_name, tag_of(tape_name), start, attrs.size)
+  end
+
+  def detach(node : Int32) : Nil
+    @dom.detach(node)
+  end
+
+  def append(parent : Int32, child : Int32) : Nil
+    @dom.append(parent, child)
+  end
+
+  def insert_before(reference : Int32, node : Int32) : Nil
+    @dom.insert_before(reference, node)
+  end
+
+  # --- parsing ------------------------------------------------------------
+
+  # `Nokogiri::HTML5::Document#fragment(html)`: a new fragment parsed in
+  # a `body`.
+  def parse_fragment(html : Str) : Int32 | Failure
+    fragment = @dom.create_fragment
+    nodes = parse_nodes(html, Namespace::Html, "body".as_tape)!
+    nodes.each { |node| @dom.append(fragment, node) }
+    fragment
+  end
+
+  # Parses *html* in the context of an element named *name* in
+  # *namespace*: the top-level nodes, detached. A leading byte order mark
+  # goes first, as Gumbo drops one there only.
+  def parse_nodes(
+    html : Str,
+    namespace : Namespace,
+    name : Str,
+  ) : Ary(Int32) | Failure
+    input = html
+    if input.bytesize >= 3 && input[0] == 0xef_u8 && input[1] == 0xbb_u8 && input[2] == 0xbf_u8
+      input = input[3, input.bytesize - 3]
+    end
+    document = parse_fragment_into(@dom, input, name, namespace, Options.gumbo)
+    return Failure.parse(document.error) unless document.ok?
+    nodes = children(document.root)
+    nodes.each { |node| @dom.detach(node) }
+    nodes
+  end
+
+  # The nodes *html* parses into for a node's children (`Node#fragment`):
+  # in its own context when it is an element, a `body` otherwise.
+  def parse_for(node : Int32, html : Str) : Ary(Int32) | Failure
+    if @dom.element?(node)
+      parse_nodes(html, @dom.namespace(node), @dom.name(node))
+    else
+      parse_nodes(html, Namespace::Html, "body".as_tape)
+    end
+  end
+
+  # `node.inner_html = html`, parsed in the node's context.
+  def set_inner_html(node : Int32, html : Str) : Nil | Failure
+    replacements = parse_for(node, html)!
+    child = @dom.first_child(node)
+    while child != NO_NODE
+      following = @dom.next_sibling(child)
+      @dom.detach(child)
+      child = following
+    end
+    replacements.each { |child_node| @dom.append(node, child_node) }
+    nil
+  end
+
+  # `node.replace(html)`: parsed in the context of the node's parent.
+  def replace_with_html(node : Int32, html : Str) : Nil | Failure
+    parent = @dom.parent(node)
+    return nil if parent == NO_NODE
+    replacements = parse_for(parent, html)!
+    replacements.each { |child| @dom.insert_before(node, child) }
+    @dom.detach(node)
+    nil
+  end
+
+  # *node* replaced by other, detached nodes.
+  def replace_with_nodes(node : Int32, replacements : Ary(Int32)) : Nil
+    return if @dom.parent(node) == NO_NODE
+    replacements.each { |child| @dom.insert_before(node, child) }
+    @dom.detach(node)
+  end
+
+  # --- serializing ----------------------------------------------------------
+
+  # `node.to_html`: the node itself, a fragment's or document's children.
+  # *brackets* escapes `<` and `>` in attribute values as well, which
+  # Nokogiri doesn't.
+  def to_html(node : Int32, brackets : Bool = false) : Str
+    writer = Str::Builder.new(256)
+    write_html(node, writer, brackets)
+    writer.finish
+  end
+
+  def write_html(
+    node : Int32,
+    writer : Str::Builder,
+    brackets : Bool = false,
+  ) : Nil
+    kind = @dom.kind(node)
+    if kind == NodeKind::Fragment || kind == NodeKind::Document
+      write_children(node, writer, brackets)
+    else
+      write_node(node, writer, brackets)
+    end
+  end
+
+  def inner_html(node : Int32) : Str
+    writer = Str::Builder.new(256)
+    write_children(node, writer, false)
+    writer.finish
+  end
+
+  def write_children(node : Int32, writer : Str::Builder, brackets : Bool) : Nil
+    child = @dom.first_child(node)
+    while child != NO_NODE
+      write_node(child, writer, brackets)
+      child = @dom.next_sibling(child)
+    end
+  end
+
+  private def write_node(
+    node : Int32,
+    writer : Str::Builder,
+    brackets : Bool,
+  ) : Nil
+    case @dom.kind(node)
+    when NodeKind::Element
+      name = @dom.name(node)
+      writer << '<' << name
+      i = 0
+      count = @dom.attrs_count(node)
+      while i < count
+        attr = @dom.attr(node, i)
+        writer << ' '
+        if !attr.prefix.empty?
+          writer << attr.prefix << ':'
+        elsif attr.namespace == Namespace::Xmlns.value
+          writer << ':'
+        end
+        writer << attr.name << "=\""
+        escape(attr.value, writer, true, brackets)
+        writer << '"'
+        i = i + 1
+      end
+      writer << '>'
+      return if @dom.namespace(node) == Namespace::Html && void?(name)
+      write_children(node, writer, brackets)
+      writer << "</" << name << '>'
+    when NodeKind::Text
+      parent = @dom.parent(node)
+      if parent != NO_NODE && @dom.element?(parent) && @dom.namespace(parent) == Namespace::Html &&
+         raw_text?(@dom.name(parent))
+        writer << @dom.data(node)
+      else
+        escape(@dom.data(node), writer, false, false)
+      end
+    when NodeKind::Comment
+      writer << "<!--" << @dom.data(node) << "-->"
+    when NodeKind::Doctype
+      writer << "<!DOCTYPE " << @dom.name(node) << '>'
+    else
+      write_children(node, writer, brackets)
+    end
+  end
+end
+
+pub def void?(name : Str) : Bool
+  VOID_ELEMENTS.any? { |void| name == void }
+end
+
+VOID_ELEMENTS = ["area", "base", "basefont", "bgsound", "br", "col", "embed", "frame", "hr", "img", "input",
+                 "keygen", "link", "meta", "param", "source", "track", "wbr"]
+
+RAW_TEXT_ELEMENTS = ["style", "script", "xmp", "iframe", "noembed", "noframes", "plaintext", "noscript"]
+
+def raw_text?(name : Str) : Bool
+  RAW_TEXT_ELEMENTS.any? { |raw| name == raw }
+end
+
+# Nokogiri's escaping: `&` and U+00A0 always, `"` in an attribute value,
+# `<` and `>` in text and, when *brackets*, in an attribute value too.
+def escape(
+  text : Str,
+  writer : Str::Builder,
+  attribute : Bool,
+  brackets : Bool,
+) : Nil
+  start = 0
+  i = 0
+  size = text.bytesize
+  while i < size
+    byte = text[i]
+    replacement = ""
+    width = 1
+    if byte == 0x26_u8
+      replacement = "&amp;"
+    elsif byte == 0xc2_u8 && i + 1 < size && text[i + 1] == 0xa0_u8
+      replacement = "&nbsp;"
+      width = 2
+    elsif byte == 0x22_u8 && attribute
+      replacement = "&quot;"
+    elsif byte == 0x3c_u8 && (!attribute || brackets)
+      replacement = "&lt;"
+    elsif byte == 0x3e_u8 && (!attribute || brackets)
+      replacement = "&gt;"
+    end
+    if replacement.empty?
+      i = i + 1
+      next
+    end
+    writer << text[start, i - start] if i > start
+    writer << replacement
+    i = i + width
+    start = i
+  end
+  writer << text[start, size - start] if size > start
+end

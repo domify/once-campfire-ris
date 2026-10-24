@@ -1,0 +1,59 @@
+# `cookies.signed` read on the tape agrees with the general reader.
+module rils/rails_compat/cookies_test
+
+import std/text
+import std/time::{Time}
+import rils/rails_compat/clock::{parse_timestamp}
+import rils/rails_compat/key_generator::{Secrets}
+import rils/rails_compat/cookies::{sign, verify_signed, verify_signed_value, signed_string_on_tape}
+import web/web/spec::*
+
+SECRETS = Secrets.new("test-secret")
+NOW     = parse_timestamp("2024-06-01T12:00:00Z") || raise("time")
+LATER   = parse_timestamp("2025-06-01T12:00:00Z") || raise("time")
+
+def on_tape(name : String, raw : String, now : Time = NOW) : String?
+  found = nil.as(String?)
+  tape { found = signed_string_on_tape(SECRETS, name, raw, now) }
+  found
+end
+
+def general(name : String, raw : String, now : Time = NOW) : String?
+  value = verify_signed_value(SECRETS, name, raw, now)
+  value ? value.as_s? : nil
+end
+
+describe "signed cookies on the tape" do
+  it "read what Rails writes, with or without an expiry" do
+    expiring = sign(SECRETS, "session_token", "tok", parse_timestamp("2044-06-01T12:00:00Z"))
+    assert on_tape("session_token", expiring) == "tok"
+    assert verify_signed(SECRETS, "session_token", expiring, NOW) == "tok"
+    session = sign(SECRETS, "session_token", "tok")
+    assert on_tape("session_token", session) == "tok"
+  end
+
+  it "leave to the general reader what they refuse, which agrees" do
+    expires = parse_timestamp("2024-12-01T12:00:00Z")
+    cases = [
+      {"session_token", sign(SECRETS, "session_token", "tok", expires), LATER},
+      {"other", sign(SECRETS, "session_token", "tok"), NOW},
+      {"session_token", sign(SECRETS, "session_token", "tok") + "0", NOW},
+      {"session_token", sign(SECRETS, "session_token", %(a"b\\c)), NOW},
+    ]
+    cases.each do |(name, raw, now)|
+      assert on_tape(name, raw, now).nil?
+      assert verify_signed(SECRETS, name, raw, now) == general(name, raw, now)
+    end
+    assert verify_signed(SECRETS, "session_token", sign(SECRETS, "session_token", %(a"b\\c)), NOW) == %(a"b\\c)
+  end
+
+  it "keep a value seen verified, until it expires and under its name" do
+    secrets = Secrets.new("test-secret")
+    raw = sign(secrets, "session_token", "tok", parse_timestamp("2024-12-01T12:00:00Z"))
+    assert verify_signed(secrets, "session_token", raw, NOW) == "tok"
+    assert secrets.verified_cookies.has_key?(raw)
+    assert verify_signed(secrets, "session_token", raw, NOW) == "tok"
+    assert verify_signed(secrets, "other", raw, NOW).nil?
+    assert verify_signed(secrets, "session_token", raw, LATER).nil?
+  end
+end

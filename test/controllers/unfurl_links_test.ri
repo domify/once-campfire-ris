@@ -1,0 +1,18 @@
+# `UnfurlLinksController`: nothing from private addresses, and a URL needed.
+module test/controllers/unfurl_links_test
+
+import integrations/net::{Http}
+import test/testing::*
+import web/web/spec::*
+
+describe "unfurl_links" do
+  it "unfurls nothing from private addresses and needs a URL" do
+    client = Client.new
+    client.app.http = Http.new(->(host : String) { nil.as(Array(String)?) })
+    cookie = client.cookie("david@37signals.com")
+    assert client.submit("POST", "/unfurl_link", "url=http%3A%2F%2F127.0.0.1%2Fsecret", cookie).status == 204
+    assert client.submit("POST", "/unfurl_link", "url=", cookie).status == 400
+    assert client.submit("POST", "/unfurl_link", "url[a]=http%3A%2F%2Fexample.com", cookie).status == 204
+    assert client.submit("POST", "/unfurl_link", "url[]=http%3A%2F%2Fexample.com", cookie).status == 204
+  end
+end

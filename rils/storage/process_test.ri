@@ -1,0 +1,95 @@
+# The Rust port's processing tests. Its sixth, on the polling pause, has
+# nothing to check here: `output_within` parks on the child instead of
+# polling it.
+module rils/storage/process_test
+
+import std/file
+import std/time::{Time}
+import std/process::{Process, ProcessResult}
+import rils/storage/process::*
+import rils/storage/variation::{Variation}
+import rils/storage/errors::*
+import web/web/spec::*
+
+def fixture(name : String) : String
+  "#{__DIR__}/../../reference/test/fixtures/files/#{name}"
+end
+
+def thumbnail(input : String, size : Int64, format : String) : String | StorageError
+  transform(input, Variation.resize_to_limit(size, size, format))
+end
+
+def made(result : String | StorageError) : String
+  raise result.message if result.is_a?(StorageError)
+  result
+end
+
+def elapsed_ms(started : Time) : Float64
+  (Time.utc - started).total_milliseconds
+end
+
+describe "process" do
+  it "reports a failing variant's own error after many variants" do
+    # libvips' error buffer is process-wide and holds 10 KB. Probing JPEG
+    # and PNG loaders for `page` used to fill it with "no property named
+    # `page'", until the next real error was cut off.
+    jpeg = made(thumbnail(fixture("moon.jpg"), 8_i64, "jpg"))
+    png = made(thumbnail(jpeg, 8_i64, "png"))
+    200.times do
+      File.delete(made(thumbnail(jpeg, 4_i64, "webp")))
+      File.delete(made(thumbnail(png, 4_i64, "webp")))
+    end
+    corrupt = File.tempfile("corrupt", ".jpg")
+    File.write(corrupt, "\xFF\xD8\xFF\xE0 not really a JPEG")
+    failed = thumbnail(corrupt, 4_i64, "webp")
+    assert failed.is_a?(StorageError) && failed.kind == StorageErrorKind::Vips
+    message = failed.is_a?(StorageError) ? failed.detail : ""
+    assert message.includes?("JPEG datastream contains no image")
+    assert !message.includes?("no property named")
+    [jpeg, png, corrupt].each { |path| File.delete(path) }
+  end
+
+  it "keeps resize arguments within libvips' range" do
+    too_wide = operations(Variation.resize_to_limit(2147483647_i64 + 1, 100_i64))
+    assert too_wide.is_a?(StorageError) && too_wide.kind == StorageErrorKind::InvalidVariation
+    widest = operations(Variation.resize_to_limit(2147483647_i64, 100_i64))
+    assert widest.is_a?(Array) && widest == [{2147483647.as(Int32?), 100.as(Int32?)}]
+  end
+
+  it "captures a quick child" do
+    output = output_within("sh", ["-c", "echo out; echo err >&2"], 10_000)
+    assert output.is_a?(ProcessResult)
+    if output.is_a?(ProcessResult)
+      assert output.success?
+      assert output.stdout == "out\n"
+      assert output.stderr == "err\n"
+    end
+  end
+
+  it "returns soon after the child exits" do
+    plain = 1e9
+    within = 1e9
+    5.times do
+      started = Time.utc
+      Process.run("sleep", ["0.035"])
+      t = elapsed_ms(started)
+      plain = t if t < plain
+      started = Time.utc
+      output_within("sleep", ["0.035"], 10_000)
+      t = elapsed_ms(started)
+      within = t if t < within
+    end
+    assert within < plain + 15.0
+  end
+
+  it "kills a child that overruns" do
+    started = Time.utc
+    pid_file = File.tempfile("pid")
+    error = output_within("sh", ["-c", "echo $$ > #{pid_file}; exec sleep 30"], 300)
+    assert error.is_a?(TimedOut)
+    assert elapsed_ms(started) < 5000.0
+    pid = File.read(pid_file).strip
+    assert !pid.empty? && !File.exists?("/proc/#{pid}")
+    File.delete(pid_file)
+  end
+end

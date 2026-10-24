@@ -1,0 +1,90 @@
+# `FirstRunsController` (reference/app/controllers/first_runs_controller.rb):
+# setting up the account and its administrator.
+module controllers/first_runs
+
+import std/text
+import models/account::{Account}
+import models/user::{User, PasswordDigest}
+import models/first_run::{first_run}
+import rils/routes/paths::{root_path}
+import rils/kit/ctx::{Ctx, ActionResult}
+import rils/kit/response::{Response}
+import rils/kit/errors::{HttpError}
+import rils/kit/format::{HTML}
+import rils/kit/params::{Param, UploadedFile}
+import rils/storage/blob::{insert_attachment}
+import rils/storage/filename::{Filename}
+import views/first_runs::{Show}
+import config/app::{App}
+import controllers/concerns::{allow_browser, set_version_headers}
+import controllers/concerns::{start_new_session_for}
+
+# `show` (`allow_unauthenticated_access`, `before_action :prevent_repeats`).
+pub def show_first_run(app : App, c : Ctx) : ActionResult
+  platform = allow_browser(app, c)
+  return platform if platform.is_a?(HttpError)
+  set_version_headers(app, c)
+  repeat = prevent_repeats(app, c)
+  return repeat if repeat
+  format = c.respond_to([HTML])
+  return format if format.is_a?(HttpError)
+  ctx = app.layout_context(c, platform: platform)
+  app.render_layout(c, 200, "Set up Campfire", "signup", ctx) { |buffer| Show.new(ctx).render_into(buffer) }
+end
+
+# `create`: `FirstRun.create!(user_params)`, signed in as the new
+# administrator, then the root.
+pub def create_first_run(app : App, c : Ctx) : ActionResult
+  forged = c.verify_authenticity_token
+  return forged if forged
+  platform = allow_browser(app, c)
+  return platform if platform.is_a?(HttpError)
+  set_version_headers(app, c)
+  repeat = prevent_repeats(app, c)
+  return repeat if repeat
+
+  # `params.require(:user).permit(:name, :avatar, :email_address, :password)`
+  user_params = c.require("user")
+  return user_params if user_params.is_a?(HttpError)
+  name = text_param(user_params, "name")
+  return HttpError.internal("users.name may not be NULL") if name.nil?
+  email_address = text_param(user_params, "email_address")
+  password = text_param(user_params, "password")
+  avatar_param = user_params["avatar"]
+  avatar = avatar_param ? avatar_param.as_file? : nil
+  # `has_secure_password`'s `password=`: an empty password sets no digest.
+  # Hashed before the write, which it would hold for bcrypt's cost.
+  digest = password && !password.empty? ? PasswordDigest.create(password, app.db.env.bcrypt_cost) : nil
+  staged = avatar ? app.storage.stage_file(avatar.path, Filename.from_bytes(avatar.original_filename), avatar.content_type) : nil
+
+  administrator = app.db.write do |tx|
+    # `rescue ActiveRecord::RecordNotUnique`: a first run that lost the race
+    # finds the account there. Writes are serialized, so it's checked here.
+    if Account.first(tx.conn)
+      nil
+    else
+      user = first_run(tx, name, email_address, digest)
+      if staged
+        blob = staged.insert(tx.conn, tx.now)
+        insert_attachment(tx.conn, "avatar", "User", user.id, blob.id, tx.now)
+      end
+      user
+    end
+  end
+  if staged
+    administrator ? staged.keep : staged.discard
+  end
+  start_new_session_for(app, c, administrator) if administrator
+  c.redirect_to(c.url_for(root_path))
+end
+
+def text_param(params : Param, key : String) : String?
+  value = params[key]
+  value ? value.to_s? : nil
+end
+
+# `prevent_repeats`: `redirect_to root_url if Account.any?`.
+def prevent_repeats(app : App, c : Ctx) : ActionResult?
+  any = app.db.read { |conn| !Account.first(conn).nil? }
+  any ? c.redirect_to(c.url_for(root_path)) : nil
+end

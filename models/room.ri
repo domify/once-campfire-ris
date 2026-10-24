@@ -1,0 +1,525 @@
+# `reference/app/models/room.rb`, `rooms/*.rb`, `membership.rb` and
+# `membership/connectable.rb`. Rooms and memberships read each other (a
+# membership with its room, a room's members), so they share this module.
+# Destroying a room destroys its messages, so `destroy_room` lives with
+# messages (`db/models/message`).
+module models/room
+
+import std/time::{Span}
+import rils/record/sqlite::{Connection, Row, SqlValue, placeholders}
+import rils/record/timestamp::{Timestamp, SQLITE_NOW}
+import rils/record/database::{Tx}
+import rils/record/errors::{Errors, RecordNotFound, RecordInvalid}
+import rils/record/events::{DisconnectUser}
+import models/user::{User, USER_COLUMNS, USER_SELECT, MEMBERSHIP_INSERT_BATCH, each_slice}
+
+# The STI `type` column.
+pub enum RoomType
+  Open
+  Closed
+  Direct
+
+  def class_name : String
+    case self
+    when RoomType::Closed then "Rooms::Closed"
+    when RoomType::Direct then "Rooms::Direct"
+    else                       "Rooms::Open"
+    end
+  end
+
+  def self.from_class_name(name : String) : RoomType?
+    case name
+    when "Rooms::Open"   then RoomType::Open
+    when "Rooms::Closed" then RoomType::Closed
+    when "Rooms::Direct" then RoomType::Direct
+    else                      nil
+    end
+  end
+
+  # `default_involvement`: "everything" in direct rooms, "mentions"
+  # elsewhere.
+  def default_involvement : String
+    direct? ? "everything" : "mentions"
+  end
+end
+
+pub ROOM_COLUMNS = %("rooms"."id", "rooms"."name", "rooms"."type", "rooms"."creator_id", "rooms"."created_at", "rooms"."updated_at")
+ROOM_COLUMN_COUNT = 6
+
+SELECT_FOR_USER = %(SELECT #{ROOM_COLUMNS} FROM "rooms" INNER JOIN "memberships" ON "rooms"."id" = "memberships"."room_id" WHERE "memberships"."user_id" = ?)
+
+pub class Room
+  getter id : Int64
+  getter name : String?
+  getter room_type : RoomType
+  getter creator_id : Int64
+  getter created_at : Timestamp
+  getter updated_at : Timestamp
+
+  def initialize(@id : Int64, @name : String?, @room_type : RoomType, @creator_id : Int64, @created_at : Timestamp, @updated_at : Timestamp)
+  end
+
+  pub def self.from_row(row : Row, offset : Int32 = 0) : Room
+    type_name = row.text(offset + 2)
+    room_type = RoomType.from_class_name(type_name) || raise("unknown room type #{type_name.inspect}")
+    Room.new(row.int(offset), row.text?(offset + 1), room_type, row.int(offset + 3), row.time(offset + 4), row.time(offset + 5))
+  end
+
+  def self.many(conn : Connection, sql : String, args : Array(SqlValue) = [] of SqlValue) : Array(Room)
+    conn.query_all(sql, args) { |row| Room.from_row(row) }
+  end
+
+  def self.one(conn : Connection, sql : String, args : Array(SqlValue) = [] of SqlValue) : Room?
+    conn.query_one(sql, args) { |row| Room.from_row(row) }
+  end
+
+  pub def self.find(conn : Connection, id : Int64) : Room | RecordNotFound
+    find_by_id(conn, id) || RecordNotFound.new("Room")
+  end
+
+  pub def self.find_by_id(conn : Connection, id : Int64) : Room?
+    one(conn, %(SELECT #{ROOM_COLUMNS} FROM "rooms" WHERE "rooms"."id" = ? LIMIT 1), [id] of SqlValue)
+  end
+
+  pub def self.all(conn : Connection) : Array(Room)
+    many(conn, %(SELECT #{ROOM_COLUMNS} FROM "rooms"))
+  end
+
+  # `Room.opens` / `closeds` / `directs`
+  pub def self.of_type(conn : Connection, room_type : RoomType) : Array(Room)
+    many(conn, %(SELECT #{ROOM_COLUMNS} FROM "rooms" WHERE "rooms"."type" = ?), [room_type.class_name] of SqlValue)
+  end
+
+  pub def self.count_of_type(conn : Connection, room_type : RoomType) : Int64
+    conn.count(%(SELECT COUNT(*) FROM "rooms" WHERE "rooms"."type" = ?), [room_type.class_name] of SqlValue)
+  end
+
+  # `Room.original`: the oldest room.
+  pub def self.original(conn : Connection) : Room?
+    one(conn, %(SELECT #{ROOM_COLUMNS} FROM "rooms" ORDER BY "rooms"."created_at" ASC LIMIT 1))
+  end
+
+  # `user.rooms`
+  pub def self.for_user(conn : Connection, user_id : Int64) : Array(Room)
+    many(conn, SELECT_FOR_USER, [user_id] of SqlValue)
+  end
+
+  # `user.rooms.find_by(id:)`
+  pub def self.find_for_user(conn : Connection, user_id : Int64, room_id : Int64) : Room?
+    one(conn, %(#{SELECT_FOR_USER} AND "rooms"."id" = ? LIMIT 1), [user_id, room_id] of SqlValue)
+  end
+
+  # `user.rooms.directs` / `.opens` / `.closeds`
+  pub def self.for_user_of_type(conn : Connection, user_id : Int64, room_type : RoomType) : Array(Room)
+    many(conn, %(#{SELECT_FOR_USER} AND "rooms"."type" = ?), [user_id, room_type.class_name] of SqlValue)
+  end
+
+  # `user.rooms.without_directs`
+  pub def self.for_user_without_directs(conn : Connection, user_id : Int64) : Array(Room)
+    many(conn, %(#{SELECT_FOR_USER} AND "rooms"."type" != ?), [user_id, RoomType::Direct.class_name] of SqlValue)
+  end
+
+  # `user.rooms.original`
+  pub def self.original_for_user(conn : Connection, user_id : Int64) : Room?
+    one(conn, %(#{SELECT_FOR_USER} ORDER BY "rooms"."created_at" ASC LIMIT 1), [user_id] of SqlValue)
+  end
+
+  # `user.rooms.last`
+  pub def self.last_for_user(conn : Connection, user_id : Int64) : Room?
+    one(conn, %(#{SELECT_FOR_USER} ORDER BY "rooms"."id" DESC LIMIT 1), [user_id] of SqlValue)
+  end
+
+  # `Rooms::<Type>.create!(name:, creator:)`. An open room grants itself to
+  # every active user after commit (`Rooms::Open#grant_access_to_all_users`).
+  pub def self.create(tx : Tx, room_type : RoomType, name : String?, creator_id : Int64) : Room
+    now = tx.now
+    id = tx.conn.query_one(%(INSERT INTO "rooms" ("created_at", "creator_id", "name", "type", "updated_at") VALUES (?, ?, ?, ?, ?) RETURNING "id"), [now, creator_id, name, room_type.class_name, now] of SqlValue) { |row| row.int(0) }
+    raise "insert into rooms returned no id" unless id
+    tx.after_commit { |after| grant_to_active_users(after, id) } if room_type.open?
+    Room.new(id, name, room_type, creator_id, now, now)
+  end
+
+  # `Room.create_for(attributes, users:)`
+  pub def self.create_for(tx : Tx, room_type : RoomType, name : String?, creator_id : Int64, user_ids : Array(Int64)) : Room
+    room = create(tx, room_type, name, creator_id)
+    room.grant_to(tx, user_ids)
+    room
+  end
+
+  # `Rooms::Direct.find_or_create_for(users)`: the direct room whose members
+  # are exactly *user_ids*, created (by *creator_id*, i.e. `Current.user`) if
+  # there isn't one.
+  pub def self.find_or_create_direct_for(tx : Tx, user_ids : Array(Int64), creator_id : Int64) : Room
+    find_direct_for(tx.conn, user_ids) || create_for(tx, RoomType::Direct, nil, creator_id, user_ids)
+  end
+
+  # `Rooms::Direct.find_for`: walks the direct rooms (joined to their users,
+  # as Rails does, so rooms repeat) and returns the first with the same set
+  # of members.
+  pub def self.find_direct_for(conn : Connection, user_ids : Array(Int64)) : Room?
+    wanted = user_ids.uniq.sorted
+    candidates = many(conn, %(SELECT #{ROOM_COLUMNS} FROM "rooms" INNER JOIN "memberships" ON "memberships"."room_id" = "rooms"."id" INNER JOIN "users" ON "users"."id" = "memberships"."user_id" WHERE "rooms"."type" = ?), [RoomType::Direct.class_name] of SqlValue)
+    candidates.find { |room| room.user_ids(conn).uniq.sorted == wanted }
+  end
+
+  # `room.update!(name:, type:)`. A direct room can't change type
+  # (`direct_rooms_keep_their_type`). Becoming open grants every active user
+  # after commit. *name* is `{value}` to set it.
+  pub def update(tx : Tx, name : Tuple(String?)? = nil, room_type : RoomType? = nil) : RecordInvalid?
+    new_name = name && name[0] != @name ? name : nil
+    new_type = room_type && room_type != @room_type ? room_type : nil
+    if new_type && @room_type.direct?
+      errors = Errors.new
+      errors.add("type", "can't be changed for a direct room")
+      return RecordInvalid.new(errors)
+    end
+    return nil if new_name.nil? && new_type.nil?
+    now = tx.now
+    @name = new_name[0] if new_name
+    @room_type = new_type if new_type
+    @updated_at = now
+    tx.conn.execute(%(UPDATE "rooms" SET "name" = ?, "type" = ?, "updated_at" = ? WHERE "rooms"."id" = ?), [@name, @room_type.class_name, now, @id] of SqlValue)
+    if new_type && new_type.open?
+      id = @id
+      tx.after_commit { |after| grant_to_active_users(after, id) }
+    end
+    nil
+  end
+
+  # `touch`: `belongs_to :room, touch: true` on messages.
+  pub def self.touch(tx : Tx, room_id : Int64) : Nil
+    tx.conn.execute(%(UPDATE "rooms" SET "updated_at" = ? WHERE "rooms"."id" = ?), [tx.now, room_id] of SqlValue)
+  end
+
+  pub def memberships(conn : Connection) : Array(Membership)
+    Membership.for_room(conn, @id)
+  end
+
+  # `memberships.grant_to(users)`: `Membership.insert_all` with the room's
+  # default involvement, skipping existing members.
+  pub def grant_to(tx : Tx, user_ids : Array(Int64)) : Nil
+    insert_memberships(tx, @id, @room_type.default_involvement, user_ids)
+  end
+
+  # `memberships.revoke_from(users)`: `destroy_by`, so each removed member is
+  # disconnected (with reconnect) after commit.
+  pub def revoke_from(tx : Tx, user_ids : Array(Int64)) : Nil
+    return if user_ids.empty?
+    values = [@id] of SqlValue
+    user_ids.each { |id| values << id }
+    memberships = tx.conn.query_all(%(SELECT #{MEMBERSHIP_COLUMNS} FROM "memberships" WHERE "memberships"."room_id" = ? AND "memberships"."user_id" IN (#{placeholders(user_ids.size)})), values) { |row| Membership.from_row(row) }
+    memberships.each(&.destroy(tx))
+  end
+
+  # `memberships.revise(granted:, revoked:)`
+  pub def revise(tx : Tx, granted : Array(Int64), revoked : Array(Int64)) : Nil
+    grant_to(tx, granted) unless granted.empty?
+    revoke_from(tx, revoked) unless revoked.empty?
+  end
+
+  # `room.users`
+  pub def users(conn : Connection) : Array(User)
+    User.find_by_sql(conn, %(#{USER_SELECT} INNER JOIN "memberships" ON "users"."id" = "memberships"."user_id" WHERE "memberships"."room_id" = ?), [@id] of SqlValue)
+  end
+
+  # `room.user_ids`
+  pub def user_ids(conn : Connection) : Array(Int64)
+    conn.query_all(%(SELECT "users"."id" FROM "users" INNER JOIN "memberships" ON "users"."id" = "memberships"."user_id" WHERE "memberships"."room_id" = ?), [@id] of SqlValue) { |row| row.int(0) }
+  end
+
+  # `room.users.active_bots`
+  pub def active_bots(conn : Connection) : Array(User)
+    User.find_by_sql(conn, %(#{USER_SELECT} INNER JOIN "memberships" ON "users"."id" = "memberships"."user_id" WHERE "memberships"."room_id" = ? AND "users"."status" = 0 AND "users"."role" = 2), [@id] of SqlValue)
+  end
+
+  # `unread_memberships` of `room.receive(message)`: members not connected
+  # (and not the sender, and not invisible) are marked unread at the
+  # message's time.
+  pub def self.unread_memberships(tx : Tx, room_id : Int64, message_created_at : Timestamp, creator_id : Int64) : Nil
+    now = tx.now
+    tx.conn.execute(%(UPDATE "memberships" SET "unread_at" = ?, "updated_at" = ? WHERE "memberships"."room_id" = ? AND "memberships"."involvement" != ? AND ("memberships"."connected_at" IS NULL OR "memberships"."connected_at" < ?) AND "memberships"."user_id" != ?), [message_created_at, now, room_id, "invisible", Membership.connection_cutoff(now), creator_id] of SqlValue)
+  end
+
+  pub def open? : Bool
+    @room_type.open?
+  end
+
+  pub def closed? : Bool
+    @room_type.closed?
+  end
+
+  pub def direct? : Bool
+    @room_type.direct?
+  end
+
+  pub def default_involvement : String
+    @room_type.default_involvement
+  end
+end
+
+# `Membership.insert_all(... { room_id:, user_id:, involvement: })`, in
+# batches: SQLite binds at most 32,766 variables per statement, 3 per row
+# here.
+def insert_memberships(tx : Tx, room_id : Int64, involvement : String, user_ids : Array(Int64)) : Nil
+  each_slice(user_ids, MEMBERSHIP_INSERT_BATCH) do |batch|
+    rows = batch.map { |_| "(#{SQLITE_NOW}, ?, ?, #{SQLITE_NOW}, ?)" }.join(", ")
+    values = [] of SqlValue
+    batch.each do |user_id|
+      values << involvement
+      values << room_id
+      values << user_id
+    end
+    tx.conn.query_all(%(INSERT INTO "memberships" ("created_at","involvement","room_id","updated_at","user_id") VALUES #{rows} ON CONFLICT  DO NOTHING RETURNING "id"), values) { |row| row.int(0) }
+  end
+end
+
+# `memberships.grant_to(User.active)`, from `Rooms::Open`'s
+# `after_save_commit`.
+def grant_to_active_users(tx : Tx, room_id : Int64) : Nil
+  user_ids = tx.conn.query_all(%(SELECT "users"."id" FROM "users" WHERE "users"."status" = ?), [0_i64] of SqlValue) { |row| row.int(0) }
+  room = Room.find(tx.conn, room_id)
+  raise room.message if room.is_a?(RecordNotFound)
+  insert_memberships(tx, room_id, room.default_involvement, user_ids)
+end
+
+# `enum :involvement, %w[ invisible nothing mentions everything ].index_by(&:itself)`
+pub enum Involvement
+  Invisible
+  Nothing
+  Mentions
+  Everything
+
+  def name : String
+    case self
+    when Involvement::Invisible then "invisible"
+    when Involvement::Nothing   then "nothing"
+    when Involvement::Mentions  then "mentions"
+    else                             "everything"
+    end
+  end
+
+  def self.from_name(name : String) : Involvement?
+    case name
+    when "invisible"  then Involvement::Invisible
+    when "nothing"    then Involvement::Nothing
+    when "mentions"   then Involvement::Mentions
+    when "everything" then Involvement::Everything
+    else                   nil
+    end
+  end
+end
+
+# `Membership::Connectable::CONNECTION_TTL`
+pub CONNECTION_TTL = Span.seconds(60)
+
+pub MEMBERSHIP_COLUMNS = %("memberships"."id", "memberships"."room_id", "memberships"."user_id", "memberships"."involvement", "memberships"."unread_at", "memberships"."connected_at", "memberships"."connections", "memberships"."created_at", "memberships"."updated_at")
+MEMBERSHIP_COLUMN_COUNT = 9
+
+pub class Membership
+  getter id : Int64
+  getter room_id : Int64
+  getter user_id : Int64
+  # Nullable in the schema (default "mentions").
+  getter involvement : Involvement?
+  getter unread_at : Timestamp?
+  getter connected_at : Timestamp?
+  getter connections : Int64
+  getter created_at : Timestamp
+  getter updated_at : Timestamp
+
+  def initialize(@id : Int64, @room_id : Int64, @user_id : Int64, @involvement : Involvement?, @unread_at : Timestamp?, @connected_at : Timestamp?, @connections : Int64, @created_at : Timestamp, @updated_at : Timestamp)
+  end
+
+  pub def self.from_row(row : Row, offset : Int32 = 0) : Membership
+    involvement_name = row.text?(offset + 3)
+    involvement = involvement_name ? (Involvement.from_name(involvement_name) || raise("unknown involvement #{involvement_name.inspect}")) : nil
+    Membership.new(row.int(offset), row.int(offset + 1), row.int(offset + 2), involvement, row.time?(offset + 4), row.time?(offset + 5), row.int(offset + 6), row.time(offset + 7), row.time(offset + 8))
+  end
+
+  def self.many(conn : Connection, sql : String, args : Array(SqlValue)) : Array(Membership)
+    conn.query_all(sql, args) { |row| Membership.from_row(row) }
+  end
+
+  pub def self.find(conn : Connection, id : Int64) : Membership | RecordNotFound
+    conn.query_one(%(SELECT #{MEMBERSHIP_COLUMNS} FROM "memberships" WHERE "memberships"."id" = ? LIMIT 1), [id] of SqlValue) { |row| Membership.from_row(row) } || RecordNotFound.new("Membership")
+  end
+
+  pub def self.count(conn : Connection) : Int64
+    conn.count(%(SELECT COUNT(*) FROM "memberships"))
+  end
+
+  pub def self.for_user(conn : Connection, user_id : Int64) : Array(Membership)
+    many(conn, %(SELECT #{MEMBERSHIP_COLUMNS} FROM "memberships" WHERE "memberships"."user_id" = ?), [user_id] of SqlValue)
+  end
+
+  pub def self.for_room(conn : Connection, room_id : Int64) : Array(Membership)
+    many(conn, %(SELECT #{MEMBERSHIP_COLUMNS} FROM "memberships" WHERE "memberships"."room_id" = ?), [room_id] of SqlValue)
+  end
+
+  # `room.memberships.find_by(user:)` / `user.memberships.find_by(room_id:)`
+  pub def self.find_by_room_and_user(conn : Connection, room_id : Int64, user_id : Int64) : Membership?
+    conn.query_one(%(SELECT #{MEMBERSHIP_COLUMNS} FROM "memberships" WHERE "memberships"."room_id" = ? AND "memberships"."user_id" = ? LIMIT 1), [room_id, user_id] of SqlValue) { |row| Membership.from_row(row) }
+  end
+
+  # `user.memberships.visible.with_ordered_room`, each with its room.
+  pub def self.visible_with_ordered_room(conn : Connection, user_id : Int64) : Array(Tuple(Membership, Room))
+    conn.query_all(%(SELECT #{MEMBERSHIP_COLUMNS}, #{ROOM_COLUMNS} FROM "memberships" INNER JOIN "rooms" ON "rooms"."id" = "memberships"."room_id" WHERE "memberships"."user_id" = ? AND "memberships"."involvement" != 'invisible' ORDER BY LOWER(rooms.name)), [user_id] of SqlValue) { |row| with_room(row) }
+  end
+
+  # `user.memberships.with_ordered_room` (invisible included).
+  pub def self.with_ordered_room(conn : Connection, user_id : Int64) : Array(Tuple(Membership, Room))
+    conn.query_all(%(SELECT #{MEMBERSHIP_COLUMNS}, #{ROOM_COLUMNS} FROM "memberships" INNER JOIN "rooms" ON "rooms"."id" = "memberships"."room_id" WHERE "memberships"."user_id" = ? ORDER BY LOWER(rooms.name)), [user_id] of SqlValue) { |row| with_room(row) }
+  end
+
+  # A membership and its room, from `MEMBERSHIP_COLUMNS` followed by
+  # `ROOM_COLUMNS`.
+  def self.with_room(row : Row) : Tuple(Membership, Room)
+    {Membership.from_row(row), Room.from_row(row, MEMBERSHIP_COLUMN_COUNT)}
+  end
+
+  # `user.memberships.without_direct_rooms.count`
+  pub def self.count_without_direct_rooms(conn : Connection, user_id : Int64) : Int64
+    conn.count(%(SELECT COUNT(*) FROM "memberships" INNER JOIN "rooms" "room" ON "room"."id" = "memberships"."room_id" WHERE "memberships"."user_id" = ? AND "room"."type" != 'Rooms::Direct'), [user_id] of SqlValue)
+  end
+
+  # `user.memberships.unread.count`: the push badge.
+  pub def self.unread_count(conn : Connection, user_id : Int64) : Int64
+    conn.count(%(SELECT COUNT(*) FROM "memberships" WHERE "memberships"."user_id" = ? AND "memberships"."unread_at" IS NOT NULL), [user_id] of SqlValue)
+  end
+
+  # `Membership.connected.exists?(id)`
+  pub def self.connected_exists?(conn : Connection, id : Int64, now : Timestamp) : Bool
+    conn.exists?(%(SELECT 1 FROM "memberships" WHERE "memberships"."connected_at" >= ? AND "memberships"."id" = ? LIMIT 1), [connection_cutoff(now), id] of SqlValue)
+  end
+
+  # `Membership.disconnected.exists?(id)`
+  pub def self.disconnected_exists?(conn : Connection, id : Int64, now : Timestamp) : Bool
+    conn.exists?(%(SELECT 1 FROM "memberships" WHERE ("memberships"."connected_at" IS NULL OR "memberships"."connected_at" < ?) AND "memberships"."id" = ? LIMIT 1), [connection_cutoff(now), id] of SqlValue)
+  end
+
+  # `CONNECTION_TTL.ago`
+  pub def self.connection_cutoff(now : Timestamp) : Timestamp
+    now.ago(CONNECTION_TTL)
+  end
+
+  pub def room(conn : Connection) : Room | RecordNotFound
+    Room.find(conn, @room_id)
+  end
+
+  pub def user(conn : Connection) : User | RecordNotFound
+    User.find(conn, @user_id)
+  end
+
+  pub def involved_in?(involvement : Involvement) : Bool
+    @involvement == involvement
+  end
+
+  # `update!(involvement:)`
+  pub def update_involvement(tx : Tx, involvement : Involvement?) : Nil
+    return if @involvement == involvement
+    now = tx.now
+    tx.conn.execute(%(UPDATE "memberships" SET "involvement" = ?, "updated_at" = ? WHERE "memberships"."id" = ?), [involvement ? involvement.name : nil, now, @id] of SqlValue)
+    @involvement = involvement
+    @updated_at = now
+  end
+
+  # `read`: `update!(unread_at: nil)`
+  pub def read(tx : Tx) : Nil
+    return if @unread_at.nil?
+    now = tx.now
+    tx.conn.execute(%(UPDATE "memberships" SET "unread_at" = ?, "updated_at" = ? WHERE "memberships"."id" = ?), [nil, now, @id] of SqlValue)
+    @unread_at = nil
+    @updated_at = now
+  end
+
+  pub def unread? : Bool
+    !@unread_at.nil?
+  end
+
+  # `destroy`: the user's sockets reconnect after commit, so their
+  # subscriptions to this room are dropped.
+  pub def destroy(tx : Tx) : Nil
+    tx.conn.execute(%(DELETE FROM "memberships" WHERE "memberships"."id" = ?), [@id] of SqlValue)
+    tx.emit_after_commit(DisconnectUser.new(@user_id, true))
+  end
+
+  # `Membership.disconnect_all`
+  pub def self.disconnect_all(tx : Tx) : Int64
+    now = tx.now
+    tx.conn.execute(%(UPDATE "memberships" SET "connected_at" = ?, "connections" = ?, "updated_at" = ? WHERE "memberships"."connected_at" >= ?), [nil, 0_i64, now, connection_cutoff(now)] of SqlValue)
+  end
+
+  # `Membership.connect(membership, connections)`: no `updated_at`.
+  pub def self.connect(tx : Tx, id : Int64, connections : Int64) : Nil
+    tx.conn.execute(%(UPDATE "memberships" SET "connections" = ?, "connected_at" = ?, "unread_at" = ? WHERE "memberships"."id" = ?), [connections, tx.now, nil, id] of SqlValue)
+  end
+
+  # `connected?`
+  pub def connected?(now : Timestamp) : Bool
+    at = @connected_at
+    !at.nil? && at >= Membership.connection_cutoff(now)
+  end
+
+  # `present`
+  pub def present(tx : Tx) : Nil
+    connections = connected?(tx.now) ? @connections + 1 : 1_i64
+    Membership.connect(tx, @id, connections)
+  end
+
+  # `connected`
+  pub def connected(tx : Tx) : Nil
+    increment_connections(tx)
+    touch_connected_at(tx)
+  end
+
+  # `disconnected`
+  pub def disconnected(tx : Tx) : Nil
+    decrement_connections(tx)
+    if @connections < 1 && !@connected_at.nil?
+      now = tx.now
+      tx.conn.execute(%(UPDATE "memberships" SET "connected_at" = ?, "updated_at" = ? WHERE "memberships"."id" = ?), [nil, now, @id] of SqlValue)
+      @connected_at = nil
+      @updated_at = now
+    end
+  end
+
+  # `refresh_connection`
+  pub def refresh_connection(tx : Tx) : Nil
+    increment_connections(tx) unless connected?(tx.now)
+    touch_connected_at(tx)
+  end
+
+  def increment_connections(tx : Tx) : Nil
+    connected?(tx.now) ? update_counter(tx, 1_i64) : update_connections(tx, 1_i64)
+  end
+
+  def decrement_connections(tx : Tx) : Nil
+    connected?(tx.now) ? update_counter(tx, -1_i64) : update_connections(tx, 0_i64)
+  end
+
+  # `increment!(:connections, touch: true)` / `decrement!`
+  def update_counter(tx : Tx, by : Int64) : Nil
+    now = tx.now
+    sign = by >= 0 ? "+" : "-"
+    tx.conn.execute(%(UPDATE "memberships" SET "connections" = COALESCE("memberships"."connections", 0) #{sign} ?, "updated_at" = ? WHERE "memberships"."id" = ?), [by.abs, now, @id] of SqlValue)
+    @connections += by
+    @updated_at = now
+  end
+
+  # `update!(connections:)`, a no-op when unchanged.
+  def update_connections(tx : Tx, connections : Int64) : Nil
+    return if @connections == connections
+    now = tx.now
+    tx.conn.execute(%(UPDATE "memberships" SET "connections" = ?, "updated_at" = ? WHERE "memberships"."id" = ?), [connections, now, @id] of SqlValue)
+    @connections = connections
+    @updated_at = now
+  end
+
+  # `touch :connected_at`
+  def touch_connected_at(tx : Tx) : Nil
+    now = tx.now
+    tx.conn.execute(%(UPDATE "memberships" SET "updated_at" = ?, "connected_at" = ? WHERE "memberships"."id" = ?), [now, now, @id] of SqlValue)
+    @connected_at = now
+    @updated_at = now
+  end
+end

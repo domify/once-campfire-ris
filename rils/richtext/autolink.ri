@@ -1,0 +1,301 @@
+# rails_autolink 1.1.8's `auto_link(text, html: { target: "_blank" },
+# sanitize_options: ...)`, as `MessagesHelper#message_presentation` calls
+# it (the Rust port's richtext/src/autolink.rs). It works on the
+# serialized HTML with regular expressions, so the exact serialization of
+# the steps before matters.
+#
+# One deliberate difference closes a stored XSS in rails_autolink: the
+# sanitized HTML is written with `<` and `>` escaped in attribute values,
+# so every `<` and `>` in the text is a tag's, and auto_link only ever
+# inserts links between tags.
+module rils/richtext/autolink
+
+import std/int
+import std/text
+import std/regex::{Regex}
+import rils/ruby/uri::{url_encode}
+import rils/richtext/nodes::{Failure}
+import rils/richtext/sanitizer::{sanitize, defaults, SafeList}
+import rils/richtext/chars::{blank?, char_at, char_start_before, html_escape, ascii_alphanumeric?}
+
+# `AUTO_LINK_RE`. Ruby's `\s` and `\w` are ASCII-only.
+AUTO_LINK_RE = Regex.new(
+  "(?:(?i:((?:ed2k|ftp|http|https|irc|mailto|news|gopher|nntp|telnet|webcal|xmpp|callto|feed|svn|urn|aim|rsync|" \
+  "tag|ssh|sftp|rtsp|afs|file):))//|(?i:www)\\.[a-zA-Z0-9_])[^ \\t\\r\\n\\x0B\\x0C<\\x{A0}\"]+")
+
+# Rust's (and Ruby's `\p{Word}`) Unicode `\w`: Alphabetic, marks, decimal
+# digits, connector punctuation and the join controls. Alphabetic is the
+# letters, the letter numbers and Other_Alphabetic, whose characters
+# outside the marks are the enclosed letters spelled output here.
+WORD_CHAR = Regex.new("[\\p{L}\\p{M}\\p{Nd}\\p{Nl}\\p{Pc}\\x{200C}\\x{200D}\\x{24B6}-\\x{24E9}" \
+                      "\\x{1F130}-\\x{1F149}\\x{1F150}-\\x{1F169}\\x{1F170}-\\x{1F189}]")
+
+private def word_char?(text : String, at : Int32) : Bool
+  !WORD_CHAR.match_at(text, at).nil?
+end
+
+private def email_local_char?(byte : UInt8) : Bool
+  return true if ascii_alphanumeric?(byte)
+  "_.!#$%&'*/=?^`{|}~+-".as_tape.each_byte { |c| return true if c == byte }
+  false
+end
+
+# What `auto_linked?(left, right)` asks about the text around a match,
+# answered from an index of the text made once, by binary search: the
+# regular expressions over the whole of `left`, as rails_autolink runs
+# them, take quadratic time.
+class TagIndex
+  # Where `<` and `>` are, ascending.
+  @lts : Array(Int32)
+  @gts : Array(Int32)
+  # The first `\n` that ends a line inside an unclosed tag, after which
+  # `/<[^>]+$/` matches every `left`.
+  @first_dangling_newline : Int32
+  # Each `/<a\b.*?>/i` match, ascending and disjoint.
+  @open_starts : Array(Int32)
+  @open_ends : Array(Int32)
+  # Where `</a>` is, in any case.
+  @close_anchors : Array(Int32)
+
+  def initialize(text : String)
+    @lts = [] of Int32
+    @gts = [] of Int32
+    @first_dangling_newline = -1
+    @open_starts = [] of Int32
+    @open_ends = [] of Int32
+    @close_anchors = [] of Int32
+    bytes = text.as_tape
+    unclosed_lt = -1
+    i = 0
+    while i < bytes.bytesize
+      b = bytes[i]
+      if b == 0x3c_u8
+        @lts << i
+        unclosed_lt = i if unclosed_lt < 0
+        if i + 4 <= bytes.bytesize && bytes[i + 1] == 0x2f_u8 && (bytes[i + 2] | 0x20_u8) == 0x61_u8 &&
+           bytes[i + 3] == 0x3e_u8
+          @close_anchors << i
+        end
+        after_previous = @open_ends.empty? || @open_ends.last <= i
+        if after_previous
+          stop = open_anchor_end(text, i)
+          if stop >= 0
+            @open_starts << i
+            @open_ends << stop
+          end
+        end
+      elsif b == 0x3e_u8
+        @gts << i
+        unclosed_lt = -1
+      elsif b == 0x0a_u8 && @first_dangling_newline < 0 && unclosed_lt >= 0 && unclosed_lt + 2 <= i
+        @first_dangling_newline = i
+      end
+      i = i + 1
+    end
+  end
+
+  # `/\A<a\b.*?>/i` at the `<` at *at*: where it ends, or -1. `.` stops at
+  # a newline, and `\b` is Unicode's, as Rust's.
+  private def open_anchor_end(text : String, at : Int32) : Int32
+    bytes = text.as_tape
+    return -1 unless at + 1 < bytes.bytesize && (bytes[at + 1] | 0x20_u8) == 0x61_u8
+    k = at + 2
+    return -1 if k >= bytes.bytesize
+    return -1 if word_char?(text, k)
+    while k < bytes.bytesize
+      return k + 1 if bytes[k] == 0x3e_u8
+      return -1 if bytes[k] == 0x0a_u8
+      k = k + 1
+    end
+    -1
+  end
+
+  # How many of *list* are below *value*.
+  private def below(list : Array(Int32), value : Int32) : Int32
+    low = 0
+    high = list.size
+    while low < high
+      middle = (low + high) // 2
+      if list[middle] < value
+        low = middle + 1
+      else
+        high = middle
+      end
+    end
+    low
+  end
+
+  # `auto_linked?(text[...start], text[end..])`: inside a tag, or inside an
+  # unclosed `<a>`.
+  def auto_linked?(start : Int32, stop : Int32) : Bool
+    (open_tag_at_line_end?(start) && closes_tag?(stop)) || inside_anchor?(start)
+  end
+
+  # `left =~ /<[^>]+$/`
+  private def open_tag_at_line_end?(start : Int32) : Bool
+    return true if @first_dangling_newline >= 0 && @first_dangling_newline < start
+    gts_before = below(@gts, start)
+    first = 0
+    if gts_before > 0
+      last_gt = @gts[gts_before - 1]
+      first = below(@lts, last_gt + 1)
+    end
+    first < @lts.size && @lts[first] + 2 <= start
+  end
+
+  # `right =~ /^[^>]*>/`, which matches whenever `right` has a `>`.
+  private def closes_tag?(stop : Int32) : Bool
+    !@gts.empty? && @gts.last >= stop
+  end
+
+  # The last `<a ...>` wholly in `left` isn't closed before `left` ends.
+  private def inside_anchor?(start : Int32) : Bool
+    before = below(@open_ends, start + 1)
+    return false if before == 0
+    anchor_end = @open_ends[before - 1]
+    close = below(@close_anchors, anchor_end)
+    !(close < @close_anchors.size && @close_anchors[close] + 4 <= start)
+  end
+end
+
+BRACKETS = ['[', ']', '(', ')', '{', '}']
+
+# `auto_link(html, html: { target: "_blank" }, sanitize_options: ...)`
+pub def auto_link(text : Str, list : SafeList) : Str | Failure
+  return "".as_tape if blank?(text)
+  sanitized = sanitize(text, list, true)!
+  linked = auto_link_urls(sanitized.to_heap)!
+  auto_link_email_addresses(linked)
+end
+
+private def auto_link_urls(text : String) : String | Failure
+  tags = TagIndex.new(text)
+  bytes = text.as_tape
+  output = Str::Builder.new(text.bytesize + 64)
+  last = 0
+  found = [] of Tuple(Int32, Int32, Bool)
+  AUTO_LINK_RE.each_match(text) { |m| found << {m.byte_begin(0), m.byte_end(0), !m[1]?.nil?} }
+  found.each do |match|
+    start, stop, has_scheme = match
+    output << bytes[last, start - last]
+    last = stop
+    if tags.auto_linked?(start, stop)
+      output << bytes[start, stop - start]
+      next
+    end
+    chars = bytes[start, stop - start].to_heap.chars
+    punctuation = [] of Char
+    counts = Hash(Char, Int32).new(0)
+    chars.each { |c| counts[c] += 1 if BRACKETS.includes?(c) }
+    while !chars.empty?
+      c = chars.last
+      break if word_char?(c.to_s, 0) || c == '/' || c == '-' || c == '=' || c == ';'
+      chars.pop
+      punctuation << c
+      counts[c] -= 1 if BRACKETS.includes?(c)
+      opening = case c
+                when ']' then '['
+                when ')' then '('
+                when '}' then '{'
+                else          nil
+                end
+      if opening && counts[opening] > counts[c]
+        chars << punctuation.pop
+        break
+      end
+    end
+    href = chars.join
+    trailing_gt = ""
+    if href.ends_with?("&gt;")
+      href = href[0, href.size - 4]
+      trailing_gt = "&gt;"
+    end
+    link_text = href
+    href = "http://#{href}" unless has_scheme
+    text_html = sanitize(Str.new(link_text), defaults)!
+    href_html = sanitize(Str.new(href), defaults)!
+    # content_tag(:a, link_text, attrs, false): nothing escaped but double
+    # quotes in attributes
+    output << "<a target=\"_blank\" href=\""
+    href_html.each_byte { |b| b == 0x22_u8 ? (output << "&quot;") : output.push(b) }
+    output << "\">" << text_html << "</a>"
+    # SafeBuffer#+ escapes the (unsafe) punctuation string
+    html_escape(Str.new(punctuation.reversed.join), output)
+    output << trailing_gt
+  end
+  output << bytes[last, bytes.bytesize - last]
+  output.finish.to_heap
+end
+
+# `AUTO_EMAIL_RE` (without its lookbehind, which the caller checks) at
+# *at*: where the address ends, or -1.
+private def email_end(bytes : Str, at : Int32) : Int32
+  return -1 unless at < bytes.bytesize
+  first = bytes[at]
+  return -1 unless ascii_alphanumeric?(first) || "_.!#$%+-".as_tape.includes?(first.unsafe_chr)
+  i = at + 1
+  while i < bytes.bytesize && email_local_char?(bytes[i])
+    i = i + 1
+  end
+  return -1 unless i < bytes.bytesize && bytes[i] == 0x40_u8
+  i = i + 1
+  labels = 0
+  stop = -1
+  while true
+    label = i
+    while i < bytes.bytesize && domain_char?(bytes[i])
+      i = i + 1
+    end
+    break if i == label
+    labels = labels + 1
+    stop = i
+    break unless i < bytes.bytesize && bytes[i] == 0x2e_u8
+    i = i + 1
+  end
+  labels >= 2 ? stop : -1
+end
+
+private def domain_char?(byte : UInt8) : Bool
+  ascii_alphanumeric?(byte) || byte == 0x5f_u8 || byte == 0x2d_u8
+end
+
+private def auto_link_email_addresses(text : String) : Str | Failure
+  bytes = text.as_tape
+  tags = TagIndex.new(text)
+  output = Str::Builder.new(text.bytesize + 64)
+  copied = 0
+  position = 0
+  while position < bytes.bytesize
+    preceded = position > 0 && email_local_char?(bytes[char_start_before(bytes, position)]) &&
+               bytes[char_start_before(bytes, position)] < 0x80_u8
+    stop = preceded ? -1 : email_end(bytes, position)
+    if stop < 0
+      _, width = char_at(bytes, position)
+      position = position + width
+      next
+    end
+    email = bytes[position, stop - position]
+    output << bytes[copied, position - copied]
+    if tags.auto_linked?(position, stop)
+      output << email
+    else
+      sanitized = sanitize(email, defaults)!
+      output << "<a target=\"_blank\" href=\"" <<
+        html_escape(
+          Str.new("mailto:" + url_encode(sanitized.to_heap).gsub("%40", "@")),
+        ) << "\">"
+      # display_text is only sanitized (and so marked safe) when sanitizing
+      # changed the address
+      if sanitized == email
+        output << html_escape(email)
+      else
+        output << sanitized
+      end
+      output << "</a>"
+    end
+    copied = stop
+    position = stop > position + 1 ? stop : position + 1
+  end
+  output << bytes[copied, bytes.bytesize - copied]
+  output.finish
+end

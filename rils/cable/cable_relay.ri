@@ -1,0 +1,71 @@
+# Broadcasts between the threads (or processes) that serve one database:
+# each has its own `PubSub`, so a broadcast made on one is written to a
+# small SQLite database beside the app's, and every other one reads it back
+# and delivers it to its own subscribers, as `solid_cable` does for Rails.
+# A single thread doesn't use it.
+module rils/cable/cable_relay
+
+import std/text
+import std/time::{Time}
+import rils/record/sqlite::{Connection, SqlValue}
+import rils/rails_compat/crypto::{uuid}
+import rils/cable/pubsub::{PubSub}
+
+# How often the others' broadcasts are looked for, and how long they're
+# kept (`solid_cable`'s polling interval and message retention).
+POLL_INTERVAL_MS  = 50
+RETENTION_SECONDS = 60_i64
+
+pub class CableRelay
+  getter origin : String
+  @conn : Connection
+  @last_id : Int64
+  @polls : Int64
+
+  def initialize(path : String, @pubsub : PubSub)
+    @origin = uuid
+    @conn = Connection.open(path)
+    @conn.busy_timeout(5000)
+    @conn.execute_batch("PRAGMA synchronous = normal")
+    # Only what's broadcast from now on.
+    @last_id = @conn.query_all(%(SELECT COALESCE(MAX("id"), 0) FROM "cable_messages"), [] of SqlValue) { |row| row.int(0) }.first? || 0_i64
+    @polls = 0_i64
+    relay = self
+    @pubsub.relay = ->(stream : String, message : String) { relay.publish(stream, message); nil }
+  end
+
+  # The database and its table, in WAL mode; once, before the threads
+  # open it.
+  pub def self.prepare(path : String) : Nil
+    conn = Connection.open(path)
+    conn.busy_timeout(5000)
+    conn.execute_batch(%(PRAGMA journal_mode = wal; CREATE TABLE IF NOT EXISTS "cable_messages" ("id" INTEGER PRIMARY KEY AUTOINCREMENT, "origin" TEXT NOT NULL, "stream" TEXT NOT NULL, "message" TEXT NOT NULL, "created_at" INTEGER NOT NULL)))
+    conn.close
+  end
+
+  pub def publish(stream : String, message : String) : Nil
+    @conn.execute(%(INSERT INTO "cable_messages" ("origin", "stream", "message", "created_at") VALUES (?, ?, ?, ?)), [@origin, stream, message, Time.utc.to_unix] of SqlValue)
+  end
+
+  # Delivers the others' broadcasts since the last poll; now and then
+  # drops the old ones.
+  pub def poll : Nil
+    rows = @conn.query_all(%(SELECT "id", "origin", "stream", "message" FROM "cable_messages" WHERE "id" > ? ORDER BY "id"), [@last_id] of SqlValue) { |row| {row.int(0), row.text(1), row.text(2), row.text(3)} }
+    rows.each do |id, origin, stream, message|
+      @last_id = id
+      @pubsub.deliver(stream, message) unless origin == @origin
+    end
+    @polls += 1
+    if @polls % 200 == 0
+      @conn.execute(%(DELETE FROM "cable_messages" WHERE "created_at" < ?), [Time.utc.to_unix - RETENTION_SECONDS] of SqlValue)
+    end
+  end
+
+  # The poller's loop.
+  pub def run : Nil
+    loop do
+      sleep(POLL_INTERVAL_MS)
+      poll
+    end
+  end
+end

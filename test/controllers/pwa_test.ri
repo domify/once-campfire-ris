@@ -1,0 +1,35 @@
+# The manifest, the service worker and the QR codes, through the drawn
+# routes.
+module test/controllers/pwa_test
+
+import std/text
+import std/json::{JSON}
+import rils/rails_compat/encoding::{urlsafe_encode_unpadded}
+import test/testing::*
+import web/web/spec::*
+
+describe "pwa" do
+  it "serves the manifest and the service worker to anyone" do
+    client = Client.new
+    manifest = client.get("/webmanifest.json")
+    assert manifest.status == 200
+    assert (manifest["content-type"] || "").starts_with?("application/json")
+    parsed = JSON.parse(body(manifest))
+    assert parsed["name"].as_s == "37signals"
+    assert parsed["icons"][0]["src"].as_s.starts_with?("/account/logo?size=small&v=")
+    worker = client.get("/service-worker.js")
+    assert worker.status == 200
+    assert body(worker).includes?("self.addEventListener")
+  end
+end
+
+describe "qr_code" do
+  it "draws a URL, cached for a year" do
+    client = Client.new
+    response = client.get("/qr_code/#{urlsafe_encode_unpadded("http://campfire.test")}")
+    assert response.status == 200
+    assert body(response).starts_with?(%(<?xml version="1.0" standalone="yes"?><svg))
+    assert (response["cache-control"] || "").includes?("max-age=31556952")
+    assert client.get("/qr_code/a").status == 500
+  end
+end

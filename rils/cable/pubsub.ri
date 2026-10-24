@@ -1,0 +1,73 @@
+# Action Cable's pubsub: broadcasts by name, to whoever is streaming from
+# it. Messages are already Active Support JSON. One per App, so one per
+# kernel thread; `relay` carries each broadcast to the others (see
+# `campfire/cable_relay`).
+module rils/cable/pubsub
+
+pub alias Listener = Proc(String, Nil)
+
+pub class Listening
+  getter stream : String
+  getter listener : Listener
+  getter id : Int64
+
+  def initialize(@stream : String, @listener : Listener, @id : Int64)
+  end
+end
+
+pub class PubSub
+  @streams : Hash(String, Array(Listening))
+  @next_id : Int64
+  # Called with every local broadcast, to pass it on to other threads.
+  property relay : Proc(String, String, Nil)?
+  # Every broadcast, for tests: stream and message.
+  property recorded : Array(Tuple(String, String))?
+
+  def initialize
+    @streams = {} of String => Array(Listening)
+    @next_id = 0_i64
+    @relay = nil
+    @recorded = nil
+  end
+
+  pub def subscribe(stream : String, listener : Listener) : Listening
+    @next_id += 1
+    subscription = Listening.new(stream, listener, @next_id)
+    (@streams[stream] ||= [] of Listening) << subscription
+    subscription
+  end
+
+  pub def unsubscribe(subscription : Listening) : Nil
+    if list = @streams[subscription.stream]?
+      kept = list.reject { |other| other.id == subscription.id }
+      if kept.empty?
+        @streams.delete(subscription.stream)
+      else
+        @streams[subscription.stream] = kept
+      end
+    end
+  end
+
+  # `ActionCable.server.broadcast`: delivered here and relayed. Returns
+  # how many local subscribers got it.
+  pub def broadcast(stream : String, message : String) : Int32
+    if recorded = @recorded
+      recorded << {stream, message}
+    end
+    if relay = @relay
+      relay.call(stream, message)
+    end
+    deliver(stream, message)
+  end
+
+  # A broadcast from elsewhere: only the local subscribers.
+  pub def deliver(stream : String, message : String) : Int32
+    list = @streams[stream]? || return 0
+    list.dup.each(&.listener.call(message))
+    list.size
+  end
+
+  pub def subscribers(stream : String) : Int32
+    (@streams[stream]? || [] of Listening).size
+  end
+end

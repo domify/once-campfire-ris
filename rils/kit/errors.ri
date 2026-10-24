@@ -1,0 +1,105 @@
+# Errors an action can return, and the status Rails would answer with.
+#
+# Rails maps exception classes to statuses in
+# `ActionDispatch::ExceptionWrapper.rescue_responses` and renders
+# `public/<status>.html` through `ActionDispatch::PublicExceptions`. A halt
+# is not an error at all: it's how a before-action that rendered or
+# redirected stops the chain.
+module rils/kit/errors
+
+import rils/kit/response::{Response}
+
+pub enum HttpErrorKind
+  # A before-action (or the action itself) produced the response; stop and
+  # send it.
+  Halt
+  # `ActionController::BadRequest`, `ParamError`s,
+  # `Parameters::ParseError`.
+  BadRequest
+  # `ActionController::ParameterMissing`.
+  ParameterMissing
+  # `ActionController::InvalidAuthenticityToken` (the `:exception` forgery
+  # strategy).
+  InvalidAuthenticityToken
+  # `ActionController::InvalidCrossOriginRequest`.
+  InvalidCrossOriginRequest
+  # `ActionController::UnknownFormat` / `MissingExactTemplate`.
+  UnknownFormat
+  # `ActiveRecord::RecordNotFound`, `ActionController::RoutingError`.
+  NotFound
+  # `ActionController::UnknownHttpMethod`.
+  MethodNotAllowed
+  # `ActionDispatch::Cookies::CookieOverflow` (not rescued by Rails: a 500).
+  CookieOverflow
+  # `ActionController::Redirecting::UnsafeRedirectError` and friends (a
+  # 500).
+  UnsafeRedirect
+  # `ActionDispatch::RemoteIp::IpSpoofAttackError` (a 500).
+  IpSpoofAttack
+  # Any other status an app wants to map an error to.
+  Status
+  Internal
+end
+
+pub class HttpError
+  getter kind : HttpErrorKind
+  getter detail : String
+  getter halted : Response?
+  getter code : Int32
+
+  def initialize(@kind : HttpErrorKind, @detail : String = "", @halted : Response? = nil, @code : Int32 = 500)
+  end
+
+  pub def self.status(code : Int32, detail : String = "") : HttpError
+    HttpError.new(HttpErrorKind::Status, detail, nil, code)
+  end
+
+  pub def self.internal(detail : String) : HttpError
+    HttpError.new(HttpErrorKind::Internal, detail)
+  end
+
+  pub def self.not_found : HttpError
+    HttpError.new(HttpErrorKind::NotFound)
+  end
+
+  pub def self.bad_request(detail : String) : HttpError
+    HttpError.new(HttpErrorKind::BadRequest, detail)
+  end
+
+  pub def status : Int32
+    halted = @halted
+    return halted.status if halted
+    case @kind
+    when HttpErrorKind::BadRequest, HttpErrorKind::ParameterMissing                   then 400
+    when HttpErrorKind::InvalidAuthenticityToken, HttpErrorKind::InvalidCrossOriginRequest then 422
+    when HttpErrorKind::UnknownFormat                                                  then 406
+    when HttpErrorKind::NotFound                                                       then 404
+    when HttpErrorKind::MethodNotAllowed                                               then 405
+    when HttpErrorKind::Status                                                         then @code
+    else                                                                                    500
+    end
+  end
+end
+
+impl Error for HttpError
+  def message : String
+    case @kind
+    when HttpErrorKind::Halt                     then "halted"
+    when HttpErrorKind::ParameterMissing         then "param is missing or the value is empty or invalid: #{@detail}"
+    when HttpErrorKind::InvalidAuthenticityToken then "invalid authenticity token: #{@detail}"
+    when HttpErrorKind::InvalidCrossOriginRequest then "invalid cross-origin request"
+    when HttpErrorKind::UnknownFormat            then "unknown format"
+    when HttpErrorKind::NotFound                 then "not found"
+    when HttpErrorKind::MethodNotAllowed         then "unknown http method"
+    when HttpErrorKind::IpSpoofAttack            then "IP spoofing attack"
+    when HttpErrorKind::BadRequest               then "bad request: #{@detail}"
+    else                                              @detail
+    end
+  end
+end
+
+# Stop the before-action chain with *response*, like a Rails callback that
+# renders or redirects.
+pub def halt(response : Response) : HttpError
+  HttpError.new(HttpErrorKind::Halt, "", response)
+end

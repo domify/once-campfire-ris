@@ -1,0 +1,41 @@
+# Active Storage's `Content-Disposition` for a blob, and the Journey path
+# escaping of the `*filename` glob in its routes.
+module rils/storage/disposition
+
+import std/text
+import std/int
+import rils/rails_compat/content_disposition::{content_disposition}
+
+# `ActiveStorage::Service#content_disposition_with`: anything but
+# "attachment" is "inline".
+pub def content_disposition_with(disposition : String, sanitized_filename : String) : String
+  content_disposition(disposition == "attachment" ? "attachment" : "inline", sanitized_filename)
+end
+
+HEX = "0123456789ABCDEF"
+
+def percent_escape(s : String, keep : String) : String
+  String.build(s.bytesize) do |io|
+    s.each_byte do |byte|
+      alnum = (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
+      if alnum || (byte < 0x80 && keep.byte_index(byte.unsafe_chr.to_s))
+        io.write_byte(byte)
+      else
+        io << '%'
+        io.write_byte(HEX.as_tape[(byte >> 4).to_i32])
+        io.write_byte(HEX.as_tape[(byte & 15).to_i32])
+      end
+    end
+  end
+end
+
+# `Journey::Router::Utils.escape_path`: keeps unreserved, sub-delims, ":",
+# "@" and "/".
+pub def escape_path(s : String) : String
+  percent_escape(s, "-._~!$&'()*+,;=:@/")
+end
+
+# `Journey::Router::Utils.escape_segment`: "/" is escaped too.
+pub def escape_segment(s : String) : String
+  percent_escape(s, "-._~!$&'()*+,;=:@")
+end

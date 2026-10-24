@@ -1,0 +1,95 @@
+# The message pages and `rooms/involvements/show` against the reference's
+# renders (vectors/views_b), region by region.
+module test/views/messages/pages_test
+
+import std/text
+import rils/record/timestamp::{Timestamp}
+import rils/template/recorded::{Fragment}
+import views/messages/messages::{Show, RoomNotFound, BoostsIndex, BoostsNew, Edit, Index, CreateTurboStream, DestroyTurboStream, RefreshTurboStream, MessageFragmentKey, message_fragment, message_fragment_key}
+import views/rooms::{InvolvementsShow, RoomView}
+import test/views/golden_b::*
+import web/web/spec::*
+
+describe "message pages" do
+  it "renders messages/show" do
+    ["messages_show_text", "messages_show_image"].each do |name|
+      golden = GoldenB.new(name)
+      golden.assert_dom(Show.new(golden.context, message_view(golden.input)).page.to_s)
+    end
+  end
+
+  it "renders messages/room_not_found" do
+    golden = GoldenB.new("messages_room_not_found")
+    golden.assert_dom(RoomNotFound.new(golden.context).page.to_s)
+  end
+
+  it "renders messages/boosts/index in the frame layout" do
+    # The boost's Cancel link loads it into the boosts frame.
+    golden = GoldenB.new("messages_boosts_index")
+    golden.assert_dom(BoostsIndex.new(golden.context, message_view(golden.input)).page(frame: true).to_s)
+  end
+
+  it "renders messages/boosts/new" do
+    golden = GoldenB.new("messages_boosts_new")
+    input = golden.input
+    golden.assert_dom(BoostsNew.new(golden.context, message_view(input["message"]), user_view(input["user"])).page.to_s)
+  end
+
+  it "renders messages/edit for a text and an attachment" do
+    ["messages_edit_text", "messages_edit_attachment"].each do |name|
+      golden = GoldenB.new(name)
+      input = golden.input
+      golden.assert_dom(Edit.new(golden.context, message_view(input["message"]), input["editable_body_html"].as_s).page.to_s)
+    end
+  end
+
+  it "builds a message view once on a cache miss and never on a hit" do
+    golden = GoldenB.new("messages_show_text")
+    ctx = golden.context
+    message = message_view(golden.input)
+    key = message_fragment_key(message.id, Timestamp.from_time(message.updated_at).microseconds)
+    fragments = {} of MessageFragmentKey => Fragment
+    calls = 0
+    first = message_fragment(ctx, key, fragments) do
+      calls += 1
+      message
+    end
+    assert calls == 1
+    assert first.to_s == message_fragment(ctx, message).to_s
+    second = message_fragment(ctx, key, fragments) do
+      calls += 1
+      message
+    end
+    assert calls == 1
+    assert second.to_s == first.to_s
+  end
+
+  it "renders messages/index" do
+    golden = GoldenB.new("messages_index")
+    ctx = golden.context
+    golden.assert_dom(Index.new(ctx, golden.input["messages"].as_a.map { |m| message_fragment(ctx, message_view(m)) }).render.to_s)
+  end
+
+  it "renders the create and destroy turbo streams" do
+    golden = GoldenB.new("messages_create")
+    golden.assert_dom(CreateTurboStream.new(golden.context, message_view(golden.input["message"]), golden.input["room_kind"].as_s).render.to_s)
+    golden = GoldenB.new("messages_destroy")
+    golden.assert_dom(DestroyTurboStream.new(golden.context, message_view(golden.input)).render.to_s)
+  end
+
+  it "renders a room's refresh" do
+    golden = GoldenB.new("rooms_refreshes_show")
+    input = golden.input
+    golden.assert_dom(RefreshTurboStream.new(golden.context, input["room_id"].as_i64, input["room_kind"].as_s,
+      input["new_messages"].as_a.map { |m| message_view(m) }, input["updated_messages"].as_a.map { |m| message_view(m) }).render.to_s)
+  end
+
+  it "renders rooms/involvements/show" do
+    ["rooms_involvements_show", "rooms_involvements_show_direct"].each do |name|
+      golden = GoldenB.new(name)
+      input = golden.input
+      room = RoomView.new(input["room_id"].as_i64, input["kind"].as_s, nil, "")
+      golden.assert_dom(InvolvementsShow.new(golden.context, room, input["involvement"].as_s).page.to_s)
+    end
+  end
+end

@@ -1,0 +1,129 @@
+# `ApplicationPlatform` (reference/app/models/application_platform.rb, over
+# platform_agent 1.0.1) and `allow_browser`'s check
+# (reference/app/controllers/concerns/allow_browser.rb), as the Rust port's
+# crates/campfire/src/concerns/platform.rs has them.
+module models/application_platform
+
+import std/text
+import views/context::{Platform}
+import rils/user_agent::{Agent, Raised, Version, parse, present?, downcase_for_ascii}
+
+# What `chrome?`, `firefox?`, `safari?` and `edge?` look for in the gem's
+# `browser`.
+CHROME  = ["Chrome"]
+FIREFOX = ["Firefox", "FxiOS"]
+SAFARI  = ["Safari"]
+EDGE    = ["Edg"]
+
+# `ApplicationPlatform.new(request.user_agent)`. A predicate that raises in
+# Ruby (on a nil `browser`, which Rails turns into a 500) answers false.
+pub class ApplicationPlatform
+  getter user_agent_string : String
+  getter agent : Agent
+
+  def initialize(user_agent : String?)
+    # `match?` reads `user_agent_string.to_s`; UserAgent.parse takes nil as "".
+    @user_agent_string = user_agent || ""
+    @agent = parse(@user_agent_string)
+  end
+
+  def matches?(needle : String) : Bool
+    @user_agent_string.includes?(needle)
+  end
+
+  pub def ios? : Bool
+    matches?("iPhone") || matches?("iPad")
+  end
+
+  pub def android? : Bool
+    matches?("Android")
+  end
+
+  pub def mac? : Bool
+    matches?("Macintosh")
+  end
+
+  # Apple Messages' link previews claim to be both Facebook's and
+  # Twitter's bots.
+  pub def apple_messages? : Bool
+    lowered = downcase_for_ascii(@user_agent_string)
+    lowered.includes?("facebookexternalhit") && lowered.includes?("twitterbot")
+  end
+
+  pub def mobile? : Bool
+    ios? || android?
+  end
+
+  pub def desktop? : Bool
+    !mobile?
+  end
+
+  # `operating_system`: nil when the gem's `os` is nil.
+  pub def try_operating_system : String? | Raised
+    platform = @agent.try_platform
+    return platform if platform.is_a?(Raised)
+    text = platform || ""
+    [{"Android", "Android"}, {"iPad", "iPad"}, {"iPhone", "iPhone"}, {"Macintosh", "macOS"}, {"Windows", "Windows"}, {"CrOS", "ChromeOS"}].each do |(needle, name)|
+      return name if text.includes?(needle)
+    end
+    os = @agent.try_os
+    return os if os.is_a?(Raised)
+    os && os.includes?("Linux") ? "Linux" : os
+  end
+
+  # The platform as the views see it: `browser` and `operating_system`
+  # are "" when nil or raised.
+  pub def to_view : Platform
+    browser = @agent.try_browser
+    operating_system = try_operating_system
+    platform = Platform.new
+    platform.ios = ios?
+    platform.android = android?
+    platform.mac = mac?
+    platform.windows = operating_system == "Windows"
+    platform.chrome = browser_matches?(browser, CHROME)
+    platform.firefox = browser_matches?(browser, FIREFOX)
+    platform.safari = browser_matches?(browser, SAFARI)
+    platform.edge = browser_matches?(browser, EDGE)
+    platform.mobile = mobile?
+    platform.desktop = desktop?
+    platform.apple_messages = apple_messages?
+    platform.browser = browser.is_a?(String) ? browser : ""
+    platform.operating_system = operating_system.is_a?(String) ? operating_system : ""
+    platform
+  end
+
+  # `ActionController::AllowBrowser::BrowserBlocker#blocked?` with
+  # Campfire's `VERSIONS = { safari: 17.2, chrome: 120, firefox: 121,
+  # opera: 104, ie: false }`; Raised where Rails raises.
+  pub def try_browser_blocked : Bool | Raised
+    return false unless present?(@user_agent_string)
+    version = @agent.try_version
+    return version if version.is_a?(Raised)
+    return false if version.nil? || !version.present?
+    browser = @agent.try_browser
+    return browser if browser.is_a?(Raised)
+    return Raised.new if browser.nil?
+    minimum = case downcase_for_ascii(browser)
+              when "safari"            then "17.2"
+              when "chrome"            then "120"
+              when "firefox"           then "121"
+              when "opera"             then "104"
+              when "internet explorer" then ""
+              else                          return false
+              end
+    below = minimum.empty? || version < Version.new(minimum)
+    below && !@agent.bot?
+  end
+
+  # Not blocked where Rails would raise.
+  pub def browser_blocked? : Bool
+    blocked = try_browser_blocked
+    blocked.is_a?(Bool) ? blocked : false
+  end
+end
+
+# `user_agent.browser.match?(/A|B/)`, false where a nil browser raises.
+def browser_matches?(browser : String? | Raised, names : Array(String)) : Bool
+  browser.is_a?(String) ? names.any? { |name| browser.includes?(name) } : false
+end

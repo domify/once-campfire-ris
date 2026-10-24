@@ -1,0 +1,34 @@
+# `rate_limit to:, within:`'s counters: `Rails.cache.increment(key, 1,
+# expires_in: within)`, which sets the expiry only when a counter starts,
+# so a window is fixed from its first hit and doesn't slide. One `App`
+# holds them, so a thread counts its own requests: with THREADS or a
+# process per core, a client could sign in that many times more often.
+module rils/kit/rate_limit
+
+import std/time::{Time, Span}
+
+class Counter
+  property count : Int32
+  getter expires_at : Time
+
+  def initialize(@count : Int32, @expires_at : Time)
+  end
+end
+
+pub class RateLimits
+  @counters : Hash(String, Counter)
+
+  def initialize
+    @counters = {} of String => Counter
+  end
+
+  # The count for *key* after this hit.
+  pub def increment(key : String, within : Span, now : Time) : Int32
+    expired = [] of String
+    @counters.each { |name, counter| expired << name if counter.expires_at <= now }
+    expired.each { |name| @counters.delete(name) }
+    counter = @counters[key]? || (@counters[key] = Counter.new(0, now + within))
+    counter.count += 1
+    counter.count
+  end
+end

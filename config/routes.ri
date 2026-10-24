@@ -1,0 +1,142 @@
+# Campfire's route table (`routes/draw`) bound to its actions. A route
+# whose controller has no such action (`resources` draws them all) answers
+# 404, as Rails' `AbstractController::ActionNotFound` does, and says so in
+# the log.
+module config/routes
+
+import std/text
+import rils/kit/ctx::{Ctx, ActionResult}
+import rils/kit/response::{Response}
+import rils/kit/errors::{HttpError}
+import rils/kit/router::{Router}
+import rils/kit/server::{Action}
+import rils/routes/draw::{campfire_routes}
+import config/app::{App}
+import controllers/messages
+import controllers/sessions::{new_session, create_session, destroy_session}
+import controllers/first_runs::{show_first_run, create_first_run}
+import controllers/welcome::{show_welcome}
+import controllers/rooms::{index_rooms, show_room}
+import controllers/boosts::{boosts_index, boosts_new, boosts_create, boosts_destroy}
+import controllers/rooms::{destroy_room_action, destroy_without_room, show_shared_room, opens_new, opens_edit, opens_update, create_open_room, closeds_new, closeds_edit, closeds_update, create_closed_room, show_direct_room, new_direct_room, create_direct_room, edit_direct_room, destroy_direct_room, show_involvement, update_involvement, show_refresh}
+import controllers/searches::{index_searches, create_search, clear_searches}
+import controllers/users::{new_user, create_user, show_user, show_profile, update_profile, show_avatar, destroy_avatar, show_sidebar, create_ban, destroy_ban, index_push_subscriptions, create_push_subscription, destroy_push_subscription, show_transfer, update_transfer, index_autocompletable_users}
+import controllers/accounts::{edit_account, update_account, index_account_users, update_account_user, destroy_account_user, index_bots, new_bot, create_bot, edit_bot, update_bot, destroy_bot, update_bot_key, create_join_code, show_logo, destroy_logo, edit_custom_styles, update_custom_styles}
+import controllers/pwa::{service_worker, manifest, show_qr_code}
+import controllers/unfurl_links::{create_unfurl_link}
+import controllers/bots_api::{bot_messages_index, bot_messages_create, bot_messages_update, bot_messages_destroy, bot_boosts_create, bot_boosts_destroy}
+import controllers/users::{create_test_notification}
+import controllers/active_storage::{blobs_redirect, blobs_proxy, representations_redirect, representations_proxy, disk_show, disk_update, direct_uploads_create, health, native_recede, native_resume, native_refresh}
+
+pub def campfire_router(app : App) : Router(Action)
+  actions = {
+    "messages#index"                                     => ->(c : Ctx) { Controllers::Messages.index(app, c) },
+    "messages#create"                                    => ->(c : Ctx) { Controllers::Messages.create(app, c) },
+    "messages#show"                                      => ->(c : Ctx) { Controllers::Messages.show(app, c) },
+    "messages#edit"                                      => ->(c : Ctx) { Controllers::Messages.edit(app, c) },
+    "messages#update"                                    => ->(c : Ctx) { Controllers::Messages.update(app, c) },
+    "messages#destroy"                                   => ->(c : Ctx) { Controllers::Messages.destroy(app, c) },
+    "sessions#new"                                       => ->(c : Ctx) { new_session(app, c) },
+    "sessions#create"                                    => ->(c : Ctx) { create_session(app, c) },
+    "sessions#destroy"                                   => ->(c : Ctx) { destroy_session(app, c) },
+    "first_runs#show"                                    => ->(c : Ctx) { show_first_run(app, c) },
+    "first_runs#create"                                  => ->(c : Ctx) { create_first_run(app, c) },
+    "welcome#show"                                       => ->(c : Ctx) { show_welcome(app, c) },
+    "rooms#index"                                        => ->(c : Ctx) { index_rooms(app, c) },
+    "rooms#show"                                         => ->(c : Ctx) { show_room(app, c) },
+    "messages/boosts#index"                              => ->(c : Ctx) { boosts_index(app, c) },
+    "messages/boosts#new"                                => ->(c : Ctx) { boosts_new(app, c) },
+    "messages/boosts#create"                             => ->(c : Ctx) { boosts_create(app, c) },
+    "messages/boosts#destroy"                            => ->(c : Ctx) { boosts_destroy(app, c) },
+    "rooms#destroy"                                      => ->(c : Ctx) { destroy_room_action(app, c) },
+    "rooms/opens#index"                                  => ->(c : Ctx) { index_rooms(app, c) },
+    "rooms/opens#show"                                   => ->(c : Ctx) { show_shared_room(app, c) },
+    "rooms/opens#new"                                    => ->(c : Ctx) { opens_new(app, c) },
+    "rooms/opens#create"                                 => ->(c : Ctx) { create_open_room(app, c) },
+    "rooms/opens#edit"                                   => ->(c : Ctx) { opens_edit(app, c) },
+    "rooms/opens#update"                                 => ->(c : Ctx) { opens_update(app, c) },
+    "rooms/opens#destroy"                                => ->(c : Ctx) { destroy_without_room(app, c) },
+    "rooms/closeds#index"                                => ->(c : Ctx) { index_rooms(app, c) },
+    "rooms/closeds#show"                                 => ->(c : Ctx) { show_shared_room(app, c) },
+    "rooms/closeds#new"                                  => ->(c : Ctx) { closeds_new(app, c) },
+    "rooms/closeds#create"                               => ->(c : Ctx) { create_closed_room(app, c) },
+    "rooms/closeds#edit"                                 => ->(c : Ctx) { closeds_edit(app, c) },
+    "rooms/closeds#update"                               => ->(c : Ctx) { closeds_update(app, c) },
+    "rooms/closeds#destroy"                              => ->(c : Ctx) { destroy_without_room(app, c) },
+    "rooms/directs#index"                                => ->(c : Ctx) { index_rooms(app, c) },
+    "rooms/directs#show"                                 => ->(c : Ctx) { show_direct_room(app, c) },
+    "rooms/directs#new"                                  => ->(c : Ctx) { new_direct_room(app, c) },
+    "rooms/directs#create"                               => ->(c : Ctx) { create_direct_room(app, c) },
+    "rooms/directs#edit"                                 => ->(c : Ctx) { edit_direct_room(app, c) },
+    "rooms/directs#destroy"                              => ->(c : Ctx) { destroy_direct_room(app, c) },
+    "rooms/involvements#show"                            => ->(c : Ctx) { show_involvement(app, c) },
+    "rooms/involvements#update"                          => ->(c : Ctx) { update_involvement(app, c) },
+    "rooms/refreshes#show"                               => ->(c : Ctx) { show_refresh(app, c) },
+    "searches#index"                                     => ->(c : Ctx) { index_searches(app, c) },
+    "searches#create"                                    => ->(c : Ctx) { create_search(app, c) },
+    "searches#clear"                                     => ->(c : Ctx) { clear_searches(app, c) },
+    "users#new"                                          => ->(c : Ctx) { new_user(app, c) },
+    "users#create"                                       => ->(c : Ctx) { create_user(app, c) },
+    "users#show"                                         => ->(c : Ctx) { show_user(app, c) },
+    "users/profiles#show"                                => ->(c : Ctx) { show_profile(app, c) },
+    "users/profiles#update"                              => ->(c : Ctx) { update_profile(app, c) },
+    "users/avatars#show"                                 => ->(c : Ctx) { show_avatar(app, c) },
+    "users/avatars#destroy"                              => ->(c : Ctx) { destroy_avatar(app, c) },
+    "users/sidebars#show"                                => ->(c : Ctx) { show_sidebar(app, c) },
+    "users/bans#create"                                  => ->(c : Ctx) { create_ban(app, c) },
+    "users/bans#destroy"                                 => ->(c : Ctx) { destroy_ban(app, c) },
+    "users/push_subscriptions#index"                     => ->(c : Ctx) { index_push_subscriptions(app, c) },
+    "users/push_subscriptions#create"                    => ->(c : Ctx) { create_push_subscription(app, c) },
+    "users/push_subscriptions#destroy"                   => ->(c : Ctx) { destroy_push_subscription(app, c) },
+    "sessions/transfers#show"                            => ->(c : Ctx) { show_transfer(app, c) },
+    "sessions/transfers#update"                          => ->(c : Ctx) { update_transfer(app, c) },
+    "autocompletable/users#index"                        => ->(c : Ctx) { index_autocompletable_users(app, c) },
+    "accounts#edit"                                      => ->(c : Ctx) { edit_account(app, c) },
+    "accounts#update"                                    => ->(c : Ctx) { update_account(app, c) },
+    "accounts/users#index"                               => ->(c : Ctx) { index_account_users(app, c) },
+    "accounts/users#update"                              => ->(c : Ctx) { update_account_user(app, c) },
+    "accounts/users#destroy"                             => ->(c : Ctx) { destroy_account_user(app, c) },
+    "accounts/bots#index"                                => ->(c : Ctx) { index_bots(app, c) },
+    "accounts/bots#new"                                  => ->(c : Ctx) { new_bot(app, c) },
+    "accounts/bots#create"                               => ->(c : Ctx) { create_bot(app, c) },
+    "accounts/bots#edit"                                 => ->(c : Ctx) { edit_bot(app, c) },
+    "accounts/bots#update"                               => ->(c : Ctx) { update_bot(app, c) },
+    "accounts/bots#destroy"                              => ->(c : Ctx) { destroy_bot(app, c) },
+    "accounts/bots/keys#update"                          => ->(c : Ctx) { update_bot_key(app, c) },
+    "accounts/join_codes#create"                         => ->(c : Ctx) { create_join_code(app, c) },
+    "accounts/logos#show"                                => ->(c : Ctx) { show_logo(app, c) },
+    "accounts/logos#destroy"                             => ->(c : Ctx) { destroy_logo(app, c) },
+    "accounts/custom_styles#edit"                        => ->(c : Ctx) { edit_custom_styles(app, c) },
+    "accounts/custom_styles#update"                      => ->(c : Ctx) { update_custom_styles(app, c) },
+    "pwa#service_worker"                                 => ->(c : Ctx) { service_worker(app, c) },
+    "pwa#manifest"                                       => ->(c : Ctx) { manifest(app, c) },
+    "qr_code#show"                                       => ->(c : Ctx) { show_qr_code(app, c) },
+    "unfurl_links#create"                                => ->(c : Ctx) { create_unfurl_link(app, c) },
+    "messages/by_bots#index"                             => ->(c : Ctx) { bot_messages_index(app, c) },
+    "messages/by_bots#create"                            => ->(c : Ctx) { bot_messages_create(app, c) },
+    "messages/by_bots#update"                            => ->(c : Ctx) { bot_messages_update(app, c) },
+    "messages/by_bots#destroy"                           => ->(c : Ctx) { bot_messages_destroy(app, c) },
+    "messages/boosts/by_bots#create"                     => ->(c : Ctx) { bot_boosts_create(app, c) },
+    "messages/boosts/by_bots#destroy"                    => ->(c : Ctx) { bot_boosts_destroy(app, c) },
+    "users/push_subscriptions/test_notifications#create" => ->(c : Ctx) { create_test_notification(app, c) },
+    "active_storage/blobs/redirect#show"                 => ->(c : Ctx) { blobs_redirect(app, c) },
+    "active_storage/blobs/proxy#show"                    => ->(c : Ctx) { blobs_proxy(app, c) },
+    "active_storage/representations/redirect#show"       => ->(c : Ctx) { representations_redirect(app, c) },
+    "active_storage/representations/proxy#show"          => ->(c : Ctx) { representations_proxy(app, c) },
+    "active_storage/disk#show"                           => ->(c : Ctx) { disk_show(app, c) },
+    "active_storage/disk#update"                         => ->(c : Ctx) { disk_update(app, c) },
+    "active_storage/direct_uploads#create"               => ->(c : Ctx) { direct_uploads_create(app, c) },
+    "rails/health#show"                                  => ->(c : Ctx) { health(app, c) },
+    "turbo/native/navigation#recede"                     => ->(c : Ctx) { native_recede(app, c) },
+    "turbo/native/navigation#resume"                     => ->(c : Ctx) { native_resume(app, c) },
+    "turbo/native/navigation#refresh"                    => ->(c : Ctx) { native_refresh(app, c) },
+  } of String => Action
+  router = Router(Action).new
+  campfire_routes.draw_into(router) { |row| actions[row.endpoint]? || not_ported(row.endpoint) }
+  router
+end
+
+def not_ported(endpoint : String) : Action
+  controller, _, action = endpoint.partition('#')
+  ->(c : Ctx) { HttpError.status(404, "The action '#{action}' could not be found for #{controller}").as(ActionResult) }
+end

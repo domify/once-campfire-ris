@@ -1,0 +1,17 @@
+# `Rails.application.message_verifier(name)`: `message_verifiers[name]` with
+# the app defaults (key `generate_key(name, 64)`, HMAC-SHA1, strict Base64,
+# `:json_allow_marshal`, `_rails` envelope). Active Storage uses
+# `app_verifier(secrets, "ActiveStorage")` for blob signed ids (purpose
+# `"blob_id"`, *not* `signed_id`'s `model/purpose` scheme), variation keys,
+# disk URLs and upload tokens. Use `generate_raw`/`verify_raw` to control
+# the JSON key order.
+module rils/rails_compat/app_verifier
+
+import rils/rails_compat/crypto::{Digest}
+import rils/rails_compat/key_generator::{Secrets}
+import rils/rails_compat/metadata::{Serializer}
+import rils/rails_compat/message_verifier::{MessageVerifier, Encoding}
+
+pub def app_verifier(secrets : Secrets, name : String) : MessageVerifier
+  MessageVerifier.new(secrets.key_generator.generate_key(name, 64), Digest::Sha1, Encoding::Strict, Serializer::JsonMarshalFallback)
+end

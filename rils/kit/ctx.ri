@@ -1,0 +1,735 @@
+# `Ctx`: everything a controller action touches, in place of a Rails
+# controller instance.
+module rils/kit/ctx
+
+import std/time::{Time}
+import std/json::{Any}
+import std/digest::{SHA256}
+import std/file::{File}
+import std/text
+import rils/rails_compat/json::{generate}
+import web/web/http_date::{http_date, parse_http_date}
+import rils/kit/app::{Stack}
+import rils/kit/cookies::{CookieJar}
+import rils/kit/errors::{HttpError, HttpErrorKind, halt}
+import rils/kit/exceptions::{render_error}
+import rils/kit/format::*
+import rils/kit/params::{Param, ParamMap}
+import rils/kit/request::{Request}
+import rils/kit/response::*
+import rils/kit/session::{Session, Flash}
+
+# Options for `redirect_to`.
+pub class Redirect
+  # Defaults to 302 Found, like Rails.
+  property status : Int32
+  property notice : String?
+  property alert : String?
+  property allow_other_host : Bool
+
+  def initialize(@status : Int32 = 302, @notice : String? = nil, @alert : String? = nil, @allow_other_host : Bool = false)
+  end
+end
+
+# Validators for `fresh_when` / `stale?`.
+pub class Freshness
+  # The weak ETag validator, already expanded to a cache key (e.g.
+  # `record.cache_key_with_version`).
+  property etag : String?
+  property strong_etag : String?
+  property last_modified : Time?
+  property public : Bool
+  # The template digest `ETagWithTemplateDigest` would add.
+  property template : String?
+
+  def initialize(@etag : String? = nil, @strong_etag : String? = nil, @last_modified : Time? = nil, @public : Bool = false, @template : String? = nil)
+  end
+end
+
+# Options for `expires_in`.
+pub class ExpiresIn
+  property public : Bool
+  property must_revalidate : Bool
+  property stale_while_revalidate : Int64?
+  property stale_if_error : Int64?
+  property immutable : Bool
+
+  def initialize(@public : Bool = false, @must_revalidate : Bool = false, @stale_while_revalidate : Int64? = nil, @stale_if_error : Int64? = nil, @immutable : Bool = false)
+  end
+end
+
+pub alias ActionResult = Response | HttpError
+
+# What an action is given: the request, where web parsed it on its tape,
+# and everything the action and the kit change while it runs, in a
+# `CtxState` on the heap its copies share. Passed by value, so a `Ctx`
+# holds the request's views and nothing outlives its tape.
+@[OnTape]
+pub struct Ctx
+  getter request : Request
+  getter cookies : CookieJar
+  @state : CtxState
+
+  def initialize(stack : Stack, @request : Request, path_params : ParamMap, query_params : ParamMap, request_params : ParamMap, @cookies : CookieJar)
+    @state = CtxState.new(stack, path_params, query_params, request_params)
+  end
+
+  pub def stack : Stack
+    @state.stack
+  end
+
+  pub def query_params : ParamMap
+    @state.query_params
+  end
+
+  pub def request_params : ParamMap
+    @state.request_params
+  end
+
+  pub def path_params : ParamMap
+    @state.path_params
+  end
+
+  pub def now : Time
+    @state.stack.clock.now
+  end
+
+  # `params`: body params, then query params, then path params, merged like
+  # Rails.
+  pub def params : ParamMap
+    merged = @state.params
+    return merged if merged
+    merged = @state.request_params.copy
+    merged.merge(@state.query_params)
+    merged.merge(@state.path_params)
+    @state.params = merged
+    merged
+  end
+
+  # The map whose *key* `params` would hold: path, then query, then body.
+  def params_with(key : String) : ParamMap?
+    if merged = @state.params
+      return merged.has_key?(key) ? merged : nil
+    end
+    return @state.path_params if @state.path_params.has_key?(key)
+    return @state.query_params if @state.query_params.has_key?(key)
+    @state.request_params.has_key?(key) ? @state.request_params : nil
+  end
+
+  pub def param(key : String) : Param?
+    map = params_with(key)
+    map ? map[key]? : nil
+  end
+
+  pub def param_str(key : String) : String?
+    map = params_with(key)
+    map ? map.str(key) : nil
+  end
+
+  # `params.require(key)`: the value, or `ParameterMissing`.
+  pub def require(key : String) : Param | HttpError
+    params.require(key) || HttpError.new(HttpErrorKind::ParameterMissing, key)
+  end
+
+  pub def headers : HeaderList
+    @state.headers ||= HeaderList.new
+  end
+
+  pub def cache_control : CacheControl
+    @state.cache_control ||= CacheControl.new
+  end
+
+  pub def cache_control=(value : CacheControl) : CacheControl
+    @state.cache_control = value
+  end
+
+  # `wrap_parameters format: [:json]`: for a JSON request, nest the body
+  # params under *key* unless it's already there. *only* is the model's
+  # attribute names when it has a model.
+  pub def wrap_parameters(key : String, only : Array(String)? = nil) : Nil
+    mime = content_mime_type(@request.content_type)
+    return unless mime.is_a?(Mime) && mime == JSON_MIME
+    return if params.has_key?(key)
+    wrapped = ParamMap.new
+    @state.request_params.each do |name, value|
+      kept = only ? only.includes?(name) : !["authenticity_token", "_method", "utf8"].includes?(name)
+      wrapped[name] = value if kept
+    end
+    params[key] = Param.new(wrapped)
+    @state.request_params[key] = Param.new(wrapped.copy)
+  end
+
+  # `session`, loaded from the cookie on first use.
+  pub def session : Session
+    (@state.session ||= Session.new(@state.stack.config.session)).load(@cookies)
+  end
+
+  # `reset_session`: new session id, no data, no flash.
+  pub def reset_session : Nil
+    session.reset
+    @state.flash = nil
+  end
+
+  # `flash`, loaded from the session on first use.
+  pub def flash : Flash
+    loaded = @state.flash
+    return loaded if loaded
+    flash = Flash.from_session_value(session["flash"])
+    @state.flash = flash
+    flash
+  end
+
+  # The `verify_authenticity_token` before-action, by `Sec-Fetch-Site`
+  # rather than tokens (Rails main's
+  # `protect_from_forgery using: :header_only`): pages carry no per-request
+  # token, so they render the same until what they show changes. Browsers
+  # send the header on every request to a secure origin; without it (an old
+  # browser, or plain HTTP where browsers don't send it) a write is only
+  # allowed when neither the request nor the app uses SSL, where the
+  # `SameSite=Lax` session cookie and the `Origin` check are the protection.
+  pub def verify_authenticity_token : HttpError?
+    @state.marked_for_same_origin_verification = @request.get?
+    return nil if @request.get? || @request.head?
+    valid = valid_request_origin
+    return valid if valid.is_a?(HttpError)
+    unless valid
+      return HttpError.new(HttpErrorKind::InvalidAuthenticityToken, "HTTP Origin header (#{@request.origin || ""}) didn't match request.base_url (#{@request.base_url})")
+    end
+    site = @request.header("sec-fetch-site")
+    return nil if site == "same-origin" || site == "same-site"
+    return nil if site.nil? && !@request.ssl? && !@state.stack.config.force_ssl
+    if site == "cross-site"
+      return HttpError.new(HttpErrorKind::InvalidAuthenticityToken, "Sec-Fetch-Site header (cross-site) indicates a cross-site request")
+    end
+    HttpError.new(HttpErrorKind::InvalidAuthenticityToken, "Sec-Fetch-Site header is missing or invalid (#{site.inspect})")
+  end
+
+  def valid_request_origin : Bool | HttpError
+    return true unless @state.stack.config.forgery_protection_origin_check
+    origin = @request.origin
+    return true if origin.nil?
+    return HttpError.new(HttpErrorKind::InvalidAuthenticityToken, "The browser returned a 'null' origin") if origin == "null"
+    origin == @request.base_url
+  end
+
+  def negotiation_input : NegotiationInput
+    NegotiationInput.new(param_str("format"), @request.header("accept"), @request.content_type, @request.path, @request.xhr?)
+  end
+
+  # `request.formats`; an invalid `Accept` header is a 406 like Rails'
+  # `InvalidType`.
+  pub def formats : Array(Format) | HttpError
+    found = @state.formats
+    unless found
+      found = request_formats(negotiation_input)
+      @state.formats = found
+    end
+    found.is_a?(InvalidMimeType) ? HttpError.new(HttpErrorKind::UnknownFormat) : found
+  end
+
+  # `request.format`: the first format; nil is Rails' `Mime::NullType`.
+  pub def format : Format | HttpError | Nil
+    found = formats
+    return found if found.is_a?(HttpError)
+    found.empty? ? nil : found.first
+  end
+
+  # `_set_vary_header`, which every `render` runs (not `head` or
+  # `redirect_to`): `Vary: Accept` when the format came from the `Accept`
+  # header, unless the response already varies.
+  pub def set_vary_header(response : Response) : Response
+    return response if response.headers.has_key?("vary") || !should_apply_vary_header?(negotiation_input)
+    response.header("vary", "Accept")
+  end
+
+  # `respond_to do |format| ... end`: pick the first format the client
+  # accepts among *offered* (in the order the block declares them), or 406
+  # via `UnknownFormat`.
+  pub def respond_to(offered : Array(Format)) : Format | HttpError
+    found = formats
+    return found if found.is_a?(HttpError)
+    chosen = negotiate(found, offered)
+    return HttpError.new(HttpErrorKind::UnknownFormat) unless chosen
+    chosen = offered.empty? ? HTML : offered.first if chosen == ALL
+    @state.rendered_format = chosen
+    chosen
+  end
+
+  # The format a render will use: the `respond_to` choice, else the first
+  # request format.
+  pub def rendered_format : Format
+    if chosen = @state.rendered_format
+      return chosen
+    end
+    found = formats
+    return HTML if found.is_a?(HttpError) || found.empty? || found.first == ALL
+    found.first
+  end
+
+  # `turbo_frame_request?`
+  pub def turbo_frame_request? : Bool
+    id = turbo_frame_request_id
+    !id.nil? && !id.blank?
+  end
+
+  pub def turbo_frame_request_id : String?
+    @request.header("turbo-frame")
+  end
+
+  # `render html:` / a template, as `text/html; charset=utf-8`.
+  pub def render_html(status : Int32, html : String) : Response
+    render_as(status, HTML_UTF8, html)
+  end
+
+  # `render` with an explicit content type (`render json:`, `send_data`,
+  # ...).
+  pub def render_as(status : Int32, content_type : String, body : String | Parts | Rendered) : Response
+    set_vary_header(Response.with_body(status, content_type, body))
+  end
+
+  pub def html(html : String) : Response
+    render_html(200, html)
+  end
+
+  # A rendered template, labelled with *the template's* format: Rails sets
+  # `rendered_format` from the template the lookup found, not from the
+  # request, so an `.html.erb`-only action answers `text/html` even when the
+  # `Accept` header prefers `text/vnd.turbo-stream.html`.
+  pub def render(status : Int32, template : Format, body : String | Parts | Rendered) : Response
+    @state.rendered_format = template
+    render_as(status, "#{template.string}; charset=utf-8", body)
+  end
+
+  # `render turbo_stream:` (`text/vnd.turbo-stream.html`).
+  pub def turbo_stream(html : String) : Response
+    render_as(200, TURBO_STREAM_UTF8, html)
+  end
+
+  # `render json:`, given the encoded JSON.
+  pub def json(status : Int32, encoded : String) : Response
+    render_as(status, JSON_UTF8, encoded)
+  end
+
+  # `head status`: no body; a bare content type (no charset) unless the
+  # status has no content.
+  pub def head(status : Int32) : Response
+    response = Response.new(status)
+    response.content_type(rendered_format.string) unless no_content?(status)
+    response
+  end
+
+  # `head status, location: url`
+  pub def head_with_location(status : Int32, location : String) : ActionResult
+    computed = compute_location(location)
+    return computed if computed.is_a?(HttpError)
+    head(status).header("location", computed)
+  end
+
+  # `redirect_to location` (302).
+  pub def redirect_to(location : String, options : Redirect = Redirect.new) : ActionResult
+    if notice = options.notice
+      flash["notice"] = notice
+    end
+    if alert = options.alert
+      flash["alert"] = alert
+    end
+    computed = compute_location(location)
+    return computed if computed.is_a?(HttpError)
+    if computed.bytes.any? { |b| b <= 8 || (b >= 10 && b <= 31) }
+      return HttpError.new(HttpErrorKind::UnsafeRedirect, "The redirect URL #{computed} contains illegal characters")
+    end
+    if !options.allow_other_host && !url_host_allowed?(computed)
+      return HttpError.new(HttpErrorKind::UnsafeRedirect, "Unsafe redirect to #{computed.inspect}")
+    end
+    Response.new(options.status).content_type(HTML_UTF8).header("location", computed)
+  end
+
+  # `redirect_back_or_to fallback`: the referer when it's on this host.
+  pub def redirect_back_or_to(fallback : String) : ActionResult
+    referer = @request.referer
+    referer && url_host_allowed?(referer) ? redirect_to(referer) : redirect_to(fallback)
+  end
+
+  # `_compute_redirect_to_location` for strings: absolute URLs pass through,
+  # paths get the request's protocol and host, path-relative URLs raise
+  # (`action_on_path_relative_redirect`).
+  def compute_location(location : String) : String | HttpError
+    url = if absolute_url?(location)
+            location
+          else
+            if !location.empty? && !location.starts_with?("/") && !location.starts_with?("?")
+              return HttpError.new(HttpErrorKind::UnsafeRedirect, "Path relative URL redirect detected: #{location.inspect}")
+            end
+            "#{@request.protocol}#{@request.host_with_port}#{location}"
+          end
+    url.delete("\0").delete("\r").delete("\n")
+  end
+
+  # `_url_host_allowed?`
+  def url_host_allowed?(url : String) : Bool
+    host = url_host(url)
+    return url.starts_with?("/") && !url.starts_with?("//") unless host
+    host.downcase == @request.host.downcase
+  end
+
+  # An absolute URL for *path* on this request's host (what `*_url` helpers
+  # produce with `default_url_options` from `SetCurrentRequest`).
+  pub def url_for(path : String) : String
+    "#{@request.protocol}#{@request.host_with_port}#{path}"
+  end
+
+  # `send_file path, type:, disposition:, filename:`
+  pub def send_file(path : String, options : SendOptions = SendOptions.new) : ActionResult
+    return HttpError.internal("Cannot read file #{path}") unless File.file?(path)
+    options.filename = File.basename(path) unless options.filename
+    send_response(options, FileBody.new(path, 0_i64, File.size(path)))
+  end
+
+  # `send_data data, type:, disposition:, filename:`
+  pub def send_data(data : String, options : SendOptions = SendOptions.new) : Response
+    send_response(options, data)
+  end
+
+  # `fresh_when`: sets ETag/Last-Modified and returns a 304 when the request
+  # is fresh.
+  pub def fresh_when(freshness : Freshness) : Response?
+    cache_control.no_store = false
+    if freshness.strong_etag || freshness.etag || freshness.template
+      strong = freshness.strong_etag
+      etag = combine_etags(strong || freshness.etag, freshness)
+      set_header("etag", strong ? %("#{etag}") : %(W/"#{etag}"))
+    end
+    if last_modified = freshness.last_modified
+      set_header("last-modified", http_date(last_modified))
+    end
+    cache_control.public = true if freshness.public
+    fresh?(@request, header("etag"), header("last-modified")) ? head(304) : nil
+  end
+
+  # `stale?`: the inverse of freshness, after setting the validators.
+  pub def stale?(freshness : Freshness) : Bool
+    fresh_when(freshness).nil?
+  end
+
+  # `[validator, *etaggers]` digested like
+  # `ActiveSupport::Digest.hexdigest(expand_cache_key(...))`. The etaggers
+  # are turbo-rails' frame etagger, `ETagWithTemplateDigest` and
+  # `ETagWithFlash`.
+  def combine_etags(validator : String?, freshness : Freshness) : String
+    parts = [] of String
+    parts << validator if validator
+    parts << "frame" if turbo_frame_request?
+    if template = freshness.template
+      parts << template
+    end
+    unless flash.empty?
+      parts << flash.keys.map { |key| "#{key}=#{flash[key].inspect}" }.join("&")
+    end
+    SHA256.hexdigest(parts.join("/"))[0, 32]
+  end
+
+  # `expires_in seconds, public:, stale_while_revalidate:, ...`
+  pub def expires_in(seconds : Int64, options : ExpiresIn = ExpiresIn.new) : Nil
+    cache_control.no_store = false
+    cache_control.max_age = seconds
+    cache_control.public = options.public
+    cache_control.must_revalidate = options.must_revalidate
+    cache_control.stale_while_revalidate = options.stale_while_revalidate
+    cache_control.stale_if_error = options.stale_if_error
+    cache_control.immutable = options.immutable
+    set_header("date", http_date(now)) unless header("date")
+  end
+
+  # `expires_now`
+  pub def expires_now : Nil
+    control = CacheControl.new
+    control.no_cache = true
+    @state.cache_control = control
+  end
+
+  # `no_store`
+  pub def no_store : Nil
+    control = CacheControl.new
+    control.no_store = true
+    @state.cache_control = control
+  end
+
+  # Set a response header ahead of the response
+  # (`response.headers[...] = ...`), as Puma would write the value.
+  pub def set_header(name : String, value : String) : Nil
+    set_header_value(headers, name, value)
+  end
+
+  # A response header set so far (`response.headers[...]`).
+  pub def header(name : String) : String?
+    early = @state.headers
+    early ? early[name] : nil
+  end
+
+  # A controller that includes `ActionController::Live`
+  # (`ActiveStorage::Streaming` does): its `make_response!` builds the
+  # response with `Live::Response.new`, which skips
+  # `ActionDispatch::Response.create` and so
+  # `config.action_dispatch.default_headers`.
+  pub def use_live_response : Nil
+    @state.live = true
+  end
+
+  # Turn the action's result into the response Rails would send: halts and
+  # errors resolved, flash and session committed into cookies, cache
+  # headers, ETag and 304.
+  pub def finish(result : ActionResult) : Response
+    response = case result
+               when Response then result
+               else
+                 halted = result.halted
+                 return error_response(result) unless halted
+                 halted
+               end
+
+    if early = @state.headers
+      early.each { |name, value| response.headers.append(name, value) unless response.headers.has_key?(name) }
+    end
+
+    cross_origin = verify_same_origin_request(response)
+    return error_response(cross_origin) if cross_origin
+    committed = commit(response)
+    return error_response(committed) if committed
+
+    apply_cache_headers(response)
+    unless @state.live
+      @state.stack.config.default_headers.each { |pair| response.headers[pair[0]] = pair[1] unless response.headers.has_key?(pair[0]) }
+    end
+    if !response.headers.has_key?("content-type") && !no_content?(response.status)
+      response.headers["content-type"] = HTML_UTF8
+    end
+    rack_etag(response, !@state.live)
+    hook = @state.after_finish
+    hook.call(response, self) if hook
+    conditional_get(response)
+    response
+  end
+
+  # *block* sees the finished response, before a conditional GET turns it
+  # into a 304: what a cache in front of the app (Rack middleware) would
+  # keep.
+  pub def after_finish(&block : Response, Ctx -> Nil) : Nil
+    @state.after_finish = block
+  end
+
+  # `verify_same_origin_request`: a GET that renders JavaScript for a
+  # non-XHR request is a cross-origin `<script>` embed.
+  def verify_same_origin_request(response : Response) : HttpError?
+    content_type = response["content-type"] || ""
+    javascript = content_type.starts_with?("text/javascript") || content_type.starts_with?("application/javascript")
+    @state.marked_for_same_origin_verification && javascript && !@request.xhr? ? HttpError.new(HttpErrorKind::InvalidCrossOriginRequest) : nil
+  end
+
+  # `commit_flash`, `commit_session`, then the cookie jar's `write`.
+  def commit(response : Response) : HttpError?
+    if pending = @state.flash
+      @state.flash = nil
+      if !pending.empty? || session.has_key?("flash")
+        stored = pending.to_session_value
+        session["flash"] = stored || Any.new(nil)
+      end
+    end
+    if used = @state.session
+      used.delete("flash") if used.loaded && used.has_key?("flash") && used["flash"].nil?
+      failure = used.commit(@cookies, now)
+      return failure if failure
+    end
+    @cookies.set_cookie_headers(@request.ssl?, @request.host).each { |cookie| response.headers.append("set-cookie", cookie) }
+    nil
+  end
+
+  # `handle_conditional_get!` and `merge_and_normalize_cache_control!`.
+  def apply_cache_headers(response : Response) : Nil
+    return if response.headers.has_key?("cache-control")
+    cache_control = @state.cache_control
+    if (cache_control.nil? || cache_control.empty?) && (response.headers.has_key?("etag") || response.headers.has_key?("last-modified"))
+      cache_control = CacheControl.new
+      cache_control.max_age = 0_i64
+      cache_control.must_revalidate = true
+    end
+    if cache_control && (value = cache_control.to_header)
+      response.headers["cache-control"] = value
+    end
+  end
+
+  # `Rack::ConditionalGet`
+  def conditional_get(response : Response) : Nil
+    # Written when sent: `write_page` decides once it has the page.
+    return if response.body.is_a?(Rendered)
+    fresh_or_not(response)
+  end
+
+  def fresh_or_not(response : Response) : Nil
+    return unless (@request.method == "GET" || @request.method == "HEAD") && response.status == 200
+    if fresh?(@request, response["etag"], response["last-modified"])
+      response.status = 304
+      response.headers.delete("content-type")
+      response.headers.delete("content-length")
+      response.body = nil
+    end
+  end
+
+  # A `Rendered` page written into *io*, on the request's tape, and given
+  # what `finish` leaves to it: `Rack::ETag`'s digest of the bytes written
+  # and the conditional GET. The page, nil when a 304 drops it.
+  pub def write_page(response : Response, io : Str::Builder) : Str?
+    body = response.body
+    return nil unless body.is_a?(Rendered)
+    body.write_into(io)
+    text = io.finish
+    response.body = Written.new
+    digest_written(response, text, !@state.live)
+    fresh_or_not(response)
+    response.status == 304 ? nil : text
+  end
+
+  # `write_page` with the page kept as the body, for a caller with no
+  # response buffer to send it from (tests).
+  pub def keep_page(response : Response) : Response
+    tape do
+      io = Str::Builder.new(1024)
+      if text = write_page(response, io)
+        response.body = text.to_heap
+      end
+    end
+    response
+  end
+
+  # What `ShowExceptions` + `PublicExceptions` render for an error raised in
+  # the action.
+  pub def error_response(error : HttpError) : Response
+    STDERR.puts "#{error.status >= 500 ? "request failed" : "request rejected"}: #{error.message} path=#{@request.path}" unless error.kind.halt?
+    found = formats
+    first = found.is_a?(HttpError) || found.empty? ? nil : found.first
+    render_error(@state.stack.config.error_pages, error.status, first, @request.head?)
+  end
+end
+# What a `Ctx` changes while its action runs, shared by its copies.
+class CtxState
+  getter stack : Stack
+  getter path_params : ParamMap
+  getter query_params : ParamMap
+  getter request_params : ParamMap
+  # `params`, merged when first asked for whole; one is read from the maps
+  # where it is (`param`), in the order the merge would let it win.
+  property params : ParamMap?
+  # Response headers set before the response exists (e.g. `X-Version` in a
+  # before-action). Merged into the final response without overriding what
+  # it already sets. Made by the first one set.
+  property headers : HeaderList?
+  # `response.cache_control`, applied to the final response; made when
+  # first changed.
+  property cache_control : CacheControl?
+  # Made, and loaded from the cookie, when first used.
+  property session : Session?
+  property flash : Flash?
+  property marked_for_same_origin_verification : Bool
+  property formats : Array(Format) | InvalidMimeType | Nil
+  property rendered_format : Format?
+  property live : Bool
+  property after_finish : Proc(Response, Ctx, Nil)?
+
+  def initialize(@stack : Stack, @path_params : ParamMap, @query_params : ParamMap, @request_params : ParamMap)
+    @params = nil
+    @headers = nil
+    @cache_control = nil
+    @session = nil
+    @flash = nil
+    @marked_for_same_origin_verification = false
+    @formats = nil
+    @rendered_format = nil
+    @live = false
+    @after_finish = nil
+  end
+end
+
+def no_content?(status : Int32) : Bool
+  (status >= 100 && status <= 199) || status == 204 || status == 205 || status == 304
+end
+
+def absolute_url?(location : String) : Bool
+  return true if location.starts_with?("//")
+  return false if location.empty? || !location[0].ascii_letter?
+  colon = location.index(':')
+  return false unless colon
+  location[0, colon].chars.all? { |c| c.ascii_alphanumeric? || c == '-' || c == '+' || c == '.' }
+end
+
+# `request.fresh?(response)` with `strict_freshness` (the 8.0 default),
+# which `fresh_when` and `Rack::ConditionalGet` both go by here: an
+# `If-None-Match` list naming the ETag (or `*`), or else an
+# `If-Modified-Since` no earlier than `Last-Modified`.
+def fresh?(request : Request, etag : String?, last_modified : String?) : Bool
+  if if_none_match = request.header("if-none-match")
+    return false unless etag
+    return if_none_match.split(',').map(&.strip).any? { |value| value == etag || value == "*" }
+  end
+  since_header = request.header("if-modified-since")
+  since = since_header ? parse_http_date(since_header) : nil
+  return false unless since && last_modified
+  modified = parse_http_date(last_modified)
+  !modified.nil? && since >= modified
+end
+
+# `Rack::ETag` (installed as `Rack::ETag, "no-cache"`): weak SHA-256 ETags
+# for 200/201 bodies without validators, and a default `Cache-Control`. A
+# Live response's body is never digested: whatever such a controller
+# renders goes out with `no-cache` and no ETag.
+def rack_etag(response : Response, digestible : Bool) : Nil
+  body = response.body
+  # Written when sent: `write_page` digests it then.
+  return if body.is_a?(Rendered)
+  present = (body.is_a?(String) || body.is_a?(Parts)) && !body.empty?
+  set_rack_etag(response, digestible, present) do |digest|
+    # Digested a piece at a time, as Rack reads a body: the page is not
+    # joined into one more string.
+    case body
+    when String then digest.update(body)
+    when Parts  then body.each_piece { |piece| digest.update(piece) }
+    end
+  end
+end
+
+# `rack_etag` for a page written on the tape, digested where it lies.
+def digest_written(response : Response, text : Str, digestible : Bool) : Nil
+  set_rack_etag(response, digestible, !text.empty?) { |digest| digest.update(text) }
+end
+
+def set_rack_etag(response : Response, digestible : Bool, present : Bool, & : SHA256 -> _) : Nil
+  digested = false
+  skip = !digestible || response.headers.has_key?("etag") || response.headers.has_key?("last-modified")
+  if (response.status == 200 || response.status == 201) && !skip && present
+    digest = SHA256.new
+    yield digest
+    response.headers["etag"] = %(W/"#{digest.hexfinal[0, 32]}")
+    digested = true
+  end
+  unless response.headers.has_key?("cache-control")
+    response.headers["cache-control"] = digested ? "max-age=0, private, must-revalidate" : "no-cache"
+  end
+end
+
+# The host of an absolute or protocol-relative URL, nil for paths.
+def url_host(url : String) : String?
+  rest = if url.starts_with?("//")
+           url[2, url.bytesize - 2]
+         else
+           scheme, separator, after = url.partition("://")
+           return nil if separator.empty? || scheme.empty? || !scheme.chars.all? { |c| c.ascii_alphanumeric? || c == '+' || c == '-' || c == '.' }
+           after
+         end
+  authority = rest
+  ['/', '?', '#'].each do |stop|
+    if at = authority.index(stop)
+      authority = authority[0, at]
+    end
+  end
+  host_port = authority.rpartition('@')[2]
+  return "[#{host_port[1, host_port.bytesize - 1].partition(']')[0]}]" if host_port.starts_with?("[")
+  host_port.partition(':')[0]
+end

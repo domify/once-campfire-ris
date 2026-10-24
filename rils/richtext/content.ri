@@ -1,0 +1,304 @@
+# `ActionText::Content`: loading (canonicalization), attachment rendering
+# and plain text (the Rust port's richtext/src/content.rs). Each Ruby step
+# that serializes a node and parses the markup back (`Fragment#replace`
+# with a string, `inner_html=`, a filter returning HTML) does the same
+# here, in the same parse context: those round trips shape the output.
+module rils/richtext/content
+
+import std/int
+import std/text
+import std/json::{Any}
+import htmlparse/htmlparse/tokenizer::{Attr}
+import rils/richtext/nodes::{Html, Failure}
+import rils/richtext/records::{RenderContext}
+import rils/richtext/attachables::{attachment_from_node, render_attachment, attachment_plain_text, Attachment, Attachable, Kind, Opt, MENTION_CONTENT_TYPE}
+import rils/richtext/sanitizer::{sanitize, action_text, ATTACHMENT_ATTRIBUTES}
+import rils/richtext/ruby_json::{json_parse, json_value_to_s}
+import rils/richtext/plain_text::{node_to_plain_text}
+import rils/richtext/chars::{strip, blank?}
+
+pub ATTACHMENT_TAG = "action-text-attachment"
+
+# How deep content attachments render inside one another: each level
+# parses and sanitizes everything below it again, so Rails' unbounded
+# nesting is quadratic in the body; deeper ones render empty.
+MAX_CONTENT_ATTACHMENT_DEPTH = 8
+
+# A fragment of rich text and the tree it lives in.
+@[OnTape]
+pub struct Content
+  getter tree : Html
+  getter root : Int32
+
+  def initialize(@tree : Html, @root : Int32)
+  end
+
+  # `ActionText::Content.new(html)`, which is also how a stored body
+  # loads: canonicalized.
+  def self.load(html : Str, ctx : RenderContext) : Content | Failure
+    tree = Html.new
+    root = load_into(tree, html, ctx)!
+    Content.new(tree, root)
+  end
+
+  # `ActionText::Content.new(html, canonicalize: false)`.
+  def self.wrap(html : Str) : Content | Failure
+    tree = Html.new
+    root = tree.parse_fragment(strip(html))!
+    Content.new(tree, root)
+  end
+
+  def to_html : Str
+    @tree.to_html(@root)
+  end
+
+  # `ActionText::Content#to_plain_text`
+  def to_plain_text(ctx : RenderContext) : Str | Failure
+    tree = @tree.duplicate
+    attachment_nodes(tree, @root).each do |node|
+      sanitize_content_attribute(tree, node)!
+      attachment = attachment_from_node(tree, node, ctx)!
+      text = Str::Builder.new(64)
+      if attachment_plain_text(attachment, text)
+        fragment = load_into(tree, text.finish, ctx)!
+        tree.replace_with_nodes(node, tree.children(fragment))
+      else
+        tree.replace_with_html(node, text.finish)!
+      end
+    end
+    node_to_plain_text(tree, @root)
+  end
+
+  # `render_action_text_content(content)`: attachments and galleries
+  # rendered, then sanitized with Action Text's allowlist.
+  def render(ctx : RenderContext) : Str | Failure
+    render_nested(ctx, 0)
+  end
+
+  def render_nested(ctx : RenderContext, depth : Int32) : Str | Failure
+    tree = @tree.duplicate
+    render_attachments(tree, @root, ctx, depth)!
+    render_attachment_galleries(tree, @root, ctx, depth)!
+    sanitize(tree.to_html(@root), action_text)
+  end
+
+  # `Content#to_s`: the content partial inside Campfire's `lexxy-content`
+  # layout.
+  def to_rendered_html_with_layout(ctx : RenderContext) : Str | Failure
+    rendered = render(ctx)!
+    writer = Str::Builder.new(rendered.bytesize + 40)
+    writer << "<div class=\"lexxy-content\">\n  " << rendered << "\n</div>\n"
+    writer.finish
+  end
+end
+
+# *html* loaded (and canonicalized) as a new fragment in *tree*.
+pub def load_into(
+  tree : Html,
+  html : Str,
+  ctx : RenderContext,
+) : Int32 | Failure
+  root = tree.parse_fragment(strip(html))!
+  convert_trix_attachments(tree, root, ctx)!
+  attachment_nodes(tree, root).each do |node|
+    tree.set_inner_html(node, "".as_tape)!
+  end
+  attachment_gallery_nodes(tree, root).each do |gallery|
+    writer = Str::Builder.new(256)
+    writer << "<div>" << tree.inner_html(gallery) << "</div>"
+    tree.replace_with_html(gallery, writer.finish)!
+  end
+  root
+end
+
+pub def attachment_nodes(tree : Html, root : Int32) : Ary(Int32)
+  nodes = Ary(Int32).new
+  tree.descendants(root).each { |n| nodes << n if tree.named?(n, ATTACHMENT_TAG) }
+  nodes
+end
+
+# --- Trix attachments -----------------------------------------------------------
+
+# `ActionText::TrixAttachment::ATTRIBUTES`, in order: the Trix name and
+# the attachment attribute's.
+TRIX_ATTRIBUTES = [{"sgid", "sgid"}, {"contentType", "content-type"}, {"url", "url"}, {"href", "href"},
+                   {"filename", "filename"}, {"filesize", "filesize"}, {"width", "width"}, {"height", "height"},
+                   {"previewable", "previewable"}, {"content", "content"}, {"caption", "caption"},
+                   {"presentation", "presentation"}]
+
+# `fragment_by_converting_trix_attachments`: an element carrying
+# `data-trix-attachment` becomes an `<action-text-attachment>`, or goes
+# when it has none of the attachment attributes.
+private def convert_trix_attachments(tree : Html, root : Int32, ctx : RenderContext) : Nil | Failure
+  nodes = Ary(Int32).new
+  tree.descendants(root).each { |n| nodes << n if tree.has_attr?(n, "data-trix-attachment") }
+  nodes.each do |node|
+    keys = [] of String
+    values = [] of Any
+    ["data-trix-attachment", "data-trix-attributes"].each do |name|
+      next unless tree.has_attr?(node, name)
+      # Unparseable JSON is logged and taken as no attributes
+      parsed = json_parse(tree.attr(node, name).to_heap)
+      next unless parsed
+      raw = parsed.raw
+      next if raw.nil? || raw == false
+      object = parsed.as_h?
+      return Failure.raised("NoMethodError: merge") unless object
+      object.each do |key, value|
+        next unless TRIX_ATTRIBUTES.any? { |pair| pair[0] == key }
+        index = keys.index(key)
+        if index
+          values[index] = value
+        else
+          keys << key
+          values << value
+        end
+      end
+    end
+    attrs = Ary(Attr).new
+    ATTACHMENT_ATTRIBUTES.each do |name|
+      trix = TRIX_ATTRIBUTES.find { |pair| pair[1] == name }
+      next unless trix
+      index = keys.index(trix[0])
+      next unless index
+      attrs << Attr.new(
+        name.as_tape, Str.new(json_value_to_s(values[index])),
+        "".as_tape, 0_u8,
+      )
+    end
+    replacement = "".as_tape
+    unless attrs.empty?
+      element = tree.create_element(ATTACHMENT_TAG, attrs)
+      # Attachment.from_node resolves the attachable, which may raise
+      attachment_from_node(tree, element, ctx)!
+      replacement = tree.to_html(element)
+    end
+    tree.replace_with_html(node, replacement)!
+  end
+  nil
+end
+
+# --- rendering ------------------------------------------------------------------
+
+# `render_attachments`' first step: an attachment's `content` attribute
+# is sanitized with Action Text's allowlist, and dropped if that leaves
+# nothing.
+private def sanitize_content_attribute(tree : Html, node : Int32) : Nil | Failure
+  return nil unless tree.has_attr?(node, "content")
+  content = tree.attr(node, "content")
+  tree.remove_attr(node, "content")
+  sanitized = sanitize(content, action_text)!
+  tree.set_attr(node, "content", sanitized) unless blank?(sanitized)
+  nil
+end
+
+# `Attachment#with_full_attributes`: a new node with the node's
+# attachment attributes, the attachable's own (sgid and content type, for
+# a user), and the node's sgid if it had one.
+private def node_with_full_attributes(tree : Html, node : Int32, attachable : Attachable) : Int32 | Failure
+  attrs = Ary(Attr).new
+  empty = "".as_tape
+  ATTACHMENT_ATTRIBUTES.each do |name|
+    user = attachable.user
+    if name == "sgid" && user
+      value = tree.has_attr?(node, "sgid") ? tree.attr(node, "sgid") : user.attachable_sgid.as_tape
+      attrs << Attr.new(name.as_tape, value, empty, 0_u8)
+    elsif name == "content-type" && attachable.kind == Kind::User
+      attrs << Attr.new(name.as_tape, MENTION_CONTENT_TYPE.as_tape, empty, 0_u8)
+    elsif tree.has_attr?(node, name)
+      attrs << Attr.new(name.as_tape, tree.attr(node, name), empty, 0_u8)
+    end
+  end
+  # from_attributes returns nil, and the render block calls #node on it
+  return Failure.raised("NoMethodError: node for nil") if attrs.empty?
+  tree.create_element(ATTACHMENT_TAG, attrs)
+end
+
+# `render_action_text_attachment`, with nested content attachments
+# rendered through `ContentAttachment#to_html`.
+pub def render_attachment_html(
+  attachment : Attachment,
+  ctx : RenderContext,
+  depth : Int32,
+) : Str | Failure
+  writer = Str::Builder.new(256)
+  render_attachment(attachment, writer) do |content|
+    next "".as_tape if depth >= MAX_CONTENT_ATTACHMENT_DEPTH
+    nested = Content.load(content, ctx)
+    next nested if nested.is_a?(Failure)
+    rendered = nested.render_nested(ctx, depth + 1)
+    next rendered if rendered.is_a?(Failure)
+    with_newline = Str::Builder.new(rendered.bytesize + 1)
+    with_newline << rendered << '\n'
+    with_newline.finish
+  end!
+  writer.finish
+end
+
+private def render_attachments(tree : Html, root : Int32, ctx : RenderContext, depth : Int32) : Nil | Failure
+  attachment_nodes(tree, root).each do |node|
+    sanitize_content_attribute(tree, node)!
+    attachment = attachment_from_node(tree, node, ctx)!
+    full = node_with_full_attributes(tree, node, attachment.attachable)!
+    caption = tree.has_attr?(full, "caption") && !blank?(tree.attr(full, "caption")) ? Opt.new(tree.attr(full, "caption"), true) : Opt.none
+    html = render_attachment_html(Attachment.new(attachment.attachable, caption), ctx, depth)!
+    tree.set_inner_html(full, html)!
+    tree.replace_with_html(node, tree.to_html(full))!
+  end
+  nil
+end
+
+GALLERY_ATTACHMENT_PRESENTATION = "gallery"
+
+private def gallery_attachment?(tree : Html, node : Int32) : Bool
+  tree.named?(node, ATTACHMENT_TAG) && tree.has_attr?(node, "presentation") &&
+    tree.attr(node, "presentation") == GALLERY_ATTACHMENT_PRESENTATION
+end
+
+# `AttachmentGallery.find_attachment_gallery_nodes`: `div:has(A + A)` for
+# gallery attachments A, whose children are all gallery attachments or
+# newline and space text.
+pub def attachment_gallery_nodes(tree : Html, root : Int32) : Ary(Int32)
+  galleries = Ary(Int32).new
+  tree.descendants(root).each do |div|
+    next unless tree.named?(div, "div")
+    paired = tree.descendants(div).any? do |n|
+      next false unless gallery_attachment?(tree, n)
+      siblings = tree.element_children(tree.parent(n))
+      index = siblings.index(n) || 0
+      index > 0 && gallery_attachment?(tree, siblings[index - 1])
+    end
+    next unless paired
+    only = tree.children(div).all? do |child|
+      if tree.text?(child)
+        all_blank = true
+        tree.text(child).each_byte { |b| all_blank = false unless b == 0x0a_u8 || b == 0x20_u8 }
+        all_blank
+      else
+        gallery_attachment?(tree, child)
+      end
+    end
+    galleries << div if only
+  end
+  galleries
+end
+
+private def render_attachment_galleries(tree : Html, root : Int32, ctx : RenderContext, depth : Int32) : Nil | Failure
+  attachment_gallery_nodes(tree, root).each do |gallery|
+    members = Ary(Int32).new
+    tree.descendants(gallery).each { |n| members << n if gallery_attachment?(tree, n) }
+    rendered = Str::Builder.new(1024)
+    members.each do |member|
+      attachment = attachment_from_node(tree, member, ctx)!
+      full = node_with_full_attributes(tree, member, attachment.attachable)!
+      html = render_attachment_html(attachment, ctx, depth)!
+      tree.set_inner_html(full, html)!
+      tree.write_html(full, rendered)
+    end
+    writer = Str::Builder.new(rendered.length + 80)
+    writer << "<div class=\"attachment-gallery attachment-gallery--" << members.size << "\">\n  " <<
+      rendered.finish << "\n</div>"
+    tree.replace_with_html(gallery, writer.finish)!
+  end
+  nil
+end

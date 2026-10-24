@@ -1,0 +1,339 @@
+# Views for `reference/app/views/users`: the partials a user shows up in.
+module views/users
+
+import rils/template/html::{Html}
+import rils/template/template::{Template, Buffer}
+import views/context::{ViewContext}
+import views/helpers/tag::*
+import views/helpers/assets::{image_tag}
+import views/helpers/forms::{button_to, button_tag, form_with, FormWith, hidden_field_tag}
+import views/pwa::{InstallInstructions}
+import views/helpers/links::{link_to}
+import views/helpers/translations::{translation_button}
+import rils/template/recorded::{RecordedPage}
+import views/layouts::{render_in_layout}
+import views/sessions::{HelpContact}
+import views/helpers/application::{version_badge}
+import views/helpers/users::{avatar_background_color, profile_form_submit_button, AvatarUser, avatar_tag, user_title, account_logo_tag, sidebar_turbo_frame_tag, button_to_direct_room_with}
+import rils/routes/paths::{session_path, room_path, user_avatar_path, session_transfer_path, user_ban_path, new_session_path, join_path, new_rooms_direct_path, new_rooms_open_path, user_profile_path, edit_account_path}
+import views/helpers/url::{rooms_directs_with_users}
+import views/helpers/turbo::{turbo_stream_from, turbo_frame_tag, dom_id}
+import views/helpers/rooms::{link_to_room, InvolvementRoom, button_to_change_involvement}
+import views/helpers/application::{capitalize, to_sentence, link_back, link_to_zoom_qr_code, button_to_copy_to_clipboard, web_share_session_button}
+import views/helpers/links::{mail_to}
+import rils/ruby/text::{space?}
+
+# What a mention shows of its user.
+pub class MentionUser
+  getter id : Int64
+  getter name : String
+  getter bio : String?
+  getter attachable_sgid : String
+  getter avatar_path : String
+
+  def initialize(@id : Int64, @name : String, @bio : String?, @attachable_sgid : String, @avatar_path : String)
+  end
+
+  # What `avatar_tag(user)` needs: `User#title` and the avatar path.
+  def avatar : AvatarUser
+    AvatarUser.new(@id, user_title(@name, @bio), @avatar_path)
+  end
+end
+
+# `users/_mention.html.erb`.
+pub class Mention
+  getter ctx : ViewContext
+  getter user : MentionUser
+
+  def initialize(@ctx : ViewContext, @user : MentionUser)
+  end
+
+  Template.def_render("users/_mention.html.erb")
+end
+
+# What the ban button needs of its user.
+pub class BanUser
+  getter id : Int64
+  getter name : String
+  getter status : String
+
+  def initialize(@id : Int64, @name : String, @status : String)
+  end
+
+  # `User#active?`.
+  def active : Bool
+    @status == "active"
+  end
+end
+
+# `users/_ban_button.html.erb`.
+pub class BanButton
+  getter ctx : ViewContext
+  getter user : BanUser
+
+  def initialize(@ctx : ViewContext, @user : BanUser)
+  end
+
+  Template.def_render("users/_ban_button.html.erb")
+end
+
+# `users/autocompletables/_template.html.erb`.
+pub class AutocompletableTemplate
+  getter ctx : ViewContext
+
+  def initialize(@ctx : ViewContext)
+  end
+
+  Template.def_render("users/autocompletables/_template.html.erb")
+end
+
+# `users/new.html.erb`: signing up with the account's join code.
+pub class New
+  getter ctx : ViewContext
+  getter join_code : String
+  getter help_contact : HelpContact?
+
+  def initialize(@ctx : ViewContext, @join_code : String, @help_contact : HelpContact?)
+  end
+
+  Template.def_page("users/new.html.erb")
+
+  pub def page(frame : Bool = false) : RecordedPage
+    render_in_layout(@ctx, "Sign up", "signup", frame) { |buffer| render_into(buffer) }
+  end
+end
+
+# A user as the sidebar shows them: a face and a first name.
+pub class SidebarUser
+  getter id : Int64
+  getter name : String
+  # `fresh_user_avatar_path(user)`.
+  getter avatar_path : String
+
+  def initialize(@id : Int64, @name : String, @avatar_path : String)
+  end
+
+  # `name.split(' ')`: runs of ASCII whitespace part the words.
+  def name_parts : Array(String)
+    parts = [] of String
+    word = String::Builder.new
+    empty = true
+    @name.each_char do |char|
+      if char.ord < 128 && space?(char.ord.to_u8)
+        parts << word.to_s unless empty
+        word = String::Builder.new
+        empty = true
+      else
+        word << char
+        empty = false
+      end
+    end
+    parts << word.to_s unless empty
+    parts
+  end
+
+  # `name.split(' ')[0]`.
+  def first_name : String
+    parts = name_parts
+    parts.empty? ? "" : parts[0]
+  end
+end
+
+# A direct room in the sidebar (`users/sidebars/rooms/_direct`): its other
+# members, or the user alone in it.
+pub class SidebarDirect
+  getter room_id : Int64
+  getter unread : Bool
+  # `room.updated_at.to_fs(:epoch)`.
+  getter updated_at_epoch : String
+  getter members : Array(SidebarUser)
+
+  def initialize(@room_id : Int64, @unread : Bool, @updated_at_epoch : String, @members : Array(SidebarUser))
+  end
+
+  def class_names : String
+    @unread ? "direct unread" : "direct"
+  end
+
+  # `members.map { |m| m.name.split(' ')[0, 3].map { |s| s[0].capitalize }.join }.to_sentence(two_words_connector: '+')`.
+  def member_initials : String
+    initials = @members.map { |member| member.name_parts.first(3).map { |part| capitalize(part[0].to_s) }.join }
+    to_sentence(initials, "+")
+  end
+end
+
+# `users/sidebars/rooms/_direct.html.erb` on its own, for the broadcast
+# that adds a new direct room to its members' sidebars.
+pub class SidebarDirectPartial
+  getter ctx : ViewContext
+  getter membership : SidebarDirect
+
+  def initialize(@ctx : ViewContext, @membership : SidebarDirect)
+  end
+
+  Template.def_render("users/sidebars/rooms/_direct.html.erb")
+end
+
+# A shared room in the sidebar (`users/sidebars/rooms/_shared`).
+pub class SidebarRoom
+  getter id : Int64
+  # "rooms_open" or "rooms_closed".
+  getter param_key : String
+  getter name : String
+  getter unread : Bool
+
+  def initialize(@id : Int64, @param_key : String, @name : String, @unread : Bool)
+  end
+
+  def class_names : String
+    @unread ? "align-center gap room btn txt-nowrap unread" : "align-center gap room btn txt-nowrap"
+  end
+end
+
+# `users/sidebars/rooms/_shared.html.erb`.
+pub class SidebarShared
+  getter ctx : ViewContext
+  getter room : SidebarRoom
+
+  def initialize(@ctx : ViewContext, @room : SidebarRoom)
+  end
+
+  Template.def_render("users/sidebars/rooms/_shared.html.erb")
+end
+
+# `users/sidebars/show.html.erb`: the rooms and directs of `Current.user`
+# (*current_user*), which the layout's sidebar frame loads.
+pub class SidebarShow
+  getter ctx : ViewContext
+  getter current_user : SidebarUser
+  getter rooms_stream : String
+  getter user_rooms_stream : String
+  getter direct_memberships : Array(SidebarDirect)
+  getter direct_placeholder_users : Array(SidebarUser)
+  getter other_memberships : Array(SidebarRoom)
+  # `Current.user.administrator? || !restrict_room_creation_to_administrators?`.
+  getter can_create_rooms : Bool
+
+  def initialize(@ctx : ViewContext, @current_user : SidebarUser, @rooms_stream : String, @user_rooms_stream : String,
+                 @direct_memberships : Array(SidebarDirect), @direct_placeholder_users : Array(SidebarUser),
+                 @other_memberships : Array(SidebarRoom), @can_create_rooms : Bool)
+  end
+
+  Template.def_page("users/sidebars/show.html.erb")
+
+  pub def page(frame : Bool = false) : RecordedPage
+    render_in_layout(@ctx, nil, nil, frame) { |buffer| render_into(buffer) }
+  end
+end
+
+# A user's profile as `users/show` shows it.
+pub class ShownUser
+  getter id : Int64
+  getter name : String
+  getter bio : String?
+  getter email_address : String?
+  # "administrator", "member" or "bot".
+  getter role : String
+  # "active", "deactivated" or "banned".
+  getter status : String
+  getter avatar_path : String
+  # `user.transfer_id`, for `users/profiles/_transfer`.
+  getter transfer_id : String
+
+  def initialize(@id : Int64, @name : String, @bio : String?, @email_address : String?, @role : String, @status : String, @avatar_path : String, @transfer_id : String)
+  end
+
+  def bot? : Bool
+    @role == "bot"
+  end
+
+  # `active?`, as `users/_ban_button` asks it.
+  def active : Bool
+    @status == "active"
+  end
+
+  def deactivated? : Bool
+    @status == "deactivated"
+  end
+
+  def banned? : Bool
+    @status == "banned"
+  end
+end
+
+# `users/show.html.erb`: someone's profile.
+pub class Show
+  getter ctx : ViewContext
+  getter user : ShownUser
+
+  def initialize(@ctx : ViewContext, @user : ShownUser)
+  end
+
+  Template.def_page("users/show.html.erb")
+
+  pub def page(frame : Bool = false) : RecordedPage
+    render_in_layout(@ctx, @user.name, nil, frame) { |buffer| render_into(buffer) }
+  end
+end
+
+# A room in the profile's list (`users/profiles/_membership`), with the
+# user's involvement in it.
+pub class ProfileMembership
+  getter room_id : Int64
+  # `model_name.param_key` of the room's class.
+  getter room_param_key : String
+  getter room_display_name : String
+  getter involvement : String
+  getter direct : Bool
+
+  def initialize(@room_id : Int64, @room_param_key : String, @room_display_name : String, @involvement : String, @direct : Bool)
+  end
+
+  def involvement_room : InvolvementRoom
+    InvolvementRoom.new(@room_id, @room_param_key, @direct)
+  end
+end
+
+# `users/profiles/show.html.erb`: `Current.user`'s own profile and rooms.
+pub class ProfileShow
+  getter ctx : ViewContext
+  getter user : ShownUser
+  getter avatar_attached : Bool
+  getter shared_memberships : Array(ProfileMembership)
+  getter direct_memberships : Array(ProfileMembership)
+
+  def initialize(@ctx : ViewContext, @user : ShownUser, @avatar_attached : Bool, @shared_memberships : Array(ProfileMembership), @direct_memberships : Array(ProfileMembership))
+  end
+
+  Template.def_page("users/profiles/show.html.erb")
+
+  # `form_with model: @user, url: user_profile_path, method: :patch, data: { controller: "form" }`.
+  def profile_form : FormWith
+    form_with(user_profile_path).model("user").method("patch").data("controller", "form")
+  end
+
+  # The email field's leading options: its value only when there is one.
+  def email_options : Attrs
+    options = attrs.class("input txt-large")
+    if email_address = @user.email_address
+      options = options.attr("value", email_address)
+    end
+    options
+  end
+
+  pub def page(frame : Bool = false) : RecordedPage
+    render_in_layout(@ctx, @user.name, nil, frame) { |buffer| render_into(buffer) }
+  end
+end
+
+# `users/avatars/show.svg.erb`: the initials avatar of a user without an
+# uploaded one.
+pub class AvatarSvg
+  getter user_id : Int64
+  getter initials : String
+
+  def initialize(@user_id : Int64, @initials : String)
+  end
+
+  Template.def_render("users/avatars/show.svg.erb")
+end

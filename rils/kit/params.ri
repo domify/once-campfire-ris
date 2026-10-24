@@ -1,0 +1,747 @@
+# Rails request parameters.
+#
+# A port of `ActionDispatch::ParamBuilder` (Rails 8.2, itself derived from
+# `Rack::QueryParser`) plus the pair splitting of
+# `ActionDispatch::QueryParser.each_pair` and
+# `Rack::QueryParser#parse_query_pairs`, the deep munging applied to JSON
+# bodies (`Request::Utils::NoNilParamEncoder`), and the strong-parameters
+# subset Campfire uses (`require`, `permit`, `fetch`).
+module rils/kit/params
+
+import std/json::{JSON, Any}
+import std/file::{File}
+import std/text
+import rils/ruby/floats::{float_to_s}
+
+# Rails' `ActionDispatch::ParamBuilder.default` depth limit.
+pub DEPTH_LIMIT = 100
+# `Rack::QueryParser` limits, applied to form bodies (Rack parses those, not
+# Rails).
+pub FORM_BYTESIZE_LIMIT = 4 * 1024 * 1024
+pub FORM_PARAMS_LIMIT   = 4096
+
+pub enum ParamErrorKind
+  # `ParameterTypeError`: e.g. `a=1&a[b]=2`.
+  Type
+  # `InvalidParameterError`: bad %-encoding or invalid UTF-8.
+  Invalid
+  # `ParamsTooDeepError`.
+  TooDeep
+  # `QueryLimitError`.
+  Limit
+  # `ActionDispatch::Http::Parameters::ParseError` (malformed JSON or
+  # multipart).
+  Parse
+end
+
+pub struct ParamError
+  getter kind : ParamErrorKind
+  getter detail : String
+
+  def initialize(@kind : ParamErrorKind, @detail : String = "")
+  end
+end
+
+impl Error for ParamError
+  def message : String
+    case @kind
+    when ParamErrorKind::TooDeep then "exceeded available parameter key space"
+    when ParamErrorKind::Parse   then "Error occurred while parsing request parameters"
+    else                              @detail
+    end
+  end
+end
+
+# A file part of a multipart body (`ActionDispatch::Http::UploadedFile`),
+# spooled to a temporary file.
+pub class UploadedFile
+  getter original_filename : String
+  getter content_type : String?
+  # The raw part headers (`UploadedFile#headers`).
+  getter headers : String
+  getter size : Int64
+  getter path : String
+
+  def initialize(@original_filename : String, @content_type : String?, @headers : String, @size : Int64, @path : String)
+  end
+
+  pub def read : String
+    File.read(@path)
+  end
+end
+
+# A parameter value: what a Rails params hash can hold.
+pub struct Param
+  alias Raw = Nil | Bool | Int64 | Float64 | String | UploadedFile | Array(Param) | ParamMap
+
+  getter raw : Raw
+
+  def initialize(@raw : Raw)
+  end
+
+  pub def null? : Bool
+    @raw.nil?
+  end
+
+  pub def as_s? : String?
+    raw = @raw
+    raw.is_a?(String) ? raw : nil
+  end
+
+  pub def as_h? : ParamMap?
+    raw = @raw
+    raw.is_a?(ParamMap) ? raw : nil
+  end
+
+  pub def as_a? : Array(Param)?
+    raw = @raw
+    raw.is_a?(Array(Param)) ? raw : nil
+  end
+
+  pub def as_file? : UploadedFile?
+    raw = @raw
+    raw.is_a?(UploadedFile) ? raw : nil
+  end
+
+  # `params[:a][:b]` style lookup; nil for anything that isn't a hash.
+  pub def [](key : String) : Param?
+    map = as_h?
+    map ? map[key]? : nil
+  end
+
+  # The value as Rails would interpolate it (`to_s`): strings as-is, numbers
+  # and booleans formatted, nil as "".
+  pub def to_s? : String?
+    raw = @raw
+    case raw
+    when Nil     then ""
+    when Bool    then raw ? "true" : "false"
+    when Int64   then raw.to_s
+    when Float64 then float_to_s(raw)
+    when String  then raw
+    else              nil
+    end
+  end
+
+  # ActiveSupport's `blank?`: nil, false, whitespace-only strings, and empty
+  # collections.
+  pub def blank? : Bool
+    raw = @raw
+    case raw
+    when Nil          then true
+    when Bool         then !raw
+    when String       then raw.blank?
+    when Array(Param) then raw.empty?
+    when ParamMap     then raw.empty?
+    else                   false
+    end
+  end
+
+  pub def present? : Bool
+    !blank?
+  end
+
+  # The strong-parameters notion of a permitted scalar.
+  def permitted_scalar? : Bool
+    !@raw.is_a?(Array(Param)) && !@raw.is_a?(ParamMap)
+  end
+
+  pub def to_json_any : Any
+    raw = @raw
+    case raw
+    when Nil, Bool, Int64, Float64, String then Any.new(raw)
+    when UploadedFile
+      Any.new({"original_filename" => Any.new(raw.original_filename), "content_type" => Any.new(raw.content_type)})
+    when Array(Param) then Any.new(raw.map(&.to_json_any))
+    when ParamMap     then raw.to_json_any
+    else                   Any.new(nil)
+    end
+  end
+
+  # `ParamBuilder.from_hash` for a decoded JSON body: nils are compacted out
+  # of arrays (`NoNilParamEncoder`, i.e. deep munge).
+  pub def self.from_json(value : Any) : Param
+    raw = value.raw
+    case raw
+    when Nil, Bool, Int64, Float64, String then Param.new(raw)
+    when Array(Any)
+      Param.new(raw.reject(&.raw.nil?).map { |item| Param.from_json(item) })
+    when Hash(String, Any)
+      map = ParamMap.new
+      raw.each { |key, item| map[key] = Param.from_json(item) }
+      Param.new(map)
+    else
+      Param.new(nil)
+    end
+  end
+
+  # `params.require(:key).permit(...)`'s second half: keep only the
+  # permitted keys.
+  pub def permit(filters : Array(Permit)) : ParamMap
+    map = as_h?
+    map ? map.permit(filters) : ParamMap.new
+  end
+end
+
+# An insertion-ordered string-keyed map, like the Ruby `Hash` behind Rails
+# params.
+pub class ParamMap
+  getter entries : Hash(String, Param)
+
+  def initialize
+    @entries = {} of String => Param
+  end
+
+  pub def [](key : String) : Param
+    @entries[key]
+  end
+
+  pub def []?(key : String) : Param?
+    @entries[key]?
+  end
+
+  # A string value, or nil.
+  pub def str(key : String) : String?
+    value = @entries[key]?
+    value ? value.as_s? : nil
+  end
+
+  pub def has_key?(key : String) : Bool
+    @entries.has_key?(key)
+  end
+
+  # Ruby's `hash[key] = value`: replaces in place, keeping the original
+  # position.
+  pub def []=(key : String, value : Param) : Param
+    @entries[key] = value
+  end
+
+  pub def delete(key : String) : Param?
+    @entries.delete(key)
+  end
+
+  pub def keys : Array(String)
+    @entries.keys
+  end
+
+  pub def each(& : String, Param -> Nil) : Nil
+    @entries.each { |key, value| yield key, value }
+  end
+
+  pub def size : Int32
+    @entries.size
+  end
+
+  pub def empty? : Bool
+    @entries.empty?
+  end
+
+  # Ruby's `Hash#merge!`: later values win, existing keys keep their
+  # position.
+  pub def merge(other : ParamMap) : Nil
+    other.each { |key, value| @entries[key] = value }
+  end
+
+  pub def copy : ParamMap
+    copied = ParamMap.new
+    copied.merge(self)
+    copied
+  end
+
+  # `params.require(:key)`: the value when it's present (or `false`), else
+  # `ParameterMissing` (the caller turns nil into it).
+  pub def require(key : String) : Param?
+    value = @entries[key]?
+    return nil unless value
+    value.present? || value.raw == false ? value : nil
+  end
+
+  # `params.fetch(:key, default)`.
+  pub def fetch(key : String, default : Param) : Param
+    @entries[key]? || default
+  end
+
+  # `ActionController::Parameters#permit`, for the filter shapes Campfire
+  # uses.
+  pub def permit(filters : Array(Permit)) : ParamMap
+    permitted = ParamMap.new
+    filters.each do |filter|
+      key = filter.key
+      value = @entries[key]?
+      case filter.shape
+      when PermitShape::Key
+        permitted[key] = value if value && value.permitted_scalar?
+        # Multi-parameter attributes, e.g. `born_on(1i)`.
+        each do |candidate, candidate_value|
+          permitted[candidate] = candidate_value if multi_parameter_key?(candidate, key) && candidate_value.permitted_scalar?
+        end
+      when PermitShape::ScalarArray
+        items = value ? value.as_a? : nil
+        permitted[key] = Param.new(items) if items && items.all?(&.permitted_scalar?)
+      when PermitShape::AnyHash
+        map = value ? value.as_h? : nil
+        permitted[key] = Param.new(permit_any(map)) if map
+      when PermitShape::Nested
+        nested = filter.nested
+        map = value ? value.as_h? : nil
+        items = value ? value.as_a? : nil
+        if map && fields_for_style?(map)
+          each_permitted = ParamMap.new
+          map.each do |inner_key, inner|
+            inner_map = inner.as_h?
+            each_permitted[inner_key] = Param.new(inner_map.permit(nested)) if inner_map
+          end
+          permitted[key] = Param.new(each_permitted)
+        elsif map
+          permitted[key] = Param.new(map.permit(nested))
+        elsif items
+          hashes = [] of Param
+          items.each do |item|
+            item_map = item.as_h?
+            hashes << Param.new(item_map.permit(nested)) if item_map
+          end
+          permitted[key] = Param.new(hashes)
+        end
+      end
+    end
+    permitted
+  end
+
+  pub def to_json_any : Any
+    hash = {} of String => Any
+    each { |key, value| hash[key] = value.to_json_any }
+    Any.new(hash)
+  end
+end
+
+def multi_parameter_key?(candidate : String, key : String) : Bool
+  # /\A#{key}\(\d+[if]?\)\z/
+  return false unless candidate.starts_with?("#{key}(") && candidate.ends_with?(")")
+  rest = candidate[key.bytesize + 1, candidate.bytesize - key.bytesize - 2]
+  rest = rest[0, rest.bytesize - 1] if rest.ends_with?("i") || rest.ends_with?("f")
+  !rest.empty? && rest.chars.all?(&.digit?)
+end
+
+def fields_for_style?(map : ParamMap) : Bool
+  return false if map.empty?
+  all = true
+  map.each do |key, value|
+    digits = key.lchop('-')
+    all = false unless !digits.empty? && digits.chars.all?(&.digit?) && value.raw.is_a?(ParamMap)
+  end
+  all
+end
+
+# `permit(key: {})`: any scalars, arrays of scalars or hashes, recursively.
+def permit_any(map : ParamMap) : ParamMap
+  permitted = ParamMap.new
+  map.each do |key, value|
+    raw = value.raw
+    if raw.is_a?(ParamMap)
+      permitted[key] = Param.new(permit_any(raw))
+    elsif raw.is_a?(Array(Param))
+      kept = [] of Param
+      raw.each do |item|
+        inner = item.raw
+        if inner.is_a?(ParamMap)
+          kept << Param.new(permit_any(inner))
+        elsif !inner.is_a?(Array(Param))
+          kept << item
+        end
+      end
+      permitted[key] = Param.new(kept)
+    else
+      permitted[key] = value
+    end
+  end
+  permitted
+end
+
+pub enum PermitShape
+  # `:name`
+  Key
+  # `name: []`
+  ScalarArray
+  # `name: {}`
+  AnyHash
+  # `name: [ ... ]` / `name: { ... }`
+  Nested
+end
+
+# A `permit` filter.
+pub struct Permit
+  getter key : String
+  getter shape : PermitShape
+  getter nested : Array(Permit)
+
+  def initialize(@key : String, @shape : PermitShape = PermitShape::Key, @nested : Array(Permit) = [] of Permit)
+  end
+
+  pub def self.array(key : String) : Permit
+    Permit.new(key, PermitShape::ScalarArray)
+  end
+
+  pub def self.any_hash(key : String) : Permit
+    Permit.new(key, PermitShape::AnyHash)
+  end
+
+  pub def self.nested(key : String, filters : Array(Permit)) : Permit
+    Permit.new(key, PermitShape::Nested, filters)
+  end
+end
+
+# Shorthand: `permit_keys(["name", "avatar"])`.
+pub def permit_keys(keys : Array(String)) : Array(Permit)
+  keys.map { |key| Permit.new(key) }
+end
+
+# A decoded pair before the UTF-8 check, which Rails performs in the builder
+# (so pairs whose top-level key is empty are skipped without raising). A nil
+# value is a pair without `=`.
+pub struct RawPair
+  getter key : String
+  getter value : String | UploadedFile | Nil
+
+  def initialize(@key : String, @value : String | UploadedFile | Nil)
+  end
+end
+
+# `ActionDispatch::QueryParser.each_pair`: split on `/& */`, skip empty
+# parts, split on the first `=`, and `URI.decode_www_form_component` both
+# halves. No size limits (Rails applies none to the query string). Read
+# where the query lies; only the decoded keys and values are copied out.
+pub def query_pairs(query : Str) : Array(RawPair) | ParamError
+  pairs = [] of RawPair
+  n = query.bytesize
+  start = 0
+  first = true
+  while start <= n
+    stop = start
+    while stop < n && query[stop] != '&'.ord
+      stop += 1
+    end
+    from = start
+    while !first && from < stop && query[from] == ' '.ord
+      from += 1
+    end
+    first = false
+    if from < stop
+      pair = decode_pair(query[from, stop - from])
+      return pair if pair.is_a?(ParamError)
+      pairs << pair
+    end
+    start = stop + 1
+  end
+  pairs
+end
+
+pub def query_pairs(query : String) : Array(RawPair) | ParamError
+  pairs = ([] of RawPair).as(Array(RawPair) | ParamError)
+  tape { pairs = query_pairs(query.as_tape) }
+  pairs
+end
+
+# `Rack::Request#form_pairs` for an urlencoded body: Rack's limits, and the
+# trailing `\0` Safari once appended is dropped.
+pub def form_pairs(body : Str) : Array(RawPair) | ParamError
+  return ParamError.new(ParamErrorKind::Limit, "total query size exceeds limit (#{FORM_BYTESIZE_LIMIT})") if body.bytesize > FORM_BYTESIZE_LIMIT
+  body = body[0, body.bytesize - 1] if body.bytesize > 0 && body[body.bytesize - 1] == 0_u8
+  total = 1
+  body.each_byte { |byte| total += 1 if byte == '&'.ord }
+  return ParamError.new(ParamErrorKind::Limit, "total number of query parameters (#{total}) exceeds limit (#{FORM_PARAMS_LIMIT})") if total > FORM_PARAMS_LIMIT
+  # Raw non-UTF-8 bytes in a form body can't decode to valid UTF-8 params
+  # either.
+  return ParamError.new(ParamErrorKind::Invalid, "Invalid encoding for parameter") unless valid_utf8?(body)
+  query_pairs(body)
+end
+
+pub def form_pairs(body : String) : Array(RawPair) | ParamError
+  pairs = ([] of RawPair).as(Array(RawPair) | ParamError)
+  tape { pairs = form_pairs(body.as_tape) }
+  pairs
+end
+
+def decode_pair(part : Str) : RawPair | ParamError
+  equals = 0
+  while equals < part.bytesize && part[equals] != '='.ord
+    equals += 1
+  end
+  decoded_key = decode_www_form_component(part[0, equals])
+  return decoded_key if decoded_key.is_a?(ParamError)
+  return RawPair.new(decoded_key, nil) if equals == part.bytesize
+  decoded_value = decode_www_form_component(part[equals + 1, part.bytesize - equals - 1])
+  return decoded_value if decoded_value.is_a?(ParamError)
+  RawPair.new(decoded_key, decoded_value)
+end
+
+def hex_value(byte : UInt8) : Int32
+  return (byte - 48).to_i32 if byte >= 48 && byte <= 57
+  return (byte - 87).to_i32 if byte >= 97 && byte <= 102
+  return (byte - 55).to_i32 if byte >= 65 && byte <= 70
+  -1
+end
+
+# Ruby's `URI.decode_www_form_component`: `+` is a space, `%XX` is a byte,
+# and a `%` not followed by two hex digits is an error. The decoded text
+# is a string to keep.
+pub def decode_www_form_component(text : Str) : String | ParamError
+  return text.to_heap unless form_escaped?(text)
+  decoded = Str::Builder.new(text.bytesize)
+  i = 0
+  while i < text.bytesize
+    byte = text[i]
+    if byte == '+'.ord
+      decoded.push(' '.ord.to_u8)
+      i += 1
+    elsif byte == '%'.ord
+      high = i + 1 < text.bytesize ? hex_value(text[i + 1]) : -1
+      low = i + 2 < text.bytesize ? hex_value(text[i + 2]) : -1
+      return ParamError.new(ParamErrorKind::Invalid, "invalid %-encoding (#{text.to_heap})") if high < 0 || low < 0
+      decoded.push((high * 16 + low).to_u8)
+      i += 3
+    else
+      decoded.push(byte)
+      i += 1
+    end
+  end
+  decoded.finish.to_heap
+end
+
+# Nothing to decode, the common case: the text itself, not a copy.
+pub def decode_www_form_component(text : String) : String | ParamError
+  decoded = text.as(String | ParamError)
+  tape { decoded = decode_www_form_component(text.as_tape) if form_escaped?(text.as_tape) }
+  decoded
+end
+
+def form_escaped?(text : Str) : Bool
+  text.each_byte { |byte| return true if byte == '+'.ord || byte == '%'.ord }
+  false
+end
+
+# Whether *text*'s bytes are well-formed UTF-8: no stray continuation
+# bytes, overlong forms, surrogates or code points past U+10FFFF.
+pub def valid_utf8?(text : String) : Bool
+  valid_utf8?(text.as_tape)
+end
+
+pub def valid_utf8?(bytes : Str) : Bool
+  i = 0
+  size = bytes.bytesize
+  while i < size
+    byte = bytes[i]
+    if byte < 0x80
+      i += 1
+      next
+    end
+    count = if byte >= 0xC2 && byte <= 0xDF
+              1
+            elsif byte >= 0xE0 && byte <= 0xEF
+              2
+            elsif byte >= 0xF0 && byte <= 0xF4
+              3
+            else
+              return false
+            end
+    # The continuation bytes must all be there.
+    return false if i + count >= size
+    count.times do |n|
+      return false unless bytes[i + 1 + n] & 0xC0 == 0x80
+    end
+    second = bytes[i + 1]
+    return false if byte == 0xE0 && second < 0xA0
+    return false if byte == 0xED && second > 0x9F
+    return false if byte == 0xF0 && second < 0x90
+    return false if byte == 0xF4 && second > 0x8F
+    i += count + 1
+  end
+  true
+end
+
+# `ActionDispatch::ParamBuilder.from_pairs`.
+pub def from_pairs(pairs : Array(RawPair)) : ParamMap | ParamError
+  params = ParamMap.new
+  pairs.each do |pair|
+    key = pair.key
+    unless valid_utf8?(key)
+      next if top_level_key(key).empty?
+      return ParamError.new(ParamErrorKind::Invalid, "Invalid encoding for parameter")
+    end
+    next if top_level_key(key).empty?
+    raw = pair.value
+    value = case raw
+            when Nil          then Param.new(nil)
+            when UploadedFile then Param.new(raw)
+            else
+              return ParamError.new(ParamErrorKind::Invalid, "Invalid encoding for parameter: #{raw}") unless valid_utf8?(raw)
+              Param.new(raw)
+            end
+    stored = store_nested_param(params, key, value, 0)
+    return stored if stored.is_a?(ParamError)
+  end
+  params
+end
+
+# `ActionDispatch::ParamBuilder.from_query_string`.
+pub def from_query_string(query : Str) : ParamMap | ParamError
+  pairs = query_pairs(query)
+  return pairs if pairs.is_a?(ParamError)
+  from_pairs(pairs)
+end
+
+pub def from_query_string(query : String) : ParamMap | ParamError
+  pairs = query_pairs(query)
+  return pairs if pairs.is_a?(ParamError)
+  from_pairs(pairs)
+end
+
+def top_level_key(name : String) : String
+  start = find_byte(name, '['.ord.to_u8, 1)
+  start ? name[0, start] : name
+end
+
+def find_byte(text : String, byte : UInt8, from : Int32) : Int32?
+  i = from
+  while i < text.bytesize
+    return i if text.as_tape[i] == byte
+    i += 1
+  end
+  nil
+end
+
+# What `store_nested_param` returned: the params hash it was given, a
+# one-element array (for a trailing `[]` below the top level), or nil (for
+# an empty key).
+enum Stored
+  Params
+  ArrayValue
+  Nothing
+end
+
+def store_nested_param(params : ParamMap, name : String, value : Param, depth : Int32) : Stored | Array(Param) | ParamError
+  return ParamError.new(ParamErrorKind::TooDeep) if depth >= DEPTH_LIMIT
+  k = name
+  after = ""
+  if depth == 0
+    # Start of parsing, don't treat [] or [ at start of string specially.
+    if start = find_byte(name, '['.ord.to_u8, 1)
+      k = name[0, start]
+      after = name[start, name.bytesize - start]
+    end
+  elsif name.starts_with?("[]")
+    k = "[]"
+    after = name[2, name.bytesize - 2]
+  elsif name.starts_with?("[") && (close = find_byte(name, ']'.ord.to_u8, 1))
+    k = name[1, close - 1]
+    after = name[close + 1, name.bytesize - close - 1]
+  end
+
+  return Stored::Nothing if k.empty?
+
+  if after.empty?
+    if k == "[]" && depth != 0
+      items = [] of Param
+      items << value unless value.null?
+      return items
+    end
+    params[k] = value
+  elsif after == "["
+    params[name] = value
+  elsif after == "[]"
+    array = array_slot(params, k)
+    return array if array.is_a?(ParamError)
+    array << value unless value.null?
+  elsif after.starts_with?("[]")
+    nested = after[2, after.bytesize - 2]
+    # Recognize x[][y] (hash inside array) parameters; otherwise nest what
+    # follows the [].
+    child_key = nested
+    if nested.starts_with?("[") && nested.ends_with?("]") && nested.bytesize > 2
+      inner = nested[1, nested.bytesize - 2]
+      child_key = inner unless inner.includes?("[") || inner.includes?("]")
+    end
+    array = array_slot(params, k)
+    return array if array.is_a?(ParamError)
+    last = array.last?
+    last_map = last ? last.as_h? : nil
+    if last_map && !params_hash_has_key?(last_map, child_key)
+      stored = store_nested_param(last_map, child_key, value, depth + 1)
+      return stored if stored.is_a?(ParamError)
+    else
+      child = ParamMap.new
+      stored = store_nested_param(child, child_key, value, depth + 1)
+      return stored if stored.is_a?(ParamError)
+      array << stored_param(stored, child)
+    end
+  else
+    existing = params[k]?
+    child = ParamMap.new
+    if existing && !existing.null?
+      existing_map = existing.as_h?
+      return ParamError.new(ParamErrorKind::Type, "expected Hash (got #{ruby_class(existing)}) for param `#{k}'") unless existing_map
+      child = existing_map
+    end
+    stored = store_nested_param(child, after, value, depth + 1)
+    return stored if stored.is_a?(ParamError)
+    params[k] = stored_param(stored, child)
+  end
+  Stored::Params
+end
+
+def stored_param(stored : Stored | Array(Param), child : ParamMap) : Param
+  return Param.new(stored) if stored.is_a?(Array(Param))
+  stored.params? ? Param.new(child) : Param.new(nil)
+end
+
+# `params[k] ||= []` followed by the Array type check.
+def array_slot(params : ParamMap, k : String) : Array(Param) | ParamError
+  existing = params[k]?
+  if existing.nil? || existing.null?
+    items = [] of Param
+    params[k] = Param.new(items)
+    return items
+  end
+  items = existing.as_a?
+  items || ParamError.new(ParamErrorKind::Type, "expected Array (got #{ruby_class(existing)}) for param `#{k}'")
+end
+
+def params_hash_has_key?(hash : ParamMap, key : String) : Bool
+  return false if key.includes?("[]")
+  # Ruby's `key.split(/[\[\]]+/)`; empty parts are skipped.
+  current = hash.as(ParamMap?)
+  key.tr("[]", "\0\0").split('\0').reject(&.empty?).each do |part|
+    return false unless current
+    value = current[part]?
+    return false unless value
+    current = value.as_h?
+  end
+  true
+end
+
+def ruby_class(param : Param) : String
+  raw = param.raw
+  case raw
+  when Nil          then "NilClass"
+  when Bool         then raw ? "TrueClass" : "FalseClass"
+  when Int64        then "Integer"
+  when Float64      then "Float"
+  when String       then "String"
+  when UploadedFile then "ActionDispatch::Http::UploadedFile"
+  when Array(Param) then "Array"
+  else                   "ActiveSupport::HashWithIndifferentAccess"
+  end
+end
+
+# `ParamBuilder.from_hash` for a JSON body:
+# `Parameters::DEFAULT_PARSERS[:json]` wraps non-hash documents as
+# `{ "_json" => data }`.
+pub def from_json_body(body : String) : ParamMap | ParamError
+  value = JSON.parse?(body)
+  return ParamError.new(ParamErrorKind::Parse) unless value
+  param = Param.from_json(value)
+  map = param.as_h?
+  return map if map
+  wrapped = ParamMap.new
+  wrapped["_json"] = param
+  wrapped
+end

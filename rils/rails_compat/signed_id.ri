@@ -1,0 +1,73 @@
+# `ActiveRecord::SignedId` (`signed_id(purpose:, expires_in:)` /
+# `find_signed`).
+#
+# The verifier is `Rails.application.message_verifiers["active_record/signed_id"]`
+# with the legacy options prepended (`use_legacy_signed_id_verifier` defaults
+# to `:generate_and_verify`): it generates with SHA256, `::JSON`, URL-safe
+# Base64, and falls back when reading to the app-wide default (SHA1,
+# `:json_allow_marshal`, strict Base64). The purpose is
+# `"<base class name underscored>/<purpose>"`, e.g. `user/avatar`, or just
+# `user`.
+module rils/rails_compat/signed_id
+
+import std/time::{Time}
+import std/json::{Any}
+import std/text
+import rils/rails_compat/crypto::{Digest}
+import rils/rails_compat/key_generator::{Secrets}
+import rils/rails_compat/metadata::{Failure, Serializer}
+import rils/rails_compat/message_verifier::{MessageVerifier, Encoding}
+import rils/ruby/integers::{to_i_checked}
+
+pub SIGNED_ID_SALT = "active_record/signed_id"
+
+# *model_name* is the record's *base* class name, e.g. "User" or "Room" (not
+# "Rooms::Open").
+pub def generate_signed_id(secrets : Secrets, model_name : String, id : Int64, purpose : String? = nil, expires_at : Time? = nil) : String
+  signed_id_verifier(secrets).generate(Any.new(id), combine_purposes(model_name, purpose), expires_at)
+end
+
+# `find_signed`'s verification step: the id to look up, or nil.
+pub def verify_signed_id(secrets : Secrets, model_name : String, signed_id : String, purpose : String?, now : Time) : Int64?
+  value = signed_id_verifier(secrets).verify(signed_id, combine_purposes(model_name, purpose), now)
+  return nil if value.is_a?(Failure)
+  raw = value.raw
+  case raw
+  when Int64 then raw
+  # `find_by(id: "7")` casts the string.
+  when String then raw.strip.to_i64?
+  else             nil
+  end
+end
+
+pub def signed_id_verifier(secrets : Secrets) : MessageVerifier
+  secret = secrets.key_generator.generate_key(SIGNED_ID_SALT, 64)
+  fallback = MessageVerifier.new(secret, Digest::Sha1, Encoding::Strict, Serializer::JsonMarshalFallback)
+  MessageVerifier.new(secret, Digest::Sha256, Encoding::UrlSafe, Serializer::Json).fall_back_to(fallback)
+end
+
+# `combine_signed_id_purposes`:
+# `[base_class.name.underscore, purpose.to_s].compact_blank.join("/")`.
+pub def combine_purposes(model_name : String, purpose : String?) : String
+  [underscore(model_name), purpose || ""].reject(&.blank?).join("/")
+end
+
+# `String#underscore` for class names: `Rooms::Open` → `rooms/open`,
+# `WebPush` → `web_push`.
+pub def underscore(name : String) : String
+  chars = name.gsub("::", "/").chars
+  String.build do |io|
+    chars.each_with_index do |c, i|
+      if c.ascii_uppercase?
+        previous = i > 0 ? chars[i - 1] : nil
+        following = i + 1 < chars.size ? chars[i + 1] : nil
+        after_lower_or_digit = previous && (previous.ascii_lowercase? || previous.ascii_number?)
+        acronym_end = previous && previous.ascii_uppercase? && following && following.ascii_lowercase?
+        io << '_' if after_lower_or_digit || acronym_end
+        io << c.downcase
+      else
+        io << (c == '-' ? '_' : c)
+      end
+    end
+  end
+end

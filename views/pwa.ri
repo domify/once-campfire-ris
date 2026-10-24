@@ -1,0 +1,77 @@
+# Views for `reference/app/views/pwa`: the notification help a browser
+# that refused notifications shows, by platform.
+module views/pwa
+
+import std/text
+import rils/template/html::{Html}
+import rils/template/template::{Template, Buffer}
+import views/context::{ViewContext}
+import views/helpers/tag::*
+import views/helpers/assets::{image_tag}
+import views/helpers/application::{capitalize}
+import rils/rails_compat/json::{generate_string}
+
+# `pwa/_browser_settings.html.erb`.
+pub class BrowserSettings
+  getter ctx : ViewContext
+
+  def initialize(@ctx : ViewContext)
+  end
+
+  Template.def_render("pwa/_browser_settings.html.erb")
+end
+
+# `pwa/_system_settings.html.erb`.
+pub class SystemSettings
+  getter ctx : ViewContext
+
+  def initialize(@ctx : ViewContext)
+  end
+
+  Template.def_render("pwa/_system_settings.html.erb")
+end
+
+# `pwa/_install_instructions.html.erb`.
+pub class InstallInstructions
+  getter ctx : ViewContext
+
+  def initialize(@ctx : ViewContext)
+  end
+
+  Template.def_render("pwa/_install_instructions.html.erb")
+end
+
+# `pwa/manifest.json.erb`. ERB HTML-escapes the values into the JSON, so an
+# account named `a\\b` or `"a"` made the manifest invalid and the logo URL
+# came out as `?size=small&amp;v=...`; the values are JSON strings here.
+pub class Manifest
+  getter ctx : ViewContext
+  # `Current.account&.name`.
+  getter account_name : String?
+  # `fresh_account_logo_path(size: :small)`.
+  getter logo_path_small : String
+  # `fresh_account_logo_path`.
+  getter logo_path : String
+
+  def initialize(@ctx : ViewContext, @account_name : String?, @logo_path_small : String, @logo_path : String)
+  end
+
+  # `image_url(source)`.
+  def image_url(source : String) : String
+    @ctx.url(@ctx.asset(source))
+  end
+
+  def json_string(value : String) : String
+    generate_string(value)
+  end
+
+  Template.def_render("pwa/manifest.json.erb")
+end
+
+# `pwa/service_worker.js`, served as it is.
+pub class ServiceWorker
+  def initialize
+  end
+
+  Template.def_render("pwa/service_worker.js")
+end

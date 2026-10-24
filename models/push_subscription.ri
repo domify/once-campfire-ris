@@ -1,0 +1,255 @@
+# `reference/app/models/push/subscription.rb`, and the subscriber queries of
+# `reference/app/models/room/message_pusher.rb`. Delivery lives in the app.
+module models/push_subscription
+
+import std/text
+import rils/record/sqlite::{Connection, Row, SqlValue, placeholders}
+import rils/record/timestamp::{Timestamp}
+import rils/record/database::{Tx, RichText}
+import rils/record/errors::{Errors, RecordNotFound, RecordInvalid}
+import models/user::{User}
+import models/room::{Room, Membership}
+import models/message::{Message}
+
+# `Push::Subscription::PERMITTED_ENDPOINT_HOSTS`
+pub PERMITTED_ENDPOINT_HOSTS = ["jmt17.google.com", "fcm.googleapis.com", "updates.push.services.mozilla.com", "web.push.apple.com", "notify.windows.com"]
+
+# How long a payload's title and body may be, counted as the bytes they take
+# in the JSON message. An encrypted Web Push record holds at most 4096
+# bytes: 4078 of JSON once the padding and tag are in, and the icon, path
+# and badge take under 150 of that.
+pub MAX_PAYLOAD_TITLE_BYTES =  256
+pub MAX_PAYLOAD_BODY_BYTES  = 3072
+
+PUSH_COLUMNS = %("push_subscriptions"."id", "push_subscriptions"."user_id", "push_subscriptions"."endpoint", "push_subscriptions"."p256dh_key", "push_subscriptions"."auth_key", "push_subscriptions"."user_agent", "push_subscriptions"."created_at", "push_subscriptions"."updated_at")
+
+# What `Room::MessagePusher#build_payload` sends.
+pub struct PushPayload
+  getter title : String
+  getter body : String
+  getter path : String
+
+  def initialize(@title : String, @body : String, @path : String)
+  end
+end
+
+# `RestrictedHTTP::PrivateNetworkGuard.resolve`: the public address a host
+# resolves to, or nil for a private or unresolvable one. The app supplies it.
+pub alias Resolver = Proc(String, String?)
+
+pub class PushSubscription
+  getter id : Int64
+  getter user_id : Int64
+  getter endpoint : String?
+  getter p256dh_key : String?
+  getter auth_key : String?
+  getter user_agent : String?
+  getter created_at : Timestamp
+  getter updated_at : Timestamp
+
+  def initialize(@id : Int64, @user_id : Int64, @endpoint : String?, @p256dh_key : String?, @auth_key : String?, @user_agent : String?, @created_at : Timestamp, @updated_at : Timestamp)
+  end
+
+  def self.from_row(row : Row) : PushSubscription
+    PushSubscription.new(row.int(0), row.int(1), row.text?(2), row.text?(3), row.text?(4), row.text?(5), row.time(6), row.time(7))
+  end
+
+  def self.many(conn : Connection, sql : String, args : Array(SqlValue)) : Array(PushSubscription)
+    conn.query_all(sql, args) { |row| PushSubscription.from_row(row) }
+  end
+
+  # An unsaved subscription, for validation.
+  pub def self.build(user_id : Int64, endpoint : String?, p256dh_key : String?, auth_key : String?, user_agent : String?) : PushSubscription
+    PushSubscription.new(0_i64, user_id, endpoint, p256dh_key, auth_key, user_agent, Timestamp.from_second(0), Timestamp.from_second(0))
+  end
+
+  pub def self.find(conn : Connection, id : Int64) : PushSubscription | RecordNotFound
+    conn.query_one(%(SELECT #{PUSH_COLUMNS} FROM "push_subscriptions" WHERE "push_subscriptions"."id" = ? LIMIT 1), [id] of SqlValue) { |row| PushSubscription.from_row(row) } || RecordNotFound.new("Push::Subscription")
+  end
+
+  pub def self.count(conn : Connection) : Int64
+    conn.count(%(SELECT COUNT(*) FROM "push_subscriptions"))
+  end
+
+  pub def self.for_user(conn : Connection, user_id : Int64) : Array(PushSubscription)
+    many(conn, %(SELECT #{PUSH_COLUMNS} FROM "push_subscriptions" WHERE "push_subscriptions"."user_id" = ?), [user_id] of SqlValue)
+  end
+
+  # `user.push_subscriptions.find_by(endpoint:, p256dh_key:, auth_key:)`
+  pub def self.find_for_user_by_keys(conn : Connection, user_id : Int64, endpoint : String, p256dh_key : String, auth_key : String) : PushSubscription?
+    conn.query_one(%(SELECT #{PUSH_COLUMNS} FROM "push_subscriptions" WHERE "push_subscriptions"."user_id" = ? AND "push_subscriptions"."endpoint" = ? AND "push_subscriptions"."p256dh_key" = ? AND "push_subscriptions"."auth_key" = ? LIMIT 1), [user_id, endpoint, p256dh_key, auth_key] of SqlValue) { |row| PushSubscription.from_row(row) }
+  end
+
+  # `create`: validates (see `validate`) then inserts.
+  pub def self.create(tx : Tx, subscription : PushSubscription, resolve : Resolver) : PushSubscription | RecordInvalid
+    errors = subscription.validate(resolve)
+    return RecordInvalid.new(errors) unless errors.empty?
+    now = tx.now
+    id = tx.conn.query_one(%(INSERT INTO "push_subscriptions" ("auth_key", "created_at", "endpoint", "p256dh_key", "updated_at", "user_agent", "user_id") VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING "id"), [subscription.auth_key, now, subscription.endpoint, subscription.p256dh_key, now, subscription.user_agent, subscription.user_id] of SqlValue) { |row| row.int(0) }
+    raise "insert into push_subscriptions returned no id" unless id
+    PushSubscription.new(id, subscription.user_id, subscription.endpoint, subscription.p256dh_key, subscription.auth_key, subscription.user_agent, now, now)
+  end
+
+  pub def destroy(tx : Tx) : Nil
+    tx.conn.execute(%(DELETE FROM "push_subscriptions" WHERE "push_subscriptions"."id" = ?), [@id] of SqlValue)
+  end
+
+  # `Push::Subscription.destroy_by(endpoint:, user_id:)`
+  pub def self.destroy_by_endpoint(tx : Tx, user_id : Int64, endpoint : String) : Nil
+    ids = tx.conn.query_all(%(SELECT "push_subscriptions"."id" FROM "push_subscriptions" WHERE "push_subscriptions"."endpoint" = ? AND "push_subscriptions"."user_id" = ?), [endpoint, user_id] of SqlValue) { |row| row.int(0) }
+    ids.each { |id| tx.conn.execute(%(DELETE FROM "push_subscriptions" WHERE "push_subscriptions"."id" = ?), [id] of SqlValue) }
+  end
+
+  # The badge for a notification: `user.memberships.unread.count`.
+  pub def badge(conn : Connection) : Int64
+    Membership.unread_count(conn, @user_id)
+  end
+
+  # Validations: endpoint present, then `validate_endpoint_url`.
+  pub def validate(resolve : Resolver) : Errors
+    errors = Errors.new
+    endpoint = @endpoint || ""
+    errors.add("endpoint", "can't be blank") if endpoint.blank?
+    uri = EndpointUri.parse(endpoint)
+    if uri.nil?
+      errors.add("endpoint", "is not a valid URL")
+    elsif uri.scheme != "https"
+      errors.add("endpoint", "must use HTTPS")
+    elsif uri.port != 443
+      errors.add("endpoint", "must use the default HTTPS port")
+    elsif !permitted_endpoint_host?(uri.host)
+      errors.add("endpoint", "is not a permitted push service")
+    elsif resolved_endpoint_ip(resolve).nil?
+      errors.add("endpoint", "resolves to a private or invalid IP address")
+    end
+    errors
+  end
+
+  # `resolved_endpoint_ip`: only for a permitted https:443 endpoint.
+  pub def resolved_endpoint_ip(resolve : Resolver) : String?
+    endpoint = @endpoint
+    return nil unless endpoint
+    uri = EndpointUri.parse(endpoint)
+    return nil unless uri && uri.scheme == "https" && uri.port == 443 && permitted_endpoint_host?(uri.host)
+    resolve.call(uri.host)
+  end
+
+  # `build_payload`: direct rooms show the sender; others the room and
+  # "Sender: body". Unlike Rails, a long title or body is cut short (with an
+  # ellipsis) so the notification still fits a push message.
+  pub def self.payload_for(conn : Connection, rich_text : RichText, room : Room, message : Message) : PushPayload | RecordNotFound
+    creator = message.creator(conn)
+    return creator if creator.is_a?(RecordNotFound)
+    body = message.plain_text_body(conn, rich_text)
+    title = room.direct? ? creator.name : (room.name || "")
+    body = "#{creator.name}: #{body}" unless room.direct?
+    PushPayload.new(truncate_json_string(title, MAX_PAYLOAD_TITLE_BYTES), truncate_json_string(body, MAX_PAYLOAD_BODY_BYTES), "/rooms/#{room.id}")
+  end
+
+  # `push_subscriptions_for_users_involved_in_everything`
+  pub def self.for_users_involved_in_everything(conn : Connection, room_id : Int64, creator_id : Int64, now : Timestamp) : Array(PushSubscription)
+    many(conn, %(SELECT #{PUSH_COLUMNS} FROM "push_subscriptions" INNER JOIN "users" ON "users"."id" = "push_subscriptions"."user_id" INNER JOIN "memberships" ON "memberships"."user_id" = "users"."id" WHERE ("memberships"."connected_at" IS NULL OR "memberships"."connected_at" < ?) AND "memberships"."room_id" = ? AND "memberships"."user_id" != ? AND "memberships"."involvement" = 'everything'), [Membership.connection_cutoff(now), room_id, creator_id] of SqlValue)
+  end
+
+  # `push_subscriptions_for_mentionable_users(message.mentionees)`
+  pub def self.for_mentioned_users(conn : Connection, room_id : Int64, creator_id : Int64, mentionee_ids : Array(Int64), now : Timestamp) : Array(PushSubscription)
+    return [] of PushSubscription if mentionee_ids.empty?
+    values = [Membership.connection_cutoff(now), room_id, creator_id] of SqlValue
+    mentionee_ids.each { |id| values << id }
+    many(conn, %(SELECT #{PUSH_COLUMNS} FROM "push_subscriptions" INNER JOIN "users" ON "users"."id" = "push_subscriptions"."user_id" INNER JOIN "memberships" ON "memberships"."user_id" = "users"."id" WHERE ("memberships"."connected_at" IS NULL OR "memberships"."connected_at" < ?) AND "memberships"."room_id" = ? AND "memberships"."user_id" != ? AND "memberships"."involvement" = 'mentions' AND "push_subscriptions"."user_id" IN (#{placeholders(mentionee_ids.size)})), values)
+  end
+end
+
+# `Room::MessagePusher#push`: the payload, and the subscriptions it goes to
+# (everything first, then mentions).
+pub struct Pushes
+  getter payload : PushPayload
+  getter everything : Array(PushSubscription)
+  getter mentions : Array(PushSubscription)
+
+  def initialize(@payload : PushPayload, @everything : Array(PushSubscription), @mentions : Array(PushSubscription))
+  end
+
+  pub def self.for(conn : Connection, rich_text : RichText, message : Message, now : Timestamp) : Pushes | RecordNotFound
+    room = Room.find(conn, message.room_id)
+    return room if room.is_a?(RecordNotFound)
+    payload = PushSubscription.payload_for(conn, rich_text, room, message)
+    return payload if payload.is_a?(RecordNotFound)
+    everything = PushSubscription.for_users_involved_in_everything(conn, room.id, message.creator_id, now)
+    mentionee_ids = message.mentionees(conn, rich_text).map(&.id)
+    mentions = PushSubscription.for_mentioned_users(conn, room.id, message.creator_id, mentionee_ids, now)
+    Pushes.new(payload, everything, mentions)
+  end
+end
+
+# *text*, cut short with an ellipsis if it takes more than *max_bytes* as a
+# JSON string's contents.
+pub def truncate_json_string(text : String, max_bytes : Int32) : String
+  total = 0
+  text.each_char { |c| total += json_length(c) }
+  return text if total <= max_bytes
+  used = 3 # the ellipsis
+  String.build do |io|
+    stopped = false
+    text.each_char do |c|
+      next if stopped
+      used += json_length(c)
+      if used > max_bytes
+        stopped = true
+      else
+        io << c
+      end
+    end
+    io << '…'
+  end
+end
+
+# The bytes *c* takes in a JSON string: `"`, `\` and the short escapes take
+# two, other control characters six (`\u001f`).
+def json_length(c : Char) : Int32
+  return 2 if c == '"' || c == '\\' || c == '\n' || c == '\r' || c == '\t' || c == '\b' || c == '\f'
+  return 6 if c.ord < 32
+  c.bytesize
+end
+
+def permitted_endpoint_host?(host : String) : Bool
+  host = host.downcase
+  !host.empty? && PERMITTED_ENDPOINT_HOSTS.any? { |permitted| host == permitted || host.ends_with?(".#{permitted}") }
+end
+
+# The parts of `URI.parse(endpoint)` the validation looks at.
+struct EndpointUri
+  getter scheme : String
+  getter host : String
+  getter port : Int32?
+
+  def initialize(@scheme : String, @host : String, @port : Int32?)
+  end
+
+  def self.parse(endpoint : String) : EndpointUri?
+    return nil if endpoint.empty? || endpoint.chars.any?(&.whitespace?)
+    scheme, separator, rest = endpoint.partition("://")
+    return nil if separator.empty?
+    scheme = scheme.downcase
+    authority = rest
+    ['/', '?', '#'].each do |stop|
+      if at = authority.index(stop)
+        authority = authority[0, at]
+      end
+    end
+    if at = authority.rindex('@')
+      authority = authority[at + 1, authority.bytesize - at - 1]
+    end
+    host = authority
+    port = nil.as(Int32?)
+    colon = authority.rindex(':')
+    if colon && !authority.ends_with?("]")
+      host = authority[0, colon]
+      port_text = authority[colon + 1, authority.bytesize - colon - 1]
+      port = port_text.to_i?
+      return nil if port.nil? || port < 0 || port > 65535
+    end
+    default_port = scheme == "https" ? 443 : (scheme == "http" ? 80 : nil)
+    EndpointUri.new(scheme, host, port || default_port)
+  end
+end

@@ -1,0 +1,162 @@
+# `test/controllers/accounts_controller_test.rb` and `accounts/**`, through
+# the drawn routes.
+module test/controllers/accounts_test
+
+import std/text
+import std/file::{File}
+import std/dir::{Dir}
+import test/models/testing::{id}
+import models/account::{Account}
+import models/user::{User}
+import models/webhook::{Webhook}
+import rils/kit/params::{RawPair, UploadedFile}
+import rils/kit/response::{Response, FileBody}
+import rils/storage/blob::{Blob}
+import test/testing::*
+import web/web/spec::*
+
+DAVID = "david@37signals.com"
+KEVIN = "kevin@37signals.com"
+JZ    = "jz@37signals.com"
+
+def account(client : Client) : Account
+  client.t.read { |conn| Account.first(conn) } || raise "no account"
+end
+
+def user(client : Client, label : String) : User
+  client.t.read { |conn| User.find_by_id(conn, id(label)) } || raise "no #{label}"
+end
+
+def upload(name : String, content_type : String) : UploadedFile
+  path = "#{Dir.tempdir}/campfire-#{name}"
+  File.write(path, File.read("#{__DIR__}/../../reference/test/fixtures/files/#{name}"))
+  UploadedFile.new(name, content_type, "", File.size(path), path)
+end
+
+# A PNG response's width and height, from its IHDR chunk.
+def png_size(response : Response) : Tuple(Int32, Int32)
+  body = response.body
+  data = body.is_a?(FileBody) ? File.read(body.path) : (response.body_text || "")
+  bytes = [] of UInt8
+  data.each_byte { |byte| bytes << byte }
+  width = (bytes[16].to_i32 << 24) | (bytes[17].to_i32 << 16) | (bytes[18].to_i32 << 8) | bytes[19].to_i32
+  height = (bytes[20].to_i32 << 24) | (bytes[21].to_i32 << 16) | (bytes[22].to_i32 << 8) | bytes[23].to_i32
+  {width, height}
+end
+
+describe "accounts" do
+  it "shows the settings, administrators before the divider and members after" do
+    client = Client.new
+    response = client.get("/account/edit", cookie: client.cookie(DAVID))
+    assert response.status == 200
+    html = body(response)
+    divider = html.index(%(hr class="separator full-width")) || raise "no divider"
+    ["David", "Jason"].each { |name| assert (html.index("<strong>#{name}</strong>") || raise name) < divider }
+    ["JZ", "Kevin"].each { |name| assert (html.index("<strong>#{name}</strong>") || raise name) > divider }
+  end
+
+  it "updates the account, for administrators only" do
+    client = Client.new
+    response = client.submit("PUT", "/account", "account[name]=Different", client.cookie(DAVID))
+    assert response["location"] == "http://once.campfire.test/account/edit"
+    assert account(client).name == "Different"
+    assert client.submit("PUT", "/account", "account[name]=Other", client.cookie(KEVIN)).status == 403
+  end
+
+  it "updates the settings" do
+    client = Client.new
+    client.submit("PUT", "/account", "account[settings][restrict_room_creation_to_administrators]=true", client.cookie(DAVID))
+    assert account(client).settings.restrict_room_creation_to_administrators?
+  end
+end
+
+describe "accounts/bots" do
+  it "lists, creates, updates and deactivates bots" do
+    client = Client.new
+    cookie = client.cookie(DAVID)
+    assert client.get("/account/bots", cookie: cookie).status == 200
+    assert client.get("/account/bots/new", cookie: cookie).status == 200
+    created = client.submit("POST", "/account/bots", "user[name]=Bender%27s+Friend", cookie)
+    assert created["location"] == "http://once.campfire.test/account/bots"
+    assert client.t.read { |conn| User.active_bots_ordered(conn).any? { |bot| bot.name == "Bender's Friend" } }
+    bender = id("bender")
+    assert client.get("/account/bots/#{bender}/edit", cookie: cookie).status == 200
+    client.submit("PUT", "/account/bots/#{bender}", "user[name]=Bender%27s+New+Friend", cookie)
+    assert user(client, "bender").name == "Bender's New Friend"
+    assert client.t.read { |conn| Webhook.find_by_user(conn, bender) }.nil?
+    client.submit("DELETE", "/account/bots/#{bender}", "", cookie)
+    assert user(client, "bender").deactivated?
+  end
+
+  it "resets a bot's key" do
+    client = Client.new
+    before = user(client, "bender").bot_key
+    response = client.submit("PUT", "/account/bots/#{id("bender")}/key", "", client.cookie(DAVID))
+    assert response["location"] == "http://once.campfire.test/account/bots"
+    assert user(client, "bender").bot_key != before
+  end
+end
+
+describe "accounts/custom_styles" do
+  it "edits and updates the styles, for administrators only" do
+    client = Client.new
+    assert client.get("/account/custom_styles/edit", cookie: client.cookie(DAVID)).status == 200
+    response = client.submit("PUT", "/account/custom_styles", "account[custom_styles]=%3Aroot+%7B+--color-text%3A+red%3B+%7D", client.cookie(DAVID))
+    assert response["location"] == "http://once.campfire.test/account/custom_styles/edit"
+    assert account(client).custom_styles == ":root { --color-text: red; }"
+    assert client.submit("PUT", "/account/custom_styles", "account[custom_styles]=x", client.cookie(KEVIN)).status == 403
+  end
+end
+
+describe "accounts/join_codes" do
+  it "makes a new join code, for administrators only" do
+    client = Client.new
+    before = account(client).join_code
+    response = client.submit("POST", "/account/join_code", "", client.cookie(DAVID))
+    assert response["location"] == "http://once.campfire.test/account/edit"
+    assert account(client).join_code != before
+    assert client.submit("POST", "/account/join_code", "", client.cookie(JZ)).status == 403
+  end
+end
+
+describe "accounts/logos" do
+  it "shows the stock icon, then the uploaded logo, in both sizes" do
+    client = Client.new
+    stock = client.get("/account/logo")
+    assert stock["content-type"] == "image/png"
+    assert png_size(stock) == {512, 512}
+    assert png_size(client.get("/account/logo", "size=small")) == {192, 192}
+    client.submit_pairs("PUT", "/account", [RawPair.new("account[logo]", upload("moon.jpg", "image/jpeg"))], client.cookie(DAVID))
+    assert png_size(client.get("/account/logo")) == {512, 512}
+    assert png_size(client.get("/account/logo", "size=small")) == {192, 192}
+    response = client.submit("DELETE", "/account/logo", "", client.cookie(DAVID))
+    assert response["location"] == "http://once.campfire.test/account/edit"
+    assert client.t.read { |conn| Blob.attached(conn, "Account", account(client).id, "logo") }.nil?
+  end
+
+  it "shows the stock icon when the logo can't be resized" do
+    client = Client.new
+    client.submit_pairs("PUT", "/account", [RawPair.new("account[logo]", upload("pixel.bmp", "image/bmp"))], client.cookie(DAVID))
+    assert png_size(client.get("/account/logo")) == {512, 512}
+  end
+end
+
+describe "accounts/users" do
+  it "changes a role and deactivates, for administrators only" do
+    client = Client.new
+    assert client.submit("PUT", "/account/users/#{id("david")}", "user[role]=administrator", client.cookie(KEVIN)).status == 403
+    assert client.submit("DELETE", "/account/users/#{id("david")}", "", client.cookie(KEVIN)).status == 403
+    response = client.submit("PUT", "/account/users/#{id("kevin")}", "user[role]=administrator", client.cookie(DAVID))
+    assert response["location"] == "http://once.campfire.test/account/edit"
+    assert user(client, "kevin").administrator?
+    client.submit("DELETE", "/account/users/#{id("kevin")}", "", client.cookie(DAVID))
+    assert user(client, "kevin").deactivated?
+  end
+
+  it "pages the people as a turbo stream" do
+    client = Client.new
+    response = client.get("/account/users.turbo_stream", "page=1", cookie: client.cookie(DAVID))
+    assert response.status == 200
+    assert body(response).includes?("Kevin")
+  end
+end

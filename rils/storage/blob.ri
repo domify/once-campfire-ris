@@ -1,0 +1,224 @@
+# `active_storage_blobs`, `active_storage_attachments` and
+# `active_storage_variant_records` rows. Every function takes a connection,
+# so callers set the transaction boundaries the way the Rails models'
+# callbacks would.
+module rils/storage/blob
+
+import std/file
+import std/json::{Any}
+import rils/record/sqlite::{Connection, Row, SqlValue, SqliteError}
+import rils/record/timestamp::{Timestamp}
+import rils/rails_compat/json::{encode}
+import rils/storage/filename::{Filename}
+import rils/storage/key::{checksum, checksum_file, generate_key}
+import rils/storage/json::{json_parse, object}
+import rils/storage/content_types::{variable?, web_image?}
+import rils/storage/marcel::{identify, magic_prefix_len, for_extension, extensions}
+import rils/storage/process::{ffmpeg_exists?}
+import rils/storage/disk::{DiskService}
+
+pub class Blob
+  getter id : Int64
+  getter key : String
+  getter filename : Filename
+  getter content_type : String?
+  # The `metadata` column, an ordered JSON object
+  # (`store :metadata, coder: JSON`).
+  property metadata : Any
+  getter service_name : String
+  getter byte_size : Int64
+  getter checksum : String?
+  getter created_at : String
+
+  def initialize(@id : Int64, @key : String, @filename : Filename, @content_type : String?, @metadata : Any,
+                 @service_name : String, @byte_size : Int64, @checksum : String?, @created_at : String)
+  end
+
+  def self.from_row(row : Row) : Blob
+    metadata = row.text?(4)
+    parsed = metadata ? json_parse(metadata) : nil
+    Blob.new(row.int(0), row.text(1), Filename.new(row.text(2)), row.text?(3), parsed || object,
+      row.text(5), row.int(6), row.text?(7), row.text(8))
+  end
+
+  pub def self.find(conn : Connection, id : Int64) : Blob?
+    conn.query_one("SELECT #{BLOB_COLUMNS} FROM active_storage_blobs WHERE id = ?", [id] of SqlValue) { |row| Blob.from_row(row) }
+  end
+
+  pub def self.find_by_key(conn : Connection, key : String) : Blob?
+    conn.query_one("SELECT #{BLOB_COLUMNS} FROM active_storage_blobs WHERE key = ?", [key] of SqlValue) { |row| Blob.from_row(row) }
+  end
+
+  # The blob attached to the record under *name* (`has_one_attached`).
+  pub def self.attached(conn : Connection, record_type : String, record_id : Int64, name : String) : Blob?
+    conn.query_one(ATTACHED_SQL, [record_type, record_id, name] of SqlValue) { |row| Blob.from_row(row) }
+  end
+
+  pub def content_type_s : String
+    @content_type || ""
+  end
+
+  pub def image? : Bool
+    content_type_s.starts_with?("image")
+  end
+
+  pub def video? : Bool
+    content_type_s.starts_with?("video")
+  end
+
+  pub def audio? : Bool
+    content_type_s.starts_with?("audio")
+  end
+
+  pub def variable? : Bool
+    variable?(content_type_s)
+  end
+
+  # `previewable?`: only the video previewer accepts in Campfire's image
+  # (no poppler or mupdf, so the PDF previewers never do).
+  pub def previewable? : Bool
+    video? && ffmpeg_exists?
+  end
+
+  pub def representable? : Bool
+    variable? || previewable?
+  end
+
+  pub def analyzed? : Bool
+    h = @metadata.as_h?
+    value = h ? h["analyzed"]? : nil
+    return false unless value
+    raw = value.raw
+    !(raw.nil? || raw == false)
+  end
+
+  # `metadata[:width]`/`[:height]` as the views read them.
+  pub def dimension(name : String) : Float64?
+    h = @metadata.as_h?
+    value = h ? h[name]? : nil
+    return nil unless value
+    raw = value.raw
+    case raw
+    when Int64   then raw.to_f64
+    when Float64 then raw
+    else              nil
+    end
+  end
+
+  # `update!(metadata:)`.
+  pub def update_metadata(conn : Connection, metadata : Any) : Nil
+    conn.execute("UPDATE active_storage_blobs SET metadata = ? WHERE id = ?", [encode(metadata), @id] of SqlValue)
+    @metadata = metadata
+  end
+
+  # `default_variant_format`: web images keep their format, everything else
+  # becomes PNG.
+  pub def default_variant_format : String
+    web_image?(content_type_s) ? (format || "png") : "png"
+  end
+
+  # `Representable#format`: the filename's extension when Marcel agrees it
+  # names the content type, else the type's first registered extension.
+  def format : String?
+    extension = @filename.extension
+    return extension if !extension.empty? && for_extension(extension) == content_type_s
+    extensions(content_type_s).first?
+  end
+
+  # `delete`: the file, plus legacy untracked variants under
+  # `variants/<key>/`.
+  pub def delete_files(service : DiskService) : Nil
+    service.delete(@key)
+    service.delete_prefixed("variants/#{@key}/") if image?
+  end
+end
+
+# A blob built from uploaded bytes, not yet saved
+# (`Blob.build_after_unfurling`).
+pub class NewBlob
+  getter key : String
+  getter filename : Filename
+  getter content_type : String?
+  property metadata : Any
+  getter service_name : String
+  getter byte_size : Int64
+  getter checksum : String
+
+  def initialize(@key : String, @filename : Filename, @content_type : String?, @metadata : Any,
+                 @service_name : String, @byte_size : Int64, @checksum : String)
+  end
+
+  # `build_after_unfurling(io:, filename:, content_type:, identify:)`:
+  # generates the key, computes the checksum, identifies the content type
+  # with Marcel (unless a declared type comes with `identify: false`) and
+  # marks the blob `identified`.
+  pub def self.unfurl(data : String, filename : Filename, declared_type : String?, service_name : String, identify : Bool = true) : NewBlob
+    build(filename, content_type_for(data, filename, declared_type, identify), service_name, data.bytesize.to_i64, checksum(data))
+  end
+
+  # `unfurl` for a file, reading only what identification needs and
+  # streaming the rest through the checksum.
+  pub def self.unfurl_file(path : String, filename : Filename, declared_type : String?, service_name : String, identify : Bool = true) : NewBlob
+    head = ""
+    File.open(path, "r") { |io| head = io.read_bytes(magic_prefix_len) }
+    build(filename, content_type_for(head, filename, declared_type, identify), service_name, File.size(path), checksum_file(path))
+  end
+
+  def self.content_type_for(head : String, filename : Filename, declared_type : String?, identify : Bool) : String?
+    declared_type.nil? || identify ? identify(head, filename.sanitized, declared_type) : declared_type
+  end
+
+  def self.build(filename : Filename, content_type : String?, service_name : String, byte_size : Int64, checksum : String) : NewBlob
+    metadata = {} of String => Any
+    metadata["identified"] = Any.new(true)
+    NewBlob.new(generate_key, filename, content_type, Any.new(metadata), service_name, byte_size, checksum)
+  end
+
+  pub def insert(conn : Connection, created_at : Timestamp) : Blob
+    stamp = created_at.to_db
+    conn.execute("INSERT INTO active_storage_blobs (key, filename, content_type, metadata, service_name, byte_size, checksum, created_at) " \
+                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      [@key, @filename.raw, @content_type, encode(@metadata), @service_name, @byte_size, @checksum, stamp] of SqlValue)
+    Blob.new(conn.last_insert_rowid, @key, @filename, @content_type, @metadata, @service_name, @byte_size, @checksum, stamp)
+  end
+end
+
+BLOB_COLUMNS = "id, key, filename, content_type, metadata, service_name, byte_size, checksum, created_at"
+
+ATTACHED_SQL = "SELECT b.id, b.key, b.filename, b.content_type, b.metadata, b.service_name, b.byte_size, b.checksum, b.created_at " \
+               "FROM active_storage_blobs b JOIN active_storage_attachments a ON a.blob_id = b.id " \
+               "WHERE a.record_type = ? AND a.record_id = ? AND a.name = ? ORDER BY a.id LIMIT 1"
+
+# Inserts an `active_storage_attachments` row. Rails then touches the
+# record (and what it touches in turn); that's up to the caller.
+pub def insert_attachment(conn : Connection, name : String, record_type : String, record_id : Int64, blob_id : Int64, created_at : Timestamp) : Int64
+  conn.execute("INSERT INTO active_storage_attachments (name, record_type, record_id, blob_id, created_at) VALUES (?, ?, ?, ?, ?)",
+    [name, record_type, record_id, blob_id, created_at] of SqlValue)
+  conn.last_insert_rowid
+end
+
+# The `(record_type, record_id)` of every attachment of a blob: what
+# `Blob#touch_attachments` touches after the blob is updated.
+pub def attachment_records(conn : Connection, blob_id : Int64) : Array(Tuple(String, Int64))
+  conn.query_all("SELECT record_type, record_id FROM active_storage_attachments WHERE blob_id = ? ORDER BY id", [blob_id] of SqlValue) do |row|
+    {row.text(0), row.int(1)}
+  end
+end
+
+# `blob.variant_records.find_by(variation_digest:)`.
+pub def find_variant_record(conn : Connection, blob_id : Int64, variation_digest : String) : Int64?
+  conn.query_one("SELECT id FROM active_storage_variant_records WHERE blob_id = ? AND variation_digest = ?",
+    [blob_id, variation_digest] of SqlValue) { |row| row.int(0) }
+end
+
+# The INSERT half of `create_or_find_by!`: nil when another writer created
+# it first.
+pub def insert_variant_record(conn : Connection, blob_id : Int64, variation_digest : String) : Int64?
+  result = conn.execute?("INSERT INTO active_storage_variant_records (blob_id, variation_digest) VALUES (?, ?)",
+    [blob_id, variation_digest] of SqlValue)
+  if result.is_a?(SqliteError)
+    return nil if result.record_not_unique?
+    raise result.message
+  end
+  conn.last_insert_rowid
+end

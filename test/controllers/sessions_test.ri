@@ -1,0 +1,123 @@
+# `test/controllers/sessions_controller_test.rb`'s `new` tests, through the
+# drawn routes, and what the layout puts around the page.
+module test/controllers/sessions_test
+
+import std/text
+import rils/rails_compat/key_generator::{Secrets}
+import test/models/testing::*
+import models/session::{Session}
+import models/user::{User}
+import rils/kit/app::{Stack, KitConfig}
+import rils/kit/cookies::{CookieJar, Cookie}
+import rils/kit/ctx::{Ctx}
+import rils/kit/params::{ParamMap, from_query_string}
+import rils/kit/request::{Request, ProxyConfig}
+import rils/kit/response::{Response, HeaderList}
+import config/app::{App}
+import config/routes::{campfire_router}
+import test/testing::*
+import web/web/spec::*
+
+describe "sessions#new" do
+  it "renders the sign-in page in the layout" do
+    client = Client.new
+    response = client.get("/session/new")
+    assert response.status == 200
+    assert response["content-type"] == "text/html; charset=utf-8"
+    html = body(response)
+    assert html.starts_with?("<!DOCTYPE html>\n<html>\n  <head>\n    <title>Sign in</title>")
+    assert html.includes?("<meta name=\"turbo-visit-control\" content=\"reload\">\n  </head>")
+    assert html.includes?("<legend class=\"txt-large txt-align-center\"><strong>37signals</strong></legend>")
+    assert html.includes?("action=\"http://once.campfire.test/session\"")
+    assert html.includes?("href=\"mailto:&quot;David&quot; &lt;david@37signals.com&gt;\"")
+    assert html.includes?("<link rel=\"icon\" href=\"/account/logo?v=")
+    assert !html.includes?("authenticity_token")
+    link = response["link"] || raise "no link header"
+    assert link.starts_with?("</assets/_reset-9c3efd7b.css>; rel=preload; as=style; nopush,")
+    assert response["x-version"] == "0"
+  end
+
+  it "fills in the email address it was given" do
+    html = body(Client.new.get("/session/new", "email_address=x%40y.com"))
+    assert html.includes?("placeholder=\"Enter your email address\" value=\"x@y.com\" type=\"email\"")
+  end
+
+  it "renders in the frame layout for a Turbo-Frame request" do
+    response = Client.new.get("/session/new", frame: "sign-in")
+    html = body(response)
+    assert html.starts_with?("<html>\n  <head>\n    \n    <meta name=\"turbo-visit-control\" content=\"reload\">\n  </head>\n  <body>\n    \n<section class=\"txt-align-center\">")
+    assert html.ends_with?("</section>\n\n  </body>\n</html>\n")
+    assert response["link"].nil?
+  end
+
+  it "sends the first run there when there are no users" do
+    client = Client.new
+    empty_database(client)
+    response = client.get("/session/new")
+    assert response.status == 302
+    assert response["location"] == "http://once.campfire.test/first_run"
+  end
+end
+
+describe "sessions#create" do
+  it "signs in and goes to the root" do
+    client = Client.new
+    before = client.sessions_of("david@37signals.com")
+    response = client.submit("POST", "/session", "email_address=david%4037signals.com&password=secret123456")
+    assert response.status == 302
+    assert response["location"] == "http://once.campfire.test/"
+    assert set_cookies(response).any?(&.starts_with?("session_token="))
+    assert client.sessions_of("david@37signals.com") == before + 1
+  end
+
+  it "rejects a wrong password with the sign-in page again" do
+    client = Client.new
+    response = client.submit("POST", "/session", "email_address=david%4037signals.com&password=wrong")
+    assert response.status == 401
+    html = body(response)
+    assert html.includes?("<div class=\"panel shake\">")
+    assert html.includes?("<span class=\"for-screen-reader\" role=\"alert\" aria-atomic=\"true\">Too many requests or unauthorized.</span>")
+    assert html.includes?("value=\"david@37signals.com\"")
+    assert set_cookies(response).none?(&.starts_with?("session_token="))
+  end
+
+  it "rejects a missing password and an unknown address" do
+    client = Client.new
+    assert client.submit("POST", "/session", "email_address=david%4037signals.com").status == 401
+    assert client.submit("POST", "/session", "email_address=nobody%4037signals.com&password=secret123456").status == 401
+  end
+
+  it "allows ten attempts from an address within three minutes" do
+    client = Client.new
+    10.times { assert client.submit("POST", "/session", "email_address=x%40y.com&password=wrong").status == 401 }
+    limited = client.submit("POST", "/session", "email_address=david%4037signals.com&password=secret123456")
+    assert limited.status == 429
+    assert body(limited).includes?("Too many requests or unauthorized.")
+    other = client.submit("POST", "/session", "email_address=david%4037signals.com&password=secret123456", ip: "10.0.0.2")
+    assert other.status == 302
+  end
+
+  it "refuses a cross-site sign-in" do
+    response = Client.new.submit("POST", "/session", "email_address=david%4037signals.com&password=secret123456", site: "cross-site")
+    assert response.status == 422
+    assert response["x-version"].nil?
+  end
+end
+
+describe "sessions#destroy" do
+  it "signs out: the session, the cookie and back to the root" do
+    client = Client.new
+    before = client.sessions_of("david@37signals.com")
+    response = client.submit("DELETE", "/session", "", cookie: client.cookie("david@37signals.com"))
+    assert response.status == 302
+    assert response["location"] == "http://once.campfire.test/"
+    assert set_cookies(response).any? { |cookie| cookie.starts_with?("session_token=;") }
+    assert client.sessions_of("david@37signals.com") == before - 1
+  end
+
+  it "sends a signed-out visitor to sign in" do
+    response = Client.new.submit("DELETE", "/session", "")
+    assert response.status == 302
+    assert response["location"] == "http://once.campfire.test/session/new"
+  end
+end

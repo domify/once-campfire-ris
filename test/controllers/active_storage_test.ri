@@ -1,0 +1,71 @@
+# The Active Storage endpoints: a message's attachment through its signed
+# redirect to the disk service, its thumbnail, a direct upload, and the
+# health check.
+module test/controllers/active_storage_test
+
+import std/text
+import std/uri::{URI}
+import std/file::{File}
+import std/dir::{Dir}
+import std/json::{JSON}
+import test/models/testing::{id}
+import models/message::{Message}
+import rils/kit/params::{RawPair, UploadedFile}
+import rils/kit/response::{Response, FileBody}
+import rils/storage/blob::{Blob}
+import rils/storage/paths::{blob_redirect_path, representation_redirect_path}
+import rils/storage/variation::{Variation}
+import rils/storage/key::{checksum}
+import test/testing::*
+import web/web/spec::*
+
+def bytes_of(response : Response) : String
+  body = response.body
+  body.is_a?(FileBody) ? File.read(body.path)[body.offset.to_i32, body.length.to_i32] : (response.body_text || "")
+end
+
+def path_and_query(url : String) : Tuple(String, String)
+  rest = url.partition("://")[2]
+  path = "/" + rest.partition('/')[2]
+  base, _, query = path.partition('?')
+  {base, query}
+end
+
+describe "active storage" do
+  it "serves an attachment through its signed URLs" do
+    client = Client.new
+    icon = File.read("#{__DIR__}/../../reference/app/assets/images/campfire-icon.png")
+    upload = "#{Dir.tempdir}/campfire-as-icon.png"
+    File.write(upload, icon)
+    client.submit_pairs("POST", "/rooms/#{id("watercooler")}/messages.turbo_stream", [RawPair.new("message[attachment]", UploadedFile.new("icon.png", "image/png", "", File.size(upload), upload))], client.cookie("david@37signals.com"))
+    blob = client.t.read { |conn| Blob.attached(conn, "Message", (Message.last(conn) || raise "none").id, "attachment") } || raise "no blob"
+    redirect = client.get(blob_redirect_path(client.app.storage.verifier, blob))
+    assert redirect.status == 302
+    location = redirect["location"] || raise "no location"
+    assert location.starts_with?("http://once.campfire.test/rails/active_storage/disk/")
+    path, query = path_and_query(location)
+    disk = client.get(path, query)
+    assert disk.status == 200
+    assert disk["cache-control"] == "max-age=3600, public"
+    assert bytes_of(disk) == icon
+    thumb = client.get(representation_redirect_path(client.app.storage.verifier, blob, Variation.resize_to_limit(1200_i64, 800_i64)))
+    assert thumb.status == 302
+    assert client.get("/rails/active_storage/blobs/redirect/bogus--sig/icon.png").status == 404
+  end
+
+  it "takes a direct upload with a session" do
+    client = Client.new
+    data = "hello direct upload"
+    form = "blob[filename]=notes.txt&blob[byte_size]=#{data.bytesize}&blob[checksum]=#{URI.encode_www_form(checksum(data))}&blob[content_type]=text%2Fplain"
+    assert client.submit("POST", "/rails/active_storage/direct_uploads", form).status == 401
+    created = client.submit("POST", "/rails/active_storage/direct_uploads", form, client.cookie("david@37signals.com"))
+    assert created.status == 200
+    json = JSON.parse(body(created))
+    assert json["filename"].as_s == "notes.txt"
+    assert json["direct_upload"]["headers"]["Content-Type"].as_s == "text/plain"
+  end
+
+  it "answers the health check" do
+    assert body(Client.new.get("/up")).includes?("background-color: green")
+  end
+end

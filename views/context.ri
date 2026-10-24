@@ -1,0 +1,130 @@
+# Per-request state every page needs: what `ApplicationController`, the
+# layout and the helpers read from `Current`, `request`, `flash` and the
+# session. Views take plain view-model values, never database rows, so this
+# crate doesn't depend on `db/`. Rich text arrives pre-rendered as sanitized
+# HTML.
+module views/context
+
+pub class CurrentUser
+  getter id : Int64
+  getter name : String
+  getter administrator : Bool
+  getter bot : Bool
+  # `fresh_user_avatar_path(Current.user)`.
+  getter avatar_url : String
+
+  def initialize(@id : Int64, @name : String, @administrator : Bool = false, @bot : Bool = false, @avatar_url : String = "")
+  end
+end
+
+pub class AccountSummary
+  getter name : String
+  # `fresh_account_logo_path` (no size).
+  getter logo_url : String
+  # `Current.account.logo.attached?` (adds the `account-has-logo` body class).
+  getter has_logo : Bool
+
+  def initialize(@name : String, @logo_url : String = "/account/logo", @has_logo : Bool = false)
+  end
+end
+
+# `ApplicationPlatform` facts derived from the user agent.
+pub class Platform
+  property ios : Bool = false
+  property android : Bool = false
+  property mac : Bool = false
+  property windows : Bool = false
+  property chrome : Bool = false
+  property firefox : Bool = false
+  property safari : Bool = false
+  property edge : Bool = false
+  property mobile : Bool = false
+  property desktop : Bool = false
+  # `ApplicationPlatform#apple_messages?`.
+  property apple_messages : Bool = false
+  # `user_agent.browser` from the useragent gem ("Chrome", "Safari", ...).
+  property browser : String = ""
+  # `ApplicationPlatform#operating_system` ("macOS", "Windows", "iPhone", ...).
+  property operating_system : String = ""
+
+  def initialize
+  end
+end
+
+# What the asset tags need from the assets crate: the digested path of a
+# logical asset ("campfire-icon.png"), the importmap and stylesheet tags.
+pub class Assets
+  getter path : Proc(String, String)
+  # `javascript_importmap_tags`: the importmap script and modulepreloads.
+  getter importmap_tags : String
+  # `stylesheet_link_tag :all, "data-turbo-track": "reload"`.
+  getter stylesheet_tags : String
+
+  def initialize(@path : Proc(String, String), @importmap_tags : String = "", @stylesheet_tags : String = "")
+  end
+end
+
+pub class ViewContext
+  getter current_user : CurrentUser?
+  getter account : AccountSummary
+  property flash_notice : String?
+  property flash_alert : String?
+  getter platform : Platform
+  # `Rails.configuration.x.vapid.public_key`; nil omits the meta tag's
+  # content attribute.
+  getter vapid_public_key : String?
+  getter assets : Assets
+  # The account's custom CSS, if any (`custom_styles_tag`).
+  getter custom_styles : String?
+  # `script_aware_action_cable_meta_tag` content: script_name + "/cable".
+  getter cable_url : String
+  # `request.base_url` ("http://campfire.test"), for the `*_url` helpers.
+  getter base_url : String
+  # `request.url`, compared against the referrer by `link_back`.
+  getter request_url : String
+  # `request.referrer`.
+  getter referrer : String?
+  # Id of `last_room_visited`: the `last_room` cookie's room if the user is
+  # a member, else `Current.user.rooms.original`. Nil links back to the root.
+  getter last_room_visited_id : Int64?
+  # `Rails.application.config.app_version`.
+  getter app_version : String
+
+  def initialize(@account : AccountSummary, @assets : Assets, @current_user : CurrentUser? = nil,
+                 @flash_notice : String? = nil, @flash_alert : String? = nil, @platform : Platform = Platform.new,
+                 @vapid_public_key : String? = nil, @custom_styles : String? = nil, @cable_url : String = "/cable",
+                 @base_url : String = "", @request_url : String = "", @referrer : String? = nil,
+                 @last_room_visited_id : Int64? = nil, @app_version : String = "0")
+  end
+
+  # The digested path of a logical asset.
+  def asset(logical_path : String) : String
+    @assets.path.call(logical_path)
+  end
+
+  # `root_url`, `session_url`, `join_url(...)`: base URL + path.
+  def url(path : String) : String
+    @base_url + path
+  end
+
+  def can_administer? : Bool
+    if user = @current_user
+      user.administrator
+    else
+      false
+    end
+  end
+
+  def current_user_id : Int64?
+    if user = @current_user
+      user.id
+    else
+      nil
+    end
+  end
+
+  # `Current.user == user`.
+  def current_user?(user_id : Int64) : Bool
+    current_user_id == user_id
+  end
+end

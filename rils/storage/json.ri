@@ -1,0 +1,49 @@
+# Order-preserving JSON for blob metadata (`store :metadata, coder: JSON`)
+# and verifier payloads, where key order is part of the stored bytes and
+# the signed messages. `std/json`'s `Any` already keeps insertion order and
+# splits integers from floats (a video's `1920.0` width renders differently
+# from an image's `1920`); these are `Hash#[]=`/`Hash#merge` on top of it,
+# and `encode` is `ActiveSupport::JSON.encode`.
+module rils/storage/json
+
+pub import std/json
+import std/int
+import std/json::{JSON, Any}
+import rils/rails_compat/json::{encode}
+
+pub alias Json = Any
+
+pub def object : Json
+  Any.new({} of String => Any)
+end
+
+pub def json_parse(text : String) : Json?
+  JSON.parse?(text)
+end
+
+# `Hash#[]=`: replaces an existing key in place, or appends a new one.
+pub def json_set(json : Json, key : String, value : Json) : Nil
+  if entries = json.as_h?
+    entries[key] = value
+  end
+end
+
+# `Hash#merge`: keys of `other` overwrite in place, new keys are appended.
+pub def json_merge(json : Json, other : Json) : Json
+  merged = {} of String => Any
+  if entries = json.as_h?
+    entries.each { |k, v| merged[k] = v }
+  end
+  if entries = other.as_h?
+    entries.each { |k, v| merged[k] = v }
+  end
+  Any.new(merged)
+end
+
+pub def json_encode(json : Json) : String
+  encode(json)
+end
+
+pub def json_string(text : String?) : Json
+  text ? Any.new(text) : Any.new(nil)
+end

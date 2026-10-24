@@ -1,0 +1,76 @@
+# Reading request bodies into params the way `Rack::Request#form_pairs` and
+# `ActionDispatch::Request#POST` do: JSON by content type, urlencoded forms
+# (also for a POST with no content type), and multipart with file parts
+# spooled to temporary files by web.
+module rils/kit/body
+
+import std/text
+import rils/kit/params::{ParamMap, ParamError, ParamErrorKind, RawPair, UploadedFile, from_pairs, form_pairs, from_json_body}
+import rils/kit/format::{content_mime_type, JSON_MIME, Mime}
+import rils/kit/request::{media_type_of}
+import web/web/multipart::{parse_multipart, multipart_boundary, MultipartError}
+
+# `Rack::Utils.multipart_total_part_limit` / `multipart_file_limit`.
+pub MULTIPART_PART_LIMIT = 4096
+pub MULTIPART_FILE_LIMIT =  128
+# The most a multipart body's text fields may hold together, since they're
+# kept in memory (Rack's `BUFFERED_UPLOAD_BYTESIZE_LIMIT`).
+pub MULTIPART_TEXT_LIMIT = 16 * 1024 * 1024
+
+MULTIPART_TYPES = ["multipart/form-data", "multipart/related", "multipart/mixed"]
+
+# The body's params, or why there are none: a param error is a 400, a
+# multipart failure carries its own status (400 or 413).
+pub alias ParsedBody = ParamMap | ParamError | MultipartError
+
+# *original_method* is the method on the wire (Rack's `form_data?` treats a
+# content-type-less POST as a form). A form is read where *body* lies; a
+# multipart or JSON body is copied out for web's and std's String parsers.
+pub def parse_body(
+  original_method : String,
+  content_type : String?,
+  body : Str,
+) : ParsedBody
+  media = media_type_of(content_type)
+  if media && MULTIPART_TYPES.includes?(media) && content_type
+    if boundary = multipart_boundary(content_type)
+      return parse_multipart_body(body.to_heap, boundary)
+    end
+  end
+  mime = content_mime_type(content_type)
+  json = mime.is_a?(Mime) && mime == JSON_MIME
+  if json && body.bytesize > 0
+    from_json_body(body.to_heap)
+  elsif media == "application/x-www-form-urlencoded" || (content_type.nil? && original_method == "POST") || (media && MULTIPART_TYPES.includes?(media))
+    pairs = form_pairs(body)
+    return pairs if pairs.is_a?(ParamError)
+    from_pairs(pairs)
+  else
+    ParamMap.new
+  end
+end
+
+pub def parse_body(original_method : String, content_type : String?, body : String) : ParsedBody
+  parsed = ParamMap.new.as(ParsedBody)
+  tape { parsed = parse_body(original_method, content_type, body.as_tape) }
+  parsed
+end
+
+def parse_multipart_body(body : String, boundary : String) : ParsedBody
+  parsed = parse_multipart(body, boundary, MULTIPART_FILE_LIMIT, MULTIPART_TEXT_LIMIT)
+  return parsed if parsed.is_a?(MultipartError)
+  pairs = [] of RawPair
+  parsed.fields.each { |field| pairs << RawPair.new(field[0], field[1]) }
+  parsed.files.each do |file|
+    # A blank filename means no file was selected: Rack drops the part.
+    if file.filename.empty?
+      file.delete
+      next
+    end
+    content_type = file.content_type.empty? ? nil : file.content_type
+    upload = UploadedFile.new(file.filename, content_type, file.headers.to_s, file.size.to_i64, file.path)
+    pairs << RawPair.new(file.name, upload)
+  end
+  return ParamError.new(ParamErrorKind::Limit, "too many multipart parts") if pairs.size > MULTIPART_PART_LIMIT
+  from_pairs(pairs)
+end

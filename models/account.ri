@@ -1,0 +1,193 @@
+# `reference/app/models/account.rb` and `account/joinable.rb`.
+module models/account
+
+import std/json::{JSON, Any}
+import std/text
+import rils/rails_compat/json::{generate}
+import rils/record/sqlite::{Connection, Row, SqlValue}
+import rils/record/timestamp::{Timestamp}
+import rils/record/database::{Tx}
+import rils/record/errors::{RecordNotFound}
+import rils/record/random::{alphanumeric}
+
+RESTRICT_ROOM_CREATION = "restrict_room_creation_to_administrators"
+
+# `has_json :settings, restrict_room_creation_to_administrators: false`
+# (`ActiveModel::SchematizedJson`): the stored hash with the schema defaults
+# merged in.
+pub class AccountSettings
+  getter data : Hash(String, Any)
+
+  def initialize(@data : Hash(String, Any))
+  end
+
+  pub def self.from_column(raw : String?) : AccountSettings
+    parsed = raw ? JSON.parse?(raw) : nil
+    data = parsed ? parsed.as_h? : nil
+    data = data ? copy_hash(data) : {} of String => Any
+    data[RESTRICT_ROOM_CREATION] = Any.new(false) unless data.has_key?(RESTRICT_ROOM_CREATION)
+    AccountSettings.new(data)
+  end
+
+  # `restrict_room_creation_to_administrators?`: `present?` of the stored
+  # value.
+  pub def restrict_room_creation_to_administrators? : Bool
+    present?(@data[RESTRICT_ROOM_CREATION]?)
+  end
+
+  # `restrict_room_creation_to_administrators = value`, cast as a boolean.
+  pub def restrict_room_creation_to_administrators=(value : String) : Nil
+    cast = cast_boolean(value)
+    @data[RESTRICT_ROOM_CREATION] = cast.nil? ? Any.new(nil) : Any.new(cast)
+  end
+
+  # `assign_data_with_type_casting`: every key must be in the schema.
+  pub def assign(values : Array(Tuple(String, String))) : String?
+    values.each do |pair|
+      key, value = pair
+      return "undefined method '#{key}=' for account settings" unless key == RESTRICT_ROOM_CREATION
+      self.restrict_room_creation_to_administrators = value
+    end
+    nil
+  end
+
+  pub def [](key : String) : Any?
+    @data[key]?
+  end
+
+  pub def to_json : String
+    generate(Any.new(@data))
+  end
+
+  pub def copy : AccountSettings
+    AccountSettings.new(copy_hash(@data))
+  end
+end
+
+# `ActiveModel::Type::Boolean#cast` of a form value: blank is nil, the
+# `FALSE_VALUES` are false, anything else is true.
+pub def cast_boolean(value : String) : Bool?
+  return nil if value.empty?
+  !["0", "f", "F", "false", "FALSE", "off", "OFF"].includes?(value)
+end
+
+def present?(value : Any?) : Bool
+  return false unless value
+  raw = value.raw
+  case raw
+  when Nil    then false
+  when Bool   then raw
+  when String then !raw.strip.empty?
+  when Array(Any) then !raw.empty?
+  when Hash(String, Any) then !raw.empty?
+  else true
+  end
+end
+
+pub ACCOUNT_COLUMNS = %("accounts"."id", "accounts"."name", "accounts"."join_code", "accounts"."custom_styles", "accounts"."settings", "accounts"."singleton_guard", "accounts"."created_at", "accounts"."updated_at")
+
+pub class Account
+  getter id : Int64
+  property name : String
+  property join_code : String
+  property custom_styles : String?
+  # The raw `settings` JSON column; read it through `settings`.
+  property settings_json : String?
+  getter singleton_guard : Int64
+  getter created_at : Timestamp
+  property updated_at : Timestamp
+
+  def initialize(@id : Int64, @name : String, @join_code : String, @custom_styles : String?, @settings_json : String?, @singleton_guard : Int64, @created_at : Timestamp, @updated_at : Timestamp)
+  end
+
+  pub def self.from_row(row : Row, offset : Int32 = 0) : Account
+    Account.new(row.int(offset), row.text(offset + 1), row.text(offset + 2), row.text?(offset + 3), row.text?(offset + 4), row.int(offset + 5), row.time(offset + 6), row.time(offset + 7))
+  end
+
+  # `Account.first` (`Current.account`).
+  pub def self.first(conn : Connection) : Account?
+    conn.query_one(%(SELECT #{ACCOUNT_COLUMNS} FROM "accounts" ORDER BY "accounts"."id" ASC LIMIT 1), [] of SqlValue) { |row| Account.from_row(row) }
+  end
+
+  pub def self.find(conn : Connection, id : Int64) : Account | RecordNotFound
+    conn.query_one(%(SELECT #{ACCOUNT_COLUMNS} FROM "accounts" WHERE "accounts"."id" = ? LIMIT 1), [id] of SqlValue) { |row| Account.from_row(row) } || RecordNotFound.new("Account")
+  end
+
+  pub def self.count(conn : Connection) : Int64
+    conn.count(%(SELECT COUNT(*) FROM "accounts"))
+  end
+
+  pub def settings : AccountSettings
+    AccountSettings.from_column(@settings_json)
+  end
+
+  # `Account.create!(name:)`: a fresh join code, and the settings defaults
+  # written out.
+  pub def self.create(tx : Tx, name : String) : Account
+    now = tx.now
+    settings = AccountSettings.from_column(nil).to_json
+    id = tx.conn.query_one(%(INSERT INTO "accounts" ("created_at", "custom_styles", "join_code", "name", "settings", "singleton_guard", "updated_at") VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING "id"), [now, nil, generate_join_code, name, settings, 0_i64, now] of SqlValue) { |row| row.int(0) }
+    raise "insert into accounts returned no id" unless id
+    found = Account.find(tx.conn, id)
+    raise found.message if found.is_a?(RecordNotFound)
+    found
+  end
+
+  # `reset_join_code`
+  pub def reset_join_code(tx : Tx) : Nil
+    @join_code = generate_join_code
+    @updated_at = tx.now
+    tx.conn.execute(%(UPDATE "accounts" SET "join_code" = ?, "updated_at" = ? WHERE "accounts"."id" = ?), [@join_code, @updated_at, @id] of SqlValue)
+  end
+
+  # `update!(name:, custom_styles:, settings:)`. Only changed attributes are
+  # written; the settings column is written when its (defaulted) hash
+  # changes. *custom_styles* is `{value}` to set it (`{nil}` clears it), or
+  # nil to leave it.
+  pub def update(tx : Tx, name : String? = nil, custom_styles : Tuple(String?)? = nil, settings : Array(Tuple(String, String))? = nil) : String?
+    columns = [] of String
+    values = [] of SqlValue
+    if name && name != @name
+      @name = name
+      columns << "name"
+      values << name
+    end
+    if custom_styles && custom_styles[0] != @custom_styles
+      @custom_styles = custom_styles[0]
+      columns << "custom_styles"
+      values << custom_styles[0]
+    end
+    if settings
+      original = self.settings
+      updated = original.copy
+      failure = updated.assign(settings)
+      return failure if failure
+      if @settings_json.nil? || updated.to_json != original.to_json
+        json = updated.to_json
+        @settings_json = json
+        columns << "settings"
+        values << json
+      end
+    end
+    return nil if columns.empty?
+    @updated_at = tx.now
+    columns << "updated_at"
+    values << @updated_at
+    values << @id
+    assignments = columns.map { |column| %("#{column}" = ?) }.join(", ")
+    tx.conn.execute(%(UPDATE "accounts" SET #{assignments} WHERE "accounts"."id" = ?), values)
+    nil
+  end
+end
+
+# `SecureRandom.alphanumeric(12).scan(/.{4}/).join("-")`
+pub def generate_join_code : String
+  code = alphanumeric(12)
+  "#{code[0, 4]}-#{code[4, 4]}-#{code[8, 4]}"
+end
+
+def copy_hash(hash : Hash(String, Any)) : Hash(String, Any)
+  copy = {} of String => Any
+  hash.each { |key, value| copy[key] = value }
+  copy
+end

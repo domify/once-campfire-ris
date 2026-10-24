@@ -1,0 +1,78 @@
+# Active Job's queue: the events models emit after commit, and the jobs
+# controllers enqueue, run later on the app's thread. The server runs them
+# on a task of their own (`work`); tests run them with `perform_all`.
+module jobs/jobs
+
+import std/text
+import rils/record/events::{Event, EventSink, DisconnectUser}
+
+# `ActiveStorage::AnalyzeJob.perform_later(blob)`.
+pub struct AnalyzeBlob
+  getter blob_id : Int64
+
+  def initialize(@blob_id : Int64)
+  end
+end
+
+pub alias Job = Event | AnalyzeBlob
+
+pub class Jobs < EventSink
+  getter pending : Array(Job)
+  # Runs one job; the app sets it (`campfire/jobs/perform`).
+  property performer : Proc(Job, Nil)?
+  # Wakes the worker; nil when there is none (tests).
+  property wake : Channel(Nil)?
+  # `remote_connections.where(current_user:).disconnect(reconnect:)`: not a
+  # job but a broadcast, done right away.
+  property disconnect : Proc(Int64, Bool, Nil)?
+
+  def initialize
+    @pending = [] of Job
+    @performer = nil
+    @wake = nil
+    @disconnect = nil
+  end
+
+  pub def emit(event : Event) : Nil
+    if event.is_a?(DisconnectUser)
+      if disconnect = @disconnect
+        disconnect.call(event.user_id, event.reconnect)
+      end
+      return
+    end
+    perform_later(event)
+  end
+
+  pub def perform_later(job : Job) : Nil
+    @pending << job
+    if wake = @wake
+      wake.send(nil) if @pending.size == 1
+    end
+  end
+
+  # Runs what's queued, and what those jobs queue, until nothing is left.
+  pub def perform_all : Int32
+    count = 0
+    until @pending.empty?
+      job = @pending.shift
+      count += 1
+      run(job)
+    end
+    count
+  end
+
+  def run(job : Job) : Nil
+    performer = @performer || return
+    performer.call(job)
+  end
+
+  # The worker: waits to be woken, then runs everything queued.
+  pub def work : Nil
+    wake = Channel(Nil).new(1)
+    @wake = wake
+    loop do
+      wake.receive if @pending.empty?
+      perform_all
+    end
+  end
+end

@@ -1,0 +1,35 @@
+<%# reference/app/views/sessions/new.html.erb -%>
+<% content_for "head" do %><%= turbo_page_requires_reload_tag %><% end %>
+<section class="txt-align-center">
+  <div class="panel <% if ctx.flash_alert %>shake<% end %>">
+    <%= account_logo_tag(ctx, "center margin-block-end txt-xx-large") %>
+
+<% form = form_with(ctx.url(session_path)).class("flex flex-column gap") %>    <%= form.wrap do %>
+      <fieldset class="flex flex-column gap center-block upad">
+        <legend class="txt-large txt-align-center"><strong><%= ctx.account.name %></strong></legend>
+
+        <div class="flex align-center gap">
+          <%= translation_button(ctx, "email_address") %>
+          <label class="flex align-center gap input input--actor txt-large">
+            <%= form.email_field("email_address", nil, attrs.required(true).class("input").autofocus.autocomplete("username").placeholder("Enter your email address").attr("value", email_address)) %>
+            <%= image_tag(ctx, "email.svg", attrs.aria_hidden.size(24).class("colorize--black")) %>
+          </label>
+        </div>
+
+        <div class="flex align-center gap">
+          <%= translation_button(ctx, "password") %>
+          <label class="flex align-center gap input input--actor txt-large">
+            <%= form.password_field("password", attrs.required(true).class("input").autocomplete("current-password").placeholder("Enter your password").maxlength(72)) %>
+            <%= image_tag(ctx, "password.svg", attrs.aria_hidden.size(24).class("colorize--black")) %>
+          </label>
+        </div>
+
+        <%= button_tag(attrs.class("btn btn--reversed center txt-large").type("submit").name("log_in")) do %>
+          <%= image_tag(ctx, "arrow-right.svg", attrs.aria_hidden) %>
+          <span class="for-screen-reader">Go</span>
+<% end %>      </fieldset>
+<% end %>  </div>
+
+  <% include "accounts/_help_contact.html.erb" %>
+</section>
+

@@ -1,0 +1,105 @@
+# Pages rendered with their cached fragments left out of the page's text,
+# and recorded where they go instead. A room page is mostly its ~40 message
+# fragments (~400 KB); copying them into one buffer only for the kit to find
+# them in it again (for its gzip and ETag, which reuse what it knows about
+# each fragment) costs more than the rest of assembling the page. So a
+# template prints a `Fragment` itself, not its text, and the buffer notes
+# the fragment at its offset instead of copying it. Anything else, a
+# fragment's equal bytes printed as a string included, is copied in as
+# text, so the page is always the same bytes a plain render gives.
+module rils/template/recorded
+
+import std/digest::{SHA256}
+
+# Shorter fragments are copied: the kit keeps fragments under 1 KB in the
+# text around them anyway, and noting every short one would cost more than
+# copying it.
+pub MIN_RECORDED = 1024
+
+# A rendered fragment as the fragment cache keeps it, shared by every page
+# that prints it.
+pub class Fragment
+  getter html : String
+  @digest : String?
+
+  def initialize(@html : String)
+    @digest = nil
+  end
+
+  # SHA-256 of the fragment, worked out once: every page that prints the
+  # fragment digests it for its ETag.
+  def digest : String
+    @digest ||= SHA256.hexdigest(@html)
+  end
+
+  def to_s : String
+    @html
+  end
+
+  def bytesize : Int32
+    @html.bytesize
+  end
+
+  def ==(other : Fragment) : Bool
+    @html == other.html
+  end
+end
+
+# A rendered page: its text, and each cached fragment with its byte offset
+# in the text, in order.
+pub class RecordedPage
+  getter text : String
+  getter fragments : Array(Tuple(Int32, Fragment))
+
+  def initialize(@text : String, @fragments : Array(Tuple(Int32, Fragment)) = [] of Tuple(Int32, Fragment))
+  end
+
+  def empty? : Bool
+    @text.empty? && @fragments.empty?
+  end
+
+  # The whole page, fragments included.
+  def to_s : String
+    return @text if @fragments.empty?
+    String.build(@text.bytesize + @fragments.sum { |(_, fragment)| fragment.bytesize }) do |io|
+      position = 0
+      @fragments.each do |(offset, fragment)|
+        io << @text[position, offset - position]
+        io << fragment.html
+        position = offset
+      end
+      io << @text[position, @text.bytesize - position]
+    end
+  end
+
+  def bytesize : Int32
+    @text.bytesize + @fragments.sum { |(_, fragment)| fragment.bytesize }
+  end
+
+  # Each fragment's own string at its offset in the text, not copied: what
+  # a body in parts sends between the text's runs.
+  def inserts : Array(Tuple(Int32, String))
+    @fragments.map { |(offset, fragment)| {offset, fragment.html} }
+  end
+
+  # A weak ETag's value for the page, as the Rust port's kit takes it: 32
+  # hex digits of a SHA-256 over its parts, each fragment by its own
+  # digest, so the cached fragments aren't read again. The same page split
+  # the same way always gets the same one.
+  def etag : String
+    # Digested where the text lies, a run at a time: no string of the
+    # page is built for it.
+    digest = SHA256.new
+    text = @text.as_tape
+    position = 0
+    @fragments.each do |(offset, fragment)|
+      digest.update("T").update((offset - position).to_s).update(":")
+      digest.update(text[position, offset - position])
+      digest.update("F").update(fragment.bytesize.to_s).update(":").update(fragment.digest)
+      position = offset
+    end
+    digest.update("T").update((@text.bytesize - position).to_s).update(":")
+    digest.update(text[position, @text.bytesize - position])
+    digest.hexfinal[0, 32]
+  end
+end

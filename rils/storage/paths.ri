@@ -1,0 +1,63 @@
+# Active Storage route helpers (`activestorage/config/routes.rb`) and blob
+# signed ids. `rails_blob_path` and `url_for(representation)` resolve
+# through `:rails_storage_redirect`; `rails_storage_proxy_path` gives the
+# proxy variants. `urls_expire_in` is unset in Campfire, so these signed
+# ids never expire.
+module rils/storage/paths
+
+import std/time::{Time}
+import rils/rails_compat/message_verifier::{MessageVerifier}
+import rils/rails_compat/metadata::{Failure}
+import rils/ruby/uri::{cgi_escape}
+import rils/storage/blob::{Blob}
+import rils/storage/disposition::{escape_path, escape_segment}
+import rils/storage/filename::{Filename}
+import rils/storage/json::{json_parse}
+import rils/storage/variation::{Variation}
+
+pub PREFIX = "/rails/active_storage"
+
+# `blob.signed_id`: the Active Storage verifier, purpose "blob_id".
+pub def signed_blob_id(verifier : MessageVerifier, blob_id : Int64, expires_at : Time? = nil) : String
+  verifier.generate_raw(blob_id.to_s, "blob_id", expires_at)
+end
+
+# `ActiveStorage::Blob.find_signed(id)`'s verification half.
+pub def verify_signed_blob_id(verifier : MessageVerifier, signed_id : String, now : Time) : Int64?
+  data = verifier.verify_raw(signed_id, "blob_id", now)
+  return nil if data.is_a?(Failure)
+  json = json_parse(data)
+  json ? json.as_i64? : nil
+end
+
+# `rails_blob_path(blob, disposition:)`.
+pub def blob_redirect_path(verifier : MessageVerifier, blob : Blob, disposition : String? = nil) : String
+  blob_path("redirect", verifier, blob.id, blob.filename, disposition)
+end
+
+# `rails_storage_proxy_path(blob)`.
+pub def blob_proxy_path(verifier : MessageVerifier, blob : Blob, disposition : String? = nil) : String
+  blob_path("proxy", verifier, blob.id, blob.filename, disposition)
+end
+
+# `url_for(blob.representation(...))`, `url_for(variant)` and
+# `url_for(preview)`. *blob* is the original (the video, for previews);
+# *variation* is exactly what the representation holds.
+pub def representation_redirect_path(verifier : MessageVerifier, blob : Blob, variation : Variation) : String
+  representation_path("redirect", verifier, blob, variation)
+end
+
+pub def representation_proxy_path(verifier : MessageVerifier, blob : Blob, variation : Variation) : String
+  representation_path("proxy", verifier, blob, variation)
+end
+
+def blob_path(kind : String, verifier : MessageVerifier, blob_id : Int64, filename : Filename, disposition : String?) : String
+  path = "#{PREFIX}/blobs/#{kind}/#{escape_segment(signed_blob_id(verifier, blob_id))}/#{escape_path(filename.sanitized)}"
+  # `Hash#to_query`, which escapes with `CGI.escape`.
+  disposition ? "#{path}?disposition=#{cgi_escape(disposition)}" : path
+end
+
+def representation_path(kind : String, verifier : MessageVerifier, blob : Blob, variation : Variation) : String
+  "#{PREFIX}/representations/#{kind}/#{escape_segment(signed_blob_id(verifier, blob.id))}/" \
+  "#{escape_segment(variation.key(verifier))}/#{escape_path(blob.filename.sanitized)}"
+end

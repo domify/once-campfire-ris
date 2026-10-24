@@ -1,0 +1,172 @@
+# Stand-ins for tests: a fixture-loaded database with a recording sink and
+# a clock the test moves, and `BasicRichText`.
+module test/models/testing
+
+import std/time::{Span}
+import std/text
+import rils/rails_compat/clock::{Clock}
+import rils/rails_compat/encoding::{strict_decode, urlsafe_decode}
+import rils/record/sqlite::{Connection, SqlValue}
+import rils/record/timestamp::{Timestamp}
+import rils/record/database::{Database, Config, Env, RichText, Tx}
+import rils/record/events::{RecordingSink, Event}
+import rils/record/errors::{RecordNotFound}
+import test/models/fixtures::{load_fixtures, fixtures_dir, identify, Loaded}
+import models/user::{User}
+
+# Tag stripping, with mentions read from unverified SGIDs, as Campfire's
+# plain text reads them (`reference/lib/rails_ext/action_text_attachables.rb`);
+# the exact rules belong to `richtext/`. It reports no mentions: those need
+# verified SGIDs (`Content#attachables`), so tests that need mentions state
+# them.
+pub class BasicRichText < RichText
+  pub def to_plain_text(conn : Connection, html : String) : String
+    text = String.build do |io|
+      rest = html
+      written = false
+      while start = rest.byte_index("<")
+        io << rest[0, start]
+        written = true if start > 0
+        stop = rest.byte_index(">", start)
+        unless stop
+          rest = ""
+          break
+        end
+        tag = rest[start + 1, stop - start - 1]
+        closing = tag.starts_with?("/")
+        name = Test::Models::Testing.tag_name(tag)
+        if name == "action-text-attachment" && !closing
+          sgid = Test::Models::Testing.attribute_value(tag, "sgid")
+          user_id = sgid ? Test::Models::Testing.user_id_from_sgid(sgid) : nil
+          user = user_id ? User.find_by_id(conn, user_id) : nil
+          if user
+            io << '@' << user.name
+            written = true
+          end
+          close = "</action-text-attachment>"
+          if after = rest.byte_index(close, start)
+            rest = rest[after + close.bytesize, rest.bytesize - after - close.bytesize]
+            next
+          end
+        end
+        if ["br", "p", "div", "li", "h1", "blockquote", "pre"].includes?(name) && written && !closing
+          io << '\n'
+        end
+        rest = rest[stop + 1, rest.bytesize - stop - 1]
+      end
+      io << rest
+    end
+    Test::Models::Testing.decode_entities(text.strip)
+  end
+end
+
+pub def attribute_value(tag : String, name : String) : String?
+  needle = "#{name}=\""
+  start = tag.byte_index(needle)
+  return nil unless start
+  after = start + needle.bytesize
+  stop = tag.byte_index("\"", after)
+  stop ? tag[after, stop - after] : nil
+end
+
+# Reads `gid://campfire/User/<id>` out of an SGID's message without
+# verifying it.
+pub def user_id_from_sgid(sgid : String) : Int64?
+  message = sgid.partition("--")[0].gsub("%3D", "=").gsub("%2B", "+").gsub("%2F", "/")
+  decoded = strict_decode(message) || urlsafe_decode(message)
+  return nil unless decoded
+  marker = "gid://campfire/User/"
+  start = decoded.byte_index(marker)
+  return nil unless start
+  digits = String.build do |io|
+    i = start + marker.bytesize
+    while i < decoded.bytesize && decoded.as_tape[i] >= 48 && decoded.as_tape[i] <= 57
+      io.write_byte(decoded.as_tape[i])
+      i += 1
+    end
+  end
+  digits.to_i64?
+end
+
+pub def decode_entities(text : String) : String
+  text.gsub("&nbsp;", " ").gsub("&lt;", "<").gsub("&gt;", ">").gsub("&quot;", "\"").gsub("&#39;", "'").gsub("&amp;", "&")
+end
+
+# A database loaded with the fixtures, a recording event sink and a clock
+# the test moves (`fixtures :all` plus `ActiveSupport::Testing::TimeHelpers`).
+pub class TestDb
+  getter db : Database
+  getter sink : RecordingSink
+  getter clock : Clock
+  getter loaded : Loaded
+
+  def initialize(@db : Database, @sink : RecordingSink, @clock : Clock, @loaded : Loaded)
+  end
+
+  pub def self.new : TestDb
+    sink = RecordingSink.new
+    clock = Clock.new
+    opened = Database.open(Config.new(":memory:", true, "test"), Env.new(clock, sink, BasicRichText.new, 4))
+    raise opened if opened.is_a?(String)
+    loaded = opened.write { |tx| load_fixtures(tx.conn, fixtures_dir, tx.now, 4) }
+    TestDb.new(opened, sink, clock, loaded)
+  end
+
+  pub def write(& : Tx -> T) : T forall T
+    @db.write { |tx| yield tx }
+  end
+
+  pub def read(& : Connection -> T) : T forall T
+    @db.read { |conn| yield conn }
+  end
+
+  pub def conn : Connection
+    @db.conn
+  end
+
+  pub def now : Timestamp
+    Timestamp.from_time(@clock.now)
+  end
+
+  pub def events : Array(Event)
+    @sink.events
+  end
+
+  pub def travel(seconds : Int64) : Nil
+    @clock.travel(Span.seconds(seconds))
+  end
+
+  pub def travel_to(at : Timestamp) : Nil
+    @clock.travel_to(at.time)
+  end
+end
+
+# A fixture's id, by label.
+pub def id(label : String) : Int64
+  identify(label)
+end
+
+# The record, or a failed test naming what was missing.
+pub def found(value : T | RecordNotFound) : T forall T
+  raise value.message if value.is_a?(RecordNotFound)
+  value
+end
+
+# The tag's name: the letters, digits and dashes it starts with.
+pub def tag_name(tag : String) : String
+  String.build do |io|
+    stopped = false
+    tag.lchop('/').each_char do |c|
+      stopped = true unless c.ascii_alphanumeric? || c == '-'
+      io << c unless stopped
+    end
+  end
+end
+
+# The last *count* items (`Array#last(n)`).
+pub def tail(items : Array(T), count : Int32) : Array(T) forall T
+  start = items.size > count ? items.size - count : 0
+  result = [] of T
+  (items.size - start).times { |i| result << items[start + i] }
+  result
+end

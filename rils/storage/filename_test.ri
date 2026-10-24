@@ -1,0 +1,34 @@
+# `File.extname`/`File.basename` cases from the Rust port, each checked
+# against Ruby.
+module rils/storage/filename_test
+
+import rils/storage/filename::*
+import web/web/spec::*
+
+describe "Filename" do
+  it "matches Ruby's File semantics" do
+    [
+      {"foo.", ".", "foo"},
+      {"a.b.", ".", "a.b"},
+      {".bashrc", "", ".bashrc"},
+      {"..", "", ".."},
+      {"...", "", "..."},
+      {".a.b", ".b", ".a"},
+      {"a..b", ".b", "a."},
+      {"a/b.c/d", "", "d"},
+      {"a.b/", ".b", "a"},
+      {"x.tar.gz", ".gz", "x.tar"},
+      {"a/.b", "", ".b"},
+      {".", "", "."},
+      {"", "", ""},
+      {"é.png", ".png", "é"},
+      {"a. b", ". b", "a"},
+    ].each do |c|
+      name, ext, base = c
+      f = Filename.new(name)
+      assert f.extension_with_delimiter == ext
+      assert f.base == base
+    end
+  end
+
+end

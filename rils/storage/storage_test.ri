@@ -1,0 +1,54 @@
+# The Rust port's staging tests.
+module rils/storage/storage_test
+
+import std/file
+import std/dir::{Dir}
+import rils/rails_compat/key_generator::{Secrets}
+import rils/rails_compat/app_verifier::{app_verifier}
+import rils/storage/storage::*
+import rils/storage/disk::{DiskService, make_tempdir, remove_tree}
+import rils/storage/filename::{Filename}
+import rils/storage/blob::{NewBlob}
+import web/web/spec::*
+
+def storage_in(root : String) : Storage
+  Storage.new(DiskService.new(root, "local"), app_verifier(Secrets.new("test"), "ActiveStorage"))
+end
+
+describe "Storage" do
+  it "leaves no file behind when a copy fails" do
+    root = make_tempdir("storage")
+    storage = storage_in(root)
+    blob = NewBlob.unfurl("partial and more", Filename.new("a.txt"), nil, "local")
+    outcome = group do |g|
+      task = g.spawn do
+        storage.stage(blob) do |path|
+          File.write(path, "partial")
+          raise "the disk went away"
+        end
+      end
+      task.value
+    end
+    assert outcome.is_a?(Panicked)
+    assert outcome.is_a?(Panicked) && outcome.message.includes?("the disk went away")
+    assert !storage.service.exist?(blob.key)
+    remove_tree(root)
+  end
+
+  it "deletes a staged file unless it is kept" do
+    root = make_tempdir("storage")
+    storage = storage_in(root)
+    dropped = storage.stage_bytes("dropped", Filename.new("a.txt"), nil)
+    dropped_path = storage.service.path_for(dropped.blob.key)
+    assert File.exists?(dropped_path)
+    dropped.discard
+    assert !File.exists?(dropped_path)
+
+    kept = storage.stage_bytes("kept", Filename.new("b.txt"), nil)
+    kept_path = storage.service.path_for(kept.blob.key)
+    kept.keep
+    kept.discard
+    assert File.exists?(kept_path)
+    remove_tree(root)
+  end
+end

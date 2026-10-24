@@ -1,0 +1,278 @@
+# The before-actions `ApplicationController` runs
+# (`reference/app/controllers/concerns`): `AllowBrowser`, `VersionHeaders`,
+# `Authentication` and `RoomScoped`. Bot keys and banned IPs aren't ported
+# yet.
+module controllers/concerns
+
+import std/text
+import rils/routes/paths::{new_session_path, root_path}
+import models/ban::{Ban}
+import rils/kit/response::{Response}
+import rils/ruby/text::{strip}
+import models/session::{Session}
+import models/user::{User}
+import models/room::{Room, Membership}
+import rils/kit/ctx::{Ctx}
+import rils/kit/cookies::{Cookie}
+import rils/kit/errors::{HttpError, halt}
+import rils/kit/response::{Parts}
+import rils/template/template::{Buffer}
+import views/sessions::{IncompatibleBrowser}
+import rils/user_agent::{present?}
+import models/application_platform::{ApplicationPlatform}
+import rils/ruby/integers::{integer_cast}
+import config/app::{App}
+
+# `Current.session` and `Current.user` once `require_authentication` passed.
+# A bot signed in with its key has no session.
+pub class Current
+  getter session_or_nil : Session?
+  getter user : User
+
+  def initialize(@session_or_nil : Session?, @user : User)
+  end
+
+  pub def session : Session
+    @session_or_nil || raise "a bot key request has no session"
+  end
+
+  # `authenticated_by.bot_key?`
+  pub def bot_key? : Bool
+    @session_or_nil.nil?
+  end
+end
+
+pub enum Authentication
+  # `require_authentication`
+  Required
+  # `allow_unauthenticated_access`
+  Skipped
+  # `require_unauthenticated_access`: skip `require_authentication`, then
+  # `restore_authentication` and `redirect_signed_in_user_to_root`.
+  RequireUnauthenticated
+end
+
+# Which of `ApplicationController`'s before-actions an action runs.
+pub class Before
+  property authentication : Authentication = Authentication::Required
+  # `deny_bots` (skipped by `allow_bot_access`).
+  property deny_bots : Bool = true
+  # `verify_authenticity_token` (skipped by `skip_forgery_protection`).
+  property forgery_protection : Bool = true
+  # The controller declares its own layout (`MessagesController`), so a
+  # blocked browser's page is never the frame layout.
+  property own_layout : Bool = false
+
+  def initialize
+  end
+
+  pub def self.unauthenticated : Before
+    before = Before.new
+    before.authentication = Authentication::Skipped
+    before
+  end
+
+  pub def self.bots : Before
+    before = Before.new
+    before.deny_bots = false
+    before
+  end
+end
+
+# The result of the before-actions: who's signed in (nil when the action
+# skips authentication and nobody is), and the platform `allow_browser`
+# parsed, for the layout.
+pub class Passed
+  getter current : Current?
+  getter platform : ApplicationPlatform?
+
+  def initialize(@current : Current?, @platform : ApplicationPlatform?)
+  end
+
+  pub def user : User
+    (@current || raise "not signed in").user
+  end
+
+  pub def signed_in : Current
+    @current || raise "not signed in"
+  end
+end
+
+# `ApplicationController`'s before-actions in the order Rails runs them:
+# `set_version_headers`, `reject_banned_ip`, `require_authentication`,
+# `deny_bots`, `verify_authenticity_token` (not for a bot key), then
+# `allow_browser`.
+pub def before_actions(app : App, c : Ctx, before : Before = Before.new) : Passed | HttpError
+  set_version_headers(app, c)
+  banned = reject_banned_ip(app, c)
+  return banned if banned
+  current = nil.as(Current?)
+  if before.authentication == Authentication::Required
+    found = require_authentication(app, c, deny_bots: false)
+    return found if found.is_a?(HttpError)
+    current = found
+  end
+  if before.deny_bots && current && current.bot_key?
+    return halt(head(403))
+  end
+  if before.forgery_protection && !(current && current.bot_key?)
+    forged = c.verify_authenticity_token
+    return forged if forged
+  end
+  platform = allow_browser(app, c, before.own_layout)
+  return platform if platform.is_a?(HttpError)
+  if before.authentication == Authentication::RequireUnauthenticated
+    if restore_authentication(app, c)
+      redirect = c.redirect_to(c.url_for(root_path))
+      return redirect.is_a?(HttpError) ? redirect : halt(redirect)
+    end
+  elsif before.authentication == Authentication::Skipped
+    current = restore_authentication(app, c)
+  end
+  Passed.new(current, platform)
+end
+
+# `reject_banned_ip`, unless the request is safe: 429 for a banned
+# `remote_ip`.
+def reject_banned_ip(app : App, c : Ctx) : HttpError?
+  return nil if c.request.get? || c.request.head?
+  ip = c.request.remote_ip
+  return ip if ip.is_a?(HttpError)
+  app.db.read { |conn| Ban.banned?(conn, ip) } ? halt(head(429)) : nil
+end
+
+# `head status` from a before-action: Rails sets the controller's formats
+# only after the before-callbacks, so it's `text/html` whatever the
+# request's format.
+pub def head(status : Int32) : Response
+  response = Response.new(status)
+  response.headers["content-type"] = "text/html" unless (status >= 100 && status <= 199) || [204, 205, 304].includes?(status)
+  response
+end
+
+# `Authorization#ensure_can_administer`: 403 unless the user administers.
+pub def ensure_can_administer(user : User) : HttpError?
+  user.can_administer?(nil) ? nil : halt(head(403))
+end
+
+# `bot_authentication`: `params[:bot_key].present?` and an active bot with
+# that key.
+def bot_authentication(app : App, c : Ctx) : Current? | HttpError
+  param = c.param("bot_key") || return nil
+  return nil unless param.present?
+  # `params[:bot_key].strip` raises for a hash or an array.
+  raw = param.as_s? || return HttpError.internal("undefined method 'strip' for bot_key")
+  key = strip(raw)
+  bot = app.db.read { |conn| User.authenticate_bot(conn, key) }
+  bot ? Current.new(nil, bot) : nil
+end
+
+# `allow_browser versions: VERSIONS, block: -> { render template:
+# "sessions/incompatible_browser" }`: the platform parsed for the check,
+# for the layout to show, or the page for a browser too old (200). A
+# missing or blank User-Agent isn't checked, and the layout parses it if a
+# page renders. An explicit `render template:`, so HTML whatever the
+# request's format. The layout is the controller's: turbo-rails' frame
+# layout for a Turbo-Frame request, unless the controller declares its own
+# (*own_layout*, `MessagesController`), which is the application layout.
+pub def allow_browser(app : App, c : Ctx, own_layout : Bool = false) : ApplicationPlatform? | HttpError
+  header = c.request.user_agent
+  return nil unless header && present?(header)
+  platform = app.platform(header)
+  return platform unless platform.browser_blocked?
+  ctx = app.layout_context(c, platform: platform)
+  page = IncompatibleBrowser.new(ctx)
+  response = if own_layout
+               app.render_page(c, 200, app.layout_body(ctx, page.page_title, nil, false, ->(buffer : Buffer) { page.render_into(buffer) }))
+             else
+               app.render_layout(c, 200, page.page_title, nil, ctx) { |buffer| page.render_into(buffer) }
+             end
+  halt(response)
+end
+
+# `set_version_headers`: `X-Version`, and `X-Rev` when there is one (Rails
+# drops a header set to nil).
+pub def set_version_headers(app : App, c : Ctx) : Nil
+  c.set_header("x-version", app.app_version)
+  if revision = app.git_revision
+    c.set_header("x-rev", revision)
+  end
+end
+
+# `require_authentication`: `restore_authentication`, else
+# `request_authentication`.
+# A bot signed in with its key is refused (`deny_bots`, 403) unless the
+# caller takes care of that itself (*deny_bots* false).
+pub def require_authentication(app : App, c : Ctx, deny_bots : Bool = true) : Current | HttpError
+  current = restore_authentication(app, c)
+  return current if current
+  bot = bot_authentication(app, c)
+  return bot if bot.is_a?(HttpError)
+  if bot
+    return halt(head(403)) if deny_bots
+    return bot
+  end
+  request_authentication(c)
+end
+
+# `restore_authentication`: resume the session the `session_token` cookie
+# names.
+pub def restore_authentication(app : App, c : Ctx) : Current?
+  token = c.cookies.signed("session_token") || return nil
+  session = app.db.read { |conn| Session.find_by_token(conn, token) } || return nil
+  resume_session(app, c, session)
+end
+
+# `resume_session`: refresh the session's activity, at most hourly, then
+# `authenticated_as`. Only a session due for its refresh writes, and only
+# then is the `session_token` cookie signed again, as the Rust port does,
+# rather than on every request as Rails does: its 20-year expiry keeps
+# rolling without a cookie on every response.
+def resume_session(app : App, c : Ctx, session : Session) : Current?
+  refresh = session.needs_resume?(app.db.env.now)
+  if refresh
+    user_agent = c.request.user_agent
+    ip = c.request.remote_ip
+    ip = nil if ip.is_a?(HttpError)
+    app.db.write { |tx| session.resume(tx, user_agent, ip) }
+    # `cookies.signed.permanent[:session_token] = { value:, httponly: true, same_site: :lax }`
+    c.cookies.set_signed("session_token", Cookie.new(session.token, permanent: true, httponly: true))
+  end
+  user = app.db.read { |conn| User.find_by_id(conn, session.user_id) } || return nil
+  Current.new(session, user)
+end
+
+# `start_new_session_for`: `user.sessions.start!`, then `authenticated_as`'s
+# `session_token` cookie.
+pub def start_new_session_for(app : App, c : Ctx, user : User) : Nil
+  ip = c.request.remote_ip
+  ip = nil if ip.is_a?(HttpError)
+  session = app.db.write { |tx| Session.start(tx, user.id, c.request.user_agent, ip) }
+  # `cookies.signed.permanent[:session_token] = { value:, httponly: true, same_site: :lax }`
+  c.cookies.set_signed("session_token", Cookie.new(session.token, permanent: true, httponly: true))
+end
+
+# `request_authentication`: remember where we were, then off to sign in.
+def request_authentication(c : Ctx) : HttpError
+  c.session["return_to_after_authenticating"] = c.request.url
+  redirect = c.redirect_to(c.url_for(new_session_path))
+  redirect.is_a?(HttpError) ? redirect : halt(redirect)
+end
+
+# `RoomScoped#set_room`: `Current.user.memberships.find_by!(room_id:)` and
+# its room. A room that's gone under its membership fails the action (a
+# 500), as `@membership.room` being nil does.
+pub def set_room(app : App, c : Ctx, current : Current) : Tuple(Membership, Room) | HttpError
+  raw = c.param_str("room_id") || return HttpError.not_found
+  room_id = integer_cast(raw) || return HttpError.not_found
+  app.db.read do |conn|
+    membership = Membership.find_by_room_and_user(conn, room_id, current.user.id)
+    if membership.nil?
+      HttpError.not_found
+    elsif room = Room.find_by_id(conn, membership.room_id)
+      {membership, room}
+    else
+      HttpError.internal("the membership's room is gone")
+    end
+  end
+end

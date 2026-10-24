@@ -1,0 +1,49 @@
+# `AllowBrowser` (reference/app/controllers/concerns/allow_browser.rb):
+# a browser older than `VERSIONS` gets `sessions/incompatible_browser`
+# wherever it goes, before signing in.
+module test/controllers/allow_browser_test
+
+import std/text
+import rils/kit/response::{Response}
+import test/testing::*
+import web/web/spec::*
+
+OLD_CHROME    = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
+MODERN_CHROME = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
+
+describe "allow_browser" do
+  it "shows an old browser the upgrade page instead" do
+    response = Client.new.get("/session/new", user_agent: OLD_CHROME)
+    assert response.status == 200
+    assert response["content-type"] == "text/html; charset=utf-8"
+    html = body(response)
+    assert html.starts_with?("<!DOCTYPE html>\n<html>\n  <head>\n    <title>Unsupported browser</title>")
+    assert html.includes?("Upgrade to a supported web browser")
+    assert html.includes?("<strong>Chrome</strong>\n          <span> 120+</span>")
+    # Halted before `set_version_headers`.
+    assert response["x-version"].nil?
+  end
+
+  it "checks before signing in" do
+    response = Client.new.get("/", user_agent: OLD_CHROME)
+    assert response.status == 200
+    assert body(response).includes?("Upgrade to a supported web browser")
+  end
+
+  it "renders in the frame layout for a Turbo-Frame request" do
+    html = body(Client.new.get("/session/new", frame: "sign-in", user_agent: OLD_CHROME))
+    assert html.starts_with?("<html>\n  <head>\n    \n    \n  </head>\n  <body>\n    \n<div class=\"panel center\">")
+  end
+
+  it "keeps the application layout where the controller declares its own" do
+    html = body(Client.new.get("/rooms/1/messages", frame: "messages", user_agent: OLD_CHROME))
+    assert html.starts_with?("<!DOCTYPE html>\n<html>\n  <head>\n    <title>Unsupported browser</title>")
+  end
+
+  it "lets a current browser, or none, through" do
+    [MODERN_CHROME, nil, "  "].each do |user_agent|
+      html = body(Client.new.get("/session/new", user_agent: user_agent))
+      assert html.includes?("<title>Sign in</title>")
+    end
+  end
+end

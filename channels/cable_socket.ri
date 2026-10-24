@@ -1,0 +1,38 @@
+# `/cable`: the WebSocket a page's Action Cable consumer opens, handed to a
+# `cable/cable` connection. The handshake is refused as Rails' would be
+# (same-origin `Origin`, the RFC's checks), the first protocol the client
+# offers that Action Cable speaks is chosen, and the connection's frames
+# go out as text messages.
+module channels/cable_socket
+
+import std/text
+import web/web/context::{Context}
+import web/web/websocket::{WebSocket}
+import rils/cable/cable::{CableServer, Connection}
+import rils/cable/protocol::{PROTOCOLS}
+import config/app::{App}
+import channels/channels::{authenticate}
+
+# The largest message a client may send.
+MAX_MESSAGE_SIZE = 1024 * 1024
+
+# Mounts the cable on the kit's handler.
+pub def cable_socket(app : App, server : CableServer, web : Context) : Nil
+  request = web.request
+  if status = WebSocket.refusal(request, [] of String)
+    web.response.status_code = status
+    web.response.print("")
+    return
+  end
+  offered = (request.headers["Sec-WebSocket-Protocol"]? || "").split(',').map(&.strip)
+  chosen = offered.find { |protocol| PROTOCOLS.includes?(protocol) }
+  web.response.headers["Sec-WebSocket-Protocol"] = chosen if chosen
+  cookies = request.headers["Cookie"]?
+  WebSocket.accept(web, MAX_MESSAGE_SIZE, ->(ws : WebSocket, ctx : Context) do
+    connection = Connection.new(server, ->(frame : String) { ws.send(frame) }, -> { ws.close(1000); nil })
+    ws.on_message { |text| connection.receive(text) }
+    ws.on_close { |_code, _reason| connection.handle_close }
+    connection.open(authenticate(app, cookies ? [cookies] : [] of String))
+    nil
+  end)
+end

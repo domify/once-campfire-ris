@@ -1,0 +1,314 @@
+# `ActionDispatch::Static` (actionpack/lib/action_dispatch/middleware/static.rb)
+# over `Rack::Files`: `reference/public` and the precompiled `/assets`,
+# with the headers `config.public_file_server.headers` sets in
+# reference/config/environments/production.rb. Files are streamed from
+# disk; their size and mtime are read once, at boot.
+module rils/kit/public_files
+
+import std/text
+import std/file::{File}
+import std/dir::{Dir}
+import std/time::{Time}
+import web/web/http_date::{http_date}
+import rils/ruby/rack::{byte_ranges}
+import rils/kit/response::{Response, FileBody}
+import rils/kit/request::{RequestFields}
+import rils/assets/pipeline::{LoadPath}
+
+ROOT = "#{__DIR__}/../.."
+
+# The last `config.public_file_server.headers` assignment in production.rb.
+CACHE_CONTROL = "public, max-age=2592000"
+
+# `Rack::Files::MULTIPART_BOUNDARY`
+MULTIPART_BOUNDARY = "AaB03x"
+
+class PublicFile
+  getter path : String
+  getter size : Int64
+  getter last_modified : String
+
+  def initialize(@path : String, @size : Int64, @last_modified : String)
+  end
+end
+
+pub class PublicFiles
+  @files : Hash(String, PublicFile)
+  # Each URL's first segment, which a request's must begin for any file to
+  # be its.
+  @heads : Array(String)
+
+  def initialize(urls : Hash(String, String))
+    @files = {} of String => PublicFile
+    urls.each do |url, path|
+      @files[url] = PublicFile.new(path, File.size(path), http_date(Time.unix(File.info(path).modification_time)))
+    end
+    @heads = @files.keys.map { |url| url.lchop('/').partition('/')[0] }.uniq
+  end
+
+  # Whether no file can be *path*'s, seen from its first segment alone,
+  # read where it lies: a path that a cleanup could change (`.`, `..`,
+  # `//`, an escape) is left to `find_file`.
+  def surely_missing?(path : Str) : Bool
+    return false unless path.bytesize > 1 && path[0] == 47_u8
+    i = 1
+    while i < path.bytesize
+      byte = path[i]
+      return false if byte == 37_u8 || byte == 0_u8 || (byte == 46_u8 && path[i - 1] == 47_u8) || (byte == 47_u8 && path[i - 1] == 47_u8)
+      i += 1
+    end
+    stop = 1
+    while stop < path.bytesize && path[stop] != 47_u8
+      stop += 1
+    end
+    head = path[1, stop - 1]
+    @heads.none? { |known| known.bytesize >= head.bytesize && head == known.as_tape[0, head.bytesize] }
+  end
+
+  # `public/` without `public/assets`, and the load path precompiled into
+  # tmp/public/assets.
+  pub def self.reference(load_path : LoadPath, root : String = ROOT) : PublicFiles
+    public = "#{root}/reference/public"
+    urls = {} of String => String
+    files_in_tree(public).each do |file|
+      next if file.starts_with?("#{public}/assets/")
+      urls[file[public.bytesize, file.bytesize - public.bytesize]] = file
+    end
+    load_path.precompile("#{root}/tmp/public").each { |url, path| urls[url] = path }
+    PublicFiles.new(urls)
+  end
+
+  # `FileHandler#attempt`: a public file's response to a GET or HEAD, nil
+  # to hand the request to the app.
+  pub def serve(
+    method : String,
+    path_info : Str,
+    headers : RequestFields,
+  ) : Response?
+    return nil unless method == "GET" || method == "HEAD"
+    return nil if surely_missing?(path_info)
+    found = find_file(path_info.to_heap, header(headers, "accept-encoding") || "") || return nil
+    file, content_headers = found
+    serve_file(file, content_headers, header(headers, "range"), header(headers, "if-modified-since"))
+  end
+
+  def header(headers : RequestFields, name : String) : String?
+    value = headers[name]
+    value ? value.to_heap : nil
+  end
+
+  def find_file(path_info : String, accept_encoding : String) : Tuple(PublicFile, Array(Tuple(String, String)))?
+    path = clean_path(path_info) || return nil
+    extname = file_extname(path)
+    content_type = mime_type(extname)
+    candidates = [{path, content_type || "text/plain"}] of Tuple(String, String)
+    # Only paths without a known extension also try .html and /index.html.
+    if content_type.nil? && extname != ".html"
+      candidates << {"#{path}.html", "text/html"}
+      candidates << {"#{path}/index.html", "text/html"}
+    end
+    candidates.each do |(candidate, type)|
+      if found = try_files(candidate, type, accept_encoding)
+        return found
+      end
+    end
+    nil
+  end
+
+  def try_files(path : String, content_type : String, accept_encoding : String) : Tuple(PublicFile, Array(Tuple(String, String)))?
+    headers = [{"content-type", content_type}]
+    if compressible?(content_type)
+      [{"br", ".br"}, {"gzip", ".gz"}].each do |(encoding, extension)|
+        if file = @files["#{path}#{extension}"]?
+          headers << {"vary", "accept-encoding"}
+          if accepts?(accept_encoding, encoding)
+            headers << {"content-encoding", encoding}
+            return {file, headers}
+          end
+        end
+      end
+    end
+    file = @files[path]? || return nil
+    {file, headers}
+  end
+
+  # `Rack::Files#serving`, then `FileHandler#serve`'s
+  # `headers.update(content_headers)`.
+  def serve_file(file : PublicFile, content_headers : Array(Tuple(String, String)), range : String?, if_modified_since : String?) : Response
+    return Response.new(304) if if_modified_since == file.last_modified
+
+    size = file.size
+    response = Response.new(200)
+    response.headers.append("last-modified", file.last_modified)
+    response.headers.append("content-type", "")
+    response.headers.append("cache-control", CACHE_CONTROL)
+    ranges = byte_ranges(range, size)
+    if ranges.nil?
+      response.headers.append("content-length", size.to_s)
+      response.body = FileBody.new(file.path, 0_i64, size)
+    elsif ranges.empty?
+      message = "Byte range unsatisfiable\n"
+      response = Response.new(416)
+      response.headers.append("content-type", "")
+      response.headers.append("content-length", message.bytesize.to_s)
+      response.headers.append("x-cascade", "pass")
+      response.headers.append("content-range", "bytes */#{size}")
+      response.body = message
+    elsif ranges.size == 1
+      first, last = ranges[0]
+      response.status = 206
+      response.headers.append("content-range", "bytes #{first}-#{last}/#{size}")
+      response.headers.append("content-length", (last - first + 1).to_s)
+      response.body = FileBody.new(file.path, first, last - first + 1)
+    else
+      # Static's content headers replace the multipart content type.
+      content_type = content_headers[0][1]
+      body = String.build do |io|
+        File.open(file.path, "r") do |source|
+          ranges.each do |(first, last)|
+            io << "\r\n--" << MULTIPART_BOUNDARY << "\r\ncontent-type: " << content_type << "\r\ncontent-range: bytes " << first << '-' << last << '/' << size << "\r\n\r\n"
+            source.seek(first)
+            io << source.read_bytes((last - first + 1).to_i32)
+          end
+        end
+        io << "\r\n--" << MULTIPART_BOUNDARY << "--\r\n"
+      end
+      response.status = 206
+      response.headers.append("content-length", body.bytesize.to_s)
+      response.body = body
+    end
+    content_headers.each { |(name, value)| response.headers[name] = value }
+    response
+  end
+end
+
+def files_in_tree(dir : String) : Array(String)
+  files = [] of String
+  return files unless Dir.exists?(dir)
+  Dir.children(dir).sorted.each do |name|
+    path = "#{dir}/#{name}"
+    if Dir.exists?(path)
+      files.concat(files_in_tree(path))
+    else
+      files << path
+    end
+  end
+  files
+end
+
+# `FileHandler#clean_path`: chomp("/"), percent-decode, reject NUL, then
+# `Rack::Utils.clean_path_info`.
+def clean_path(path_info : String) : String?
+  path = unescape_path(path_info.ends_with?('/') ? path_info[0, path_info.bytesize - 1] : path_info)
+  return nil if path.includes?("\u0000")
+  parts = path.split('/')
+  clean = [] of String
+  parts.each do |part|
+    case part
+    when "", "." then nil
+    when ".."    then clean.pop unless clean.empty?
+    else              clean << part
+    end
+  end
+  cleaned = clean.join("/")
+  parts.empty? || parts[0].empty? ? "/#{cleaned}" : cleaned
+end
+
+# `URI::RFC2396_Parser#unescape`: %XX sequences become bytes, anything
+# else is kept.
+def unescape_path(path : String) : String
+  bytes = path.bytes
+  String.build(bytes.size) do |io|
+    i = 0
+    while i < bytes.size
+      if bytes[i] == '%'.ord && i + 2 < bytes.size && (high = hex_value(bytes[i + 1])) && (low = hex_value(bytes[i + 2]))
+        io.write_byte((high * 16 + low).to_u8)
+        i += 3
+      else
+        io.write_byte(bytes[i])
+        i += 1
+      end
+    end
+  end
+end
+
+def hex_value(byte : UInt8) : Int32?
+  c = byte.to_i32
+  return c - '0'.ord if c >= '0'.ord && c <= '9'.ord
+  return c - 'a'.ord + 10 if c >= 'a'.ord && c <= 'f'.ord
+  return c - 'A'.ord + 10 if c >= 'A'.ord && c <= 'F'.ord
+  nil
+end
+
+# `FileHandler#compressible_content_types`:
+# /\A(?:text\/|application\/javascript|image\/svg\+xml)/
+def compressible?(content_type : String) : Bool
+  content_type.starts_with?("text/") || content_type.starts_with?("application/javascript") || content_type.starts_with?("image/svg+xml")
+end
+
+# `accept_encoding.any? { |enc, _| /\b#{encoding}\b/i.match?(enc) }` over
+# Rack's parsed header.
+def accepts?(accept_encoding : String, encoding : String) : Bool
+  accept_encoding.split(',').any? do |part|
+    value = part.partition(';')[0].strip.downcase
+    found = false
+    at = 0
+    while index = value.index(encoding, at)
+      before = index > 0 && word_byte?(value.bytes[index - 1])
+      stop = index + encoding.bytesize
+      after = stop < value.bytesize && word_byte?(value.bytes[stop])
+      found = true unless before || after
+      at = index + 1
+    end
+    found
+  end
+end
+
+def word_byte?(byte : UInt8) : Bool
+  c = byte.to_i32
+  (c >= 'a'.ord && c <= 'z'.ord) || (c >= 'A'.ord && c <= 'Z'.ord) || (c >= '0'.ord && c <= '9'.ord) || c == '_'.ord
+end
+
+# `File.extname`.
+def file_extname(path : String) : String
+  slash = path.rindex('/')
+  base = slash ? path[slash + 1, path.bytesize - slash - 1] : path
+  base = base.lstrip('.')
+  dot = base.rindex('.') || return ""
+  base[dot, base.bytesize - dot]
+end
+
+# `Rack::Mime.mime_type(ext, nil)` for the extensions a Campfire deploy
+# serves (and the other common web ones), case-insensitively.
+def mime_type(extname : String) : String?
+  case extname.downcase
+  when ".avif"          then "image/avif"
+  when ".css"           then "text/css"
+  when ".csv"           then "text/csv"
+  when ".gif"           then "image/gif"
+  when ".gz"            then "application/x-gzip"
+  when ".htm", ".html"  then "text/html"
+  when ".ico"           then "image/vnd.microsoft.icon"
+  when ".jpeg", ".jpg"  then "image/jpeg"
+  when ".js", ".mjs"    then "text/javascript"
+  when ".json"          then "application/json"
+  when ".m4a"           then "audio/mp4a-latm"
+  when ".mp3"           then "audio/mpeg"
+  when ".mp4"           then "video/mp4"
+  when ".ogg"           then "application/ogg"
+  when ".otf"           then "font/otf"
+  when ".pdf"           then "application/pdf"
+  when ".png"           then "image/png"
+  when ".svg"           then "image/svg+xml"
+  when ".ttf"           then "font/ttf"
+  when ".txt"           then "text/plain"
+  when ".wav"           then "audio/x-wav"
+  when ".webm"          then "video/webm"
+  when ".webp"          then "image/webp"
+  when ".woff"          then "font/woff"
+  when ".woff2"         then "font/woff2"
+  when ".xml"           then "application/xml"
+  when ".zip"           then "application/zip"
+  else                       nil
+  end
+end

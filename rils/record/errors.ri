@@ -1,0 +1,84 @@
+# `ActiveModel::Errors` and the failures a model write answers with instead
+# of raising: `RecordNotFound`, `RecordInvalid`, `RecordNotUnique`.
+module rils/record/errors
+
+import std/text
+
+# `ActiveModel::Errors`: attribute/message pairs in the order they were added.
+pub class Errors
+  getter pairs : Array(Tuple(String, String))
+
+  def initialize
+    @pairs = [] of Tuple(String, String)
+  end
+
+  pub def add(attribute : String, message : String) : Nil
+    @pairs << {attribute, message}
+  end
+
+  pub def empty? : Bool
+    @pairs.empty?
+  end
+
+  pub def on(attribute : String) : Array(String)
+    @pairs.select { |pair| pair[0] == attribute }.map { |pair| pair[1] }
+  end
+
+  # `errors.full_messages`: "Endpoint must use HTTPS"
+  pub def full_messages : Array(String)
+    @pairs.map { |pair| "#{humanize(pair[0])} #{pair[1]}" }
+  end
+
+  pub def to_s : String
+    full_messages.join(", ")
+  end
+end
+
+def humanize(attribute : String) : String
+  words = attribute.ends_with?("_id") ? attribute[0, attribute.bytesize - 3] : attribute
+  words = words.gsub('_', ' ')
+  return words if words.empty? || !words[0].ascii_lowercase?
+  words[0].upcase.to_s + words[1, words.bytesize - 1]
+end
+
+# `ActiveRecord::RecordNotFound`
+pub struct RecordNotFound
+  getter model : String
+
+  def initialize(@model : String)
+  end
+end
+
+impl Error for RecordNotFound
+  def message : String
+    "Couldn't find #{@model}"
+  end
+end
+
+# `ActiveRecord::RecordInvalid`
+pub struct RecordInvalid
+  getter errors : Errors
+
+  def initialize(@errors : Errors)
+  end
+end
+
+impl Error for RecordInvalid
+  def message : String
+    "Validation failed: #{@errors}"
+  end
+end
+
+# `ActiveRecord::RecordNotUnique`: a unique index refused the write.
+pub struct RecordNotUnique
+  getter detail : String
+
+  def initialize(@detail : String)
+  end
+end
+
+impl Error for RecordNotUnique
+  def message : String
+    @detail
+  end
+end

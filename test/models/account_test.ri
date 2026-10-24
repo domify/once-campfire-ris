@@ -1,0 +1,82 @@
+# `test/models/account_test.rb`, `test/models/account/joinable_test.rb`
+module test/models/account_test
+
+import std/text
+import test/models/testing::*
+import models/account::{Account}
+import web/web/spec::*
+
+def signal(t : TestDb) : Account
+  Account.first(t.conn) || raise("no account")
+end
+
+describe "account settings" do
+  it "are written as the schematized JSON" do
+    t = TestDb.new
+    account = signal(t)
+    assert account.settings_json.nil?, "fixture leaves settings NULL"
+
+    settings = account.settings
+    settings.restrict_room_creation_to_administrators = "true"
+    assert settings.restrict_room_creation_to_administrators?
+    assert settings.to_json == %({"restrict_room_creation_to_administrators":true})
+
+    t.write { |tx| account.update(tx, settings: [{"restrict_room_creation_to_administrators", "true"}]) }
+    account = signal(t)
+    assert account.settings.restrict_room_creation_to_administrators?
+    assert account.settings_json == %({"restrict_room_creation_to_administrators":true})
+
+    settings = account.settings
+    settings.restrict_room_creation_to_administrators = "false"
+    assert !settings.restrict_room_creation_to_administrators?
+    assert settings.to_json == %({"restrict_room_creation_to_administrators":false})
+
+    t.write { |tx| account.update(tx, settings: [{"restrict_room_creation_to_administrators", "false"}]) }
+    assert !signal(t).settings.restrict_room_creation_to_administrators?
+  end
+
+  it "are left NULL when other attributes change" do
+    # What Rails does: `update!(name:)` on the fixture account doesn't write
+    # settings.
+    t = TestDb.new
+    account = signal(t)
+    t.write { |tx| account.update(tx, name: "X") }
+    account = signal(t)
+    assert account.name == "X"
+    assert account.settings_json.nil?
+  end
+
+  it "refuse unknown keys" do
+    t = TestDb.new
+    account = signal(t)
+    assert !t.write { |tx| account.update(tx, settings: [{"nope", "1"}]) }.nil?
+  end
+end
+
+describe "accounts" do
+  it "get a joinable code when created" do
+    t = TestDb.new
+    account = t.write do |tx|
+      tx.conn.execute("DELETE FROM accounts")
+      Account.create(tx, "Chat")
+    end
+    parts = account.join_code.split('-')
+    assert parts.size == 3
+    assert parts.all? { |part| part.bytesize == 4 && part.chars.all?(&.ascii_alphanumeric?) }
+    assert account.settings_json == %({"restrict_room_creation_to_administrators":false})
+    assert account.singleton_guard == 0
+  end
+
+  it "can only exist once" do
+    t = TestDb.new
+    assert panics? { t.write { |tx| Account.create(tx, "Second") }; nil }
+  end
+
+  it "can reset the join code" do
+    t = TestDb.new
+    before = signal(t).join_code
+    account = signal(t)
+    t.write { |tx| account.reset_join_code(tx) }
+    assert signal(t).join_code != before
+  end
+end

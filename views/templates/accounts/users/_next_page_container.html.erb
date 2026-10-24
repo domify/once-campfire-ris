@@ -1,0 +1,4 @@
+<%# reference/app/views/accounts/users/_next_page_container.html.erb -%>
+<%= turbo_frame_tag("next_page_container", attrs.loading("lazy").attr("src", "/account/users.turbo_stream?page=#{cgi_escape(page)}").class("flex center")) do %>
+  <div class="spinner center"></div>
+<% end %>

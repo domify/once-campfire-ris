@@ -1,0 +1,292 @@
+# `reference/app/channels`: `ApplicationCable::Connection` and every
+# channel, over `cable/cable`. Each matches its Ruby class: identifier,
+# streams, payloads and callback order (`on_subscribe` runs after
+# `subscribed`, before the confirmation). Ruby makes every public method an
+# action, a publicly redefined `subscribed` included, so those are
+# performable here too.
+module channels/channels
+
+import std/text
+import std/float
+import std/json::{Any}
+import rils/rails_compat/global_id::{GlobalId}
+import rils/kit/cookies::{CookieJar}
+import rils/record/sqlite::{Connection}
+import rils/record/database::{Tx}
+import models/room::{Room, RoomType, Membership}
+import models/session::{Session}
+import models/user::{User}
+import rils/ruby/integers::{integer_cast}
+import rils/cable/cable::{Identity, Channel, ChannelError, EmptyChannel, Subscription, CableServer, StreamsChannel, verified_stream_name_from_params}
+import config/app::{App}
+import channels/broadcasts::{room_gid_param, read_rooms_stream, unread_rooms_stream}
+
+# `connection_identifier`: the user's GlobalID, which
+# `remote_connections.where(current_user:)` matches.
+pub def user_identifier(user_id : Int64) : String
+  GlobalId.new("User", user_id).to_s
+end
+
+# `ApplicationCable::Connection#connect`: `current_user` from the signed
+# `session_token` cookie, or nil (`reject_unauthorized_connection`).
+pub def authenticate(app : App, cookie_headers : Array(String)) : Identity?
+  jar = CookieJar.from_headers(cookie_headers, app.secrets, app.stack.clock)
+  token = jar.signed("session_token") || return nil
+  user = app.db.read do |conn|
+    session = Session.find_by_token(conn, token)
+    session ? User.find_by_id(conn, session.user_id) : nil
+  end
+  user ? Identity.new(user.id, user.name, user_identifier(user.id)) : nil
+end
+
+# How Active Record casts a value for an integer `id` condition: numbers
+# truncate, booleans are 1 and 0, strings go through `to_i` unless they
+# don't start like a number, and anything else matches nothing.
+pub def cast_id(value : Any?) : Int64?
+  return nil unless value
+  raw = value.raw
+  case raw
+  when Int64   then raw
+  when Float64 then raw.finite? && raw.abs < 9.2e18 ? raw.to_i64 : nil
+  when Bool    then raw ? 1_i64 : 0_i64
+  when String  then integer_cast(raw)
+  else              nil
+  end
+end
+
+# `RoomChannel#subscribed`'s room: `current_user.rooms.find_by(id:
+# params[:room_id])`, streamed for, else rejected.
+def subscribe_room(app : App, sub : Subscription) : Room?
+  room_id = cast_id(sub.param("room_id"))
+  user_id = sub.identity.user_id
+  room = room_id ? app.db.read { |conn| Room.find_for_user(conn, user_id, room_id).as(Room?) } : nil
+  if room
+    sub.stream_for([room_gid_param(room)])
+  else
+    sub.reject
+  end
+  room
+end
+
+# `RoomChannel`
+pub class RoomChannel < Channel
+  @room : Room?
+
+  def initialize(@app : App)
+    @room = nil
+  end
+
+  pub def subscribed(sub : Subscription) : ChannelError?
+    @room = subscribe_room(@app, sub)
+    nil
+  end
+
+  pub def perform(action : String, data : Hash(String, Any), sub : Subscription) : Bool | ChannelError
+    return false unless action == "subscribed" && !sub.rejected
+    @room = subscribe_room(@app, sub)
+    true
+  end
+end
+
+# `PresenceChannel`: a `RoomChannel` that marks the membership connected
+# while subscribed and tells the user's other windows the room was read.
+pub class PresenceChannel < Channel
+  @room : Room?
+
+  def initialize(@app : App)
+    @room = nil
+  end
+
+  # `subscribed`, then `on_subscribe :present, unless: :subscription_rejected?`.
+  pub def subscribed(sub : Subscription) : ChannelError?
+    @room = subscribe_room(@app, sub)
+    sub.rejected ? nil : present(sub)
+  end
+
+  # `on_unsubscribe :absent, unless: :subscription_rejected?`.
+  pub def unsubscribed(sub : Subscription) : ChannelError?
+    sub.rejected ? nil : absent(sub)
+  end
+
+  pub def perform(action : String, data : Hash(String, Any), sub : Subscription) : Bool | ChannelError
+    return false if sub.rejected
+    failed = case action
+             when "present"    then present(sub)
+             when "absent"     then absent(sub)
+             when "refresh"    then with_membership(sub) { |membership, tx| membership.refresh_connection(tx) }
+             when "subscribed" then (@room = subscribe_room(@app, sub)) && nil
+             else                   return false
+             end
+    failed || true
+  end
+
+  # `membership.present`, then `broadcast_read_room`.
+  def present(sub : Subscription) : ChannelError?
+    failed = with_membership(sub) { |membership, tx| membership.present(tx) }
+    return failed if failed
+    room = @room || return nil
+    @app.broadcasts.read_room(sub.identity.user_id, room.id)
+    nil
+  end
+
+  def absent(sub : Subscription) : ChannelError?
+    with_membership(sub) { |membership, tx| membership.disconnected(tx) }
+  end
+
+  # `@room.memberships.find_by(user: current_user)`, which is nil (and so
+  # raises) once the membership is gone.
+  def with_membership(sub : Subscription, &change : Membership, Tx -> Nil) : ChannelError?
+    room = @room || return ChannelError.new("undefined method 'memberships' for nil")
+    user_id = sub.identity.user_id
+    found = @app.db.write do |tx|
+      membership = Membership.find_by_room_and_user(tx.conn, room.id, user_id)
+      change.call(membership, tx) if membership
+      !membership.nil?
+    end
+    found ? nil : ChannelError.new("undefined method for nil (membership)")
+  end
+end
+
+# `TypingNotificationsChannel`: a `RoomChannel` whose `start` and `stop`
+# go to everyone in the room.
+pub class TypingNotificationsChannel < Channel
+  @room : Room?
+
+  def initialize(@app : App)
+    @room = nil
+  end
+
+  pub def subscribed(sub : Subscription) : ChannelError?
+    @room = subscribe_room(@app, sub)
+    nil
+  end
+
+  pub def perform(action : String, data : Hash(String, Any), sub : Subscription) : Bool | ChannelError
+    return false if sub.rejected
+    case action
+    when "start", "stop"
+      room = @room || return ChannelError.new("undefined method 'to_gid_param' for nil")
+      identity = sub.identity
+      # `broadcast_to @room, action:, user: current_user.slice(:id, :name)`
+      sub.broadcast_to([room_gid_param(room)], Any.new({"action" => Any.new(action), "user" => Any.new({"id" => Any.new(identity.user_id), "name" => Any.new(identity.name)})}))
+      true
+    when "subscribed"
+      @room = subscribe_room(@app, sub)
+      true
+    else
+      false
+    end
+  end
+end
+
+# `ReadRoomsChannel` and `UnreadRoomsChannel`: the user's own stream.
+pub class UserStreamChannel < Channel
+  def initialize(@stream : Proc(Int64, String))
+  end
+
+  pub def subscribed(sub : Subscription) : ChannelError?
+    sub.stream_from(@stream.call(sub.identity.user_id))
+    nil
+  end
+
+  # `subscribed` is public, so it's an action too.
+  pub def perform(action : String, data : Hash(String, Any), sub : Subscription) : Bool | ChannelError
+    return false unless action == "subscribed"
+    subscribed(sub)
+    true
+  end
+end
+
+pub STREAM_SUFFIX = "messages"
+
+# `RoomMessagesChannel.guarded_stream?`: the stream names this channel
+# guards, whoever is asking; also `Turbo::StreamsChannel`'s guard.
+pub def guarded_stream?(name : String) : Bool
+  _, colon, suffix = name.partition(':')
+  !colon.empty? && suffix == STREAM_SUFFIX
+end
+
+# Constants a GID could name that aren't rooms (`only: Room` turns them
+# away without raising).
+KNOWN_MODELS = ["Account", "Ban", "Boost", "Current", "Membership", "Message", "Push::Subscription", "Search", "Session", "User", "Webhook"]
+
+# `RoomMessagesChannel.subscribable_room(user, stream_name)`.
+def subscribable_room(conn : Connection, user_id : Int64, name : String) : Room? | ChannelError
+  gid_param, colon, suffix = name.partition(':')
+  return nil unless !colon.empty? && suffix == STREAM_SUFFIX
+  room = room_from(conn, gid_param)
+  return room if room.is_a?(ChannelError)
+  room ? Room.find_for_user(conn, user_id, room.id) : nil
+end
+
+# `GlobalID::Locator.locate gid_param, only: Room`, `RecordNotFound` as nil.
+def room_from(conn : Connection, gid_param : String) : Room? | ChannelError
+  gid = GlobalId.parse(gid_param) || GlobalId.from_param(gid_param) || return nil
+  required = nil.as(RoomType?)
+  unless gid.model_name == "Room"
+    required = RoomType.from_class_name(gid.model_name)
+    unless required
+      return nil if KNOWN_MODELS.includes?(gid.model_name)
+      # `model_name.constantize` raises NameError.
+      return ChannelError.new("uninitialized constant #{gid.model_name}")
+    end
+  end
+  id = gid.id.to_i64? || return nil
+  room = Room.find_by_id(conn, id) || return nil
+  required && required != room.room_type ? nil : room
+end
+
+# `RoomMessagesChannel`: a room's message stream, only to a current
+# member of the room the verified stream name points at.
+pub class RoomMessagesChannel < Channel
+  def initialize(@app : App)
+  end
+
+  pub def subscribed(sub : Subscription) : ChannelError?
+    name = authorized_stream_name(sub)
+    return name if name.is_a?(ChannelError)
+    name ? sub.stream_from(name) : sub.reject
+    nil
+  end
+
+  def authorized_stream_name(sub : Subscription) : String? | ChannelError
+    name = verified_stream_name_from_params(@app.secrets, sub.params)
+    return name if name.is_a?(ChannelError)
+    return nil if name.nil? || name.strip.empty?
+    room = @app.db.read { |conn| subscribable_room(conn, sub.identity.user_id, name) }
+    return room if room.is_a?(ChannelError)
+    room ? name : nil
+  end
+
+  # Its public methods: `subscribed`, and `verified_stream_name_from_params`
+  # (which transmits nothing).
+  pub def perform(action : String, data : Hash(String, Any), sub : Subscription) : Bool | ChannelError
+    return false if sub.rejected
+    case action
+    when "subscribed"
+      failed = subscribed(sub)
+      failed || true
+    when "verified_stream_name_from_params"
+      found = verified_stream_name_from_params(@app.secrets, sub.params)
+      found.is_a?(ChannelError) ? found : true
+    else
+      false
+    end
+  end
+end
+
+# The cable server with every channel registered under its Ruby class
+# name.
+pub def cable_server(app : App) : CableServer
+  server = CableServer.new(app.pubsub)
+  server.register_channel("ApplicationCable::Channel", -> { EmptyChannel.new.as(Channel) })
+  server.register_channel("HeartbeatChannel", -> { EmptyChannel.new.as(Channel) })
+  server.register_channel("PresenceChannel", -> { PresenceChannel.new(app).as(Channel) })
+  server.register_channel("ReadRoomsChannel", -> { UserStreamChannel.new(->(id : Int64) { read_rooms_stream(id) }).as(Channel) })
+  server.register_channel("UnreadRoomsChannel", -> { UserStreamChannel.new(->(id : Int64) { unread_rooms_stream(id) }).as(Channel) })
+  server.register_channel("RoomChannel", -> { RoomChannel.new(app).as(Channel) })
+  server.register_channel("RoomMessagesChannel", -> { RoomMessagesChannel.new(app).as(Channel) })
+  server.register_channel("TypingNotificationsChannel", -> { TypingNotificationsChannel.new(app).as(Channel) })
+  server.register_channel("Turbo::StreamsChannel", -> { StreamsChannel.new(app.secrets, ->(name : String) { guarded_stream?(name) }).as(Channel) })
+  server
+end

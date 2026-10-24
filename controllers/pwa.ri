@@ -1,0 +1,61 @@
+# `PwaController` (reference/app/controllers/pwa_controller.rb): the web app
+# manifest and the service worker at stable URLs, and `QrCodeController`
+# (reference/app/controllers/qr_code_controller.rb).
+module controllers/pwa
+
+import rils/template/template::{Buffer}
+import std/text
+import rils/rails_compat/encoding::{urlsafe_decode}
+import models/account::{Account}
+import rils/routes/paths::{fresh_account_logo_path}
+import rils/kit/ctx::{Ctx, ActionResult, ExpiresIn}
+import rils/kit/errors::{HttpError}
+import rils/kit/response::{Response}
+import rils/kit/format::{JS, JSON_MIME}
+import views/pwa::{Manifest, ServiceWorker}
+import config/app::{App}
+import views/helpers/user_paths::{to_fs_number}
+import controllers/concerns::{Before, before_actions}
+import controllers/qr_code/rqrcode::{svg_bytes}
+
+# `allow_unauthenticated_access`, `skip_forgery_protection`
+def pwa_before : Before
+  before = Before.unauthenticated
+  before.forgery_protection = false
+  before
+end
+
+# `pwa/service_worker.js`
+pub def service_worker(app : App, c : Ctx) : ActionResult
+  passed = before_actions(app, c, pwa_before)
+  return passed if passed.is_a?(HttpError)
+  format = c.respond_to([JS])
+  return format if format.is_a?(HttpError)
+  c.render_as(200, "text/javascript; charset=utf-8", app.written(->(buffer : Buffer) { ServiceWorker.new.render_into(buffer) }))
+end
+
+# `pwa/manifest.json.erb`
+pub def manifest(app : App, c : Ctx) : ActionResult
+  passed = before_actions(app, c, pwa_before)
+  return passed if passed.is_a?(HttpError)
+  format = c.respond_to([JSON_MIME])
+  return format if format.is_a?(HttpError)
+  account = app.db.read { |conn| Account.first(conn) }
+  v = account ? to_fs_number(account.updated_at) : nil
+  view = Manifest.new(app.view_context(c.request), account ? account.name : nil, fresh_account_logo_path(v, "small"), fresh_account_logo_path(v, nil))
+  c.render_as(200, "application/json; charset=utf-8", app.written(->(buffer : Buffer) { view.render_into(buffer) }))
+end
+
+# `QrCodeController#show` (`allow_unauthenticated_access`): the QR code of
+# the Base64url-encoded URL, cached for a year.
+pub def show_qr_code(app : App, c : Ctx) : ActionResult
+  passed = before_actions(app, c, Before.unauthenticated)
+  return passed if passed.is_a?(HttpError)
+  # `Base64.urlsafe_decode64` raises on malformed input (a 500).
+  url = urlsafe_decode(c.param_str("id") || "") || return HttpError.internal("invalid base64")
+  # Too much to encode is the client's doing.
+  svg = svg_bytes(url) || return HttpError.status(422)
+  # `expires_in 1.year, public: true`
+  c.expires_in(31_556_952_i64, ExpiresIn.new(public: true))
+  c.render_as(200, "image/svg+xml; charset=utf-8", svg)
+end

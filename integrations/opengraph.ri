@@ -1,0 +1,304 @@
+# Link unfurling: `UnfurlLinksController#create`
+# (reference/app/controllers/unfurl_links_controller.rb) over
+# `Opengraph::Metadata`, `Location`, `Fetch` and `Document`
+# (reference/app/models/opengraph).
+#
+# Every address is resolved through the private network guard and pinned,
+# every redirect is re-checked, and documents are capped at 5MB and 10
+# responses. Unlike Rails, which gives each connect and read 60 seconds,
+# each request here has 5.
+module integrations/opengraph
+
+import std/text
+import rils/ruby/text::{strip}
+import std/json::{Any}
+import rils/rails_compat/json::{encode}
+import rils/ruby/uri_parser::{Uri, UriError, parse_uri}
+import rils/richtext/richtext::{strip_and_sanitize}
+import integrations/net::{Http, HttpAnswer, NetError, GuardError}
+import integrations/opengraph/html::{decode, meta_elements, meta_encoding, Element}
+
+TWITTER_HOSTS                 = ["twitter.com", "www.twitter.com", "x.com", "www.x.com"]
+FX_TWITTER_HOST               = "fxtwitter.com"
+ALLOWED_IMAGE_CONTENT_TYPES   = ["image/jpeg", "image/png", "image/gif", "image/webp"]
+ALLOWED_DOCUMENT_CONTENT_TYPE = "text/html"
+MAX_BODY_SIZE                 = 5_i64 * 1024 * 1024
+MAX_REDIRECTS                 = 10
+REQUEST_TIMEOUT_MS            = 5000
+
+# `Opengraph::Metadata::ATTRIBUTES`, in the order `Hash#slice` returns them.
+ATTRIBUTES = ["title", "url", "image", "description"]
+
+# `FILES_AND_MEDIA_URL_REGEX`'s extensions.
+FILE_AND_MEDIA_EXTENSIONS = ["zip", "tar", "tar.gz", "tar.bz2", "tar.xz", "gz", "bz2", "rar", "7z", "dmg", "exe", "msi", "pkg", "deb", "iso",
+                             "jpg", "jpeg", "png", "gif", "bmp", "mp4", "mov", "avi", "mkv", "wmv", "flv", "heic", "heif", "mp3", "wav",
+                             "ogg", "aac", "wma", "webm", "ogv", "mpg", "mpeg"]
+
+# Where the Rails action raises (a 500).
+pub class UnfurlError
+  getter message : String
+
+  def initialize(@message : String)
+  end
+end
+
+# `String#blank?`: empty or only whitespace.
+def blank?(text : String) : Bool
+  text.each_char { |char| return false unless char.whitespace? }
+  true
+end
+
+def word_char?(char : Char) : Bool
+  char.ascii_letter? || char.ascii_number? || char == '_'
+end
+
+# `FILES_AND_MEDIA_URL_REGEX`: `\bhttps?://\S+\.(?:ext...)\b`.
+def file_or_media_url?(url : String) : Bool
+  at = 0
+  while start = url.byte_index("http", at)
+    at = start + 1
+    next if start > 0 && word_char?(url[start - 1])
+    rest = url[start, url.bytesize - start]
+    scheme_end = rest.starts_with?("https://") ? 8 : (rest.starts_with?("http://") ? 7 : next)
+    tail = rest[scheme_end, rest.bytesize - scheme_end]
+    run = String.build { |io| tail.each_char { |char| char.whitespace? ? break : (io << char) } }
+    # `\S+\.` backtracks: any dot after the first character of the run.
+    (1...run.bytesize).each do |dot|
+      next unless run[dot] == '.'
+      after = run[dot + 1, run.bytesize - dot - 1]
+      FILE_AND_MEDIA_EXTENSIONS.each do |extension|
+        next unless after.starts_with?(extension)
+        following = after.bytesize > extension.bytesize ? after[extension.bytesize] : nil
+        return true if following.nil? || !word_char?(following)
+      end
+    end
+  end
+  false
+end
+
+class FetchFailure
+  getter message : String
+
+  def initialize(@message : String)
+  end
+end
+
+# `Opengraph::Location`: a URL that is valid when it parses as http(s) and
+# its host resolves to a public address, memoized and pinned for the fetch.
+class Location
+  @parsed : Uri?
+  @resolved : String?
+  @looked_up : Bool
+
+  def initialize(@http : Http, @url : String?)
+    url = @url
+    parsed = url ? parse_uri(url) : nil
+    @parsed = parsed.is_a?(Uri) ? parsed : nil
+    @resolved = nil
+    @looked_up = false
+  end
+
+  # `valid?`: both validations run, so the host is resolved even for a
+  # non-http URL.
+  def valid? : Bool
+    parsed = @parsed
+    http = !parsed.nil? && parsed.http?
+    public = !resolved_ip.nil?
+    http && public
+  end
+
+  # `PrivateNetworkGuard.resolve(parsed_url.host) rescue nil`, memoized.
+  def resolved_ip : String?
+    return @resolved if @looked_up
+    @looked_up = true
+    parsed = @parsed
+    host = parsed ? parsed.host : nil
+    if host
+      found = @http.resolve(host)
+      @resolved = found.is_a?(String) ? found : nil
+    end
+    @resolved
+  end
+
+  # `read_html`: nothing for invalid URLs or ones that look like files.
+  def read_html : String?
+    return nil if !valid? || file_or_media_url?(@url || "")
+    url = @parsed || return nil
+    ip = resolved_ip || return nil
+    fetched = fetch_document(@http, url, ip)
+    if fetched.is_a?(FetchFailure)
+      STDERR.puts "Failed to fetch #{url.to_s} at #{ip} (#{fetched.message})"
+      return nil
+    end
+    fetched
+  end
+
+  # `fetch_content_type`
+  def fetch_content_type : String?
+    return nil unless valid?
+    url = @parsed || return nil
+    ip = resolved_ip || return nil
+    answer = request(@http, url, ip, "HEAD")
+    if answer.is_a?(HttpAnswer)
+      answer.headers["content-type"]?
+    else
+      STDERR.puts "Failed to fetch #{url.to_s} at #{ip} (#{answer})"
+      nil
+    end
+  end
+end
+
+# `Opengraph::Fetch#fetch_document`: a 200 `text/html` of at most 5MB.
+def fetch_document(http : Http, url : Uri, ip : String) : String? | FetchFailure
+  answer = request(http, url, ip, "GET")
+  return FetchFailure.new(answer) unless answer.is_a?(HttpAnswer)
+  # `Net::HTTPHeader#content_type`: each part stripped, the case kept.
+  main, slash, sub = (answer.headers["content-type"]? || "").partition(';')[0].partition('/')
+  type = slash.empty? ? strip(main) : "#{strip(main)}/#{strip(sub)}"
+  return nil unless answer.status == 200 && type == ALLOWED_DOCUMENT_CONTENT_TYPE
+  length = answer.headers["content-length"]?
+  return nil if length && (length.to_i64? || 0_i64) > MAX_BODY_SIZE
+  answer.body.bytesize > MAX_BODY_SIZE ? nil : answer.body
+end
+
+# Follows up to 10 responses (any 3xx is a redirect), each target parsed,
+# required to be http(s), and resolved through the guard again. A failure
+# is its message.
+def request(http : Http, start : Uri, start_ip : String, method : String) : HttpAnswer | String
+  url = start
+  ip = start_ip
+  MAX_REDIRECTS.times do
+    answer = http.request(method, url.to_s, ip, timeout_ms: REQUEST_TIMEOUT_MS, max_bytes: MAX_BODY_SIZE)
+    return answer.message if answer.is_a?(NetError)
+    return answer unless answer.status >= 300 && answer.status < 400
+    location = answer.headers["location"]? || return "bad URI"
+    target = parse_uri(location)
+    return "bad URI" if target.is_a?(UriError)
+    return "Opengraph::Fetch::RedirectDeniedError" unless target.http?
+    resolved = http.resolve(target.host || "")
+    return resolved.message if resolved.is_a?(GuardError)
+    url = target
+    ip = resolved
+  end
+  "Opengraph::Fetch::TooManyRedirectsError"
+end
+
+# `Opengraph::Document#opengraph_attributes`: from each `meta` whose
+# `property` or `name` starts with "og:", the key with every "og:" removed
+# and its non-blank `content`; later tags win. Without a meta charset,
+# non-ASCII characters are dropped.
+pub def opengraph_attributes(body : String?) : Array(Tuple(String, String))
+  metas = meta_elements(decode(body || ""))
+  encoded = !meta_encoding(metas).nil?
+  found = {} of String => String
+  metas.each do |meta|
+    next unless (meta.attr("property") || "").starts_with?("og:") || (meta.attr("name") || "").starts_with?("og:")
+    key = meta.has_attr?("property") ? "property" : "name"
+    name = (meta.attr(key) || "").gsub("og:", "")
+    next unless ATTRIBUTES.includes?(name)
+    content = meta.attr("content") || next
+    next if blank?(content)
+    found[name] = encoded ? content : String.build { |io| content.each_char { |char| io << char if char.ord < 128 } }
+  end
+  ATTRIBUTES.compact_map { |name| (value = found[name]?) ? {name, value} : nil }
+end
+
+# `Opengraph::Metadata`: its attributes in the order they were first
+# assigned, which is the order `render json:` emits them.
+pub class Metadata
+  getter attributes : Array(Tuple(String, String?))
+
+  def initialize(@attributes : Array(Tuple(String, String?)))
+  end
+
+  pub def [](key : String) : String?
+    found = @attributes.find { |attribute| attribute[0] == key }
+    found ? found[1] : nil
+  end
+
+  def assign(key : String, value : String?) : Nil
+    if at = @attributes.index { |attribute| attribute[0] == key }
+      @attributes[at] = {key, value}
+    else
+      @attributes << {key, value}
+    end
+  end
+
+  # `valid?`: sanitizes the title and description first
+  # (`before_validation`), then checks presence and, with an image, that
+  # it's a valid location.
+  pub def validate(http : Http) : Bool | UnfurlError
+    ["title", "description"].each do |key|
+      if value = self[key]
+        sanitized = strip_and_sanitize(value) || return UnfurlError.new("ArgumentError")
+        assign(key, sanitized)
+      end
+    end
+    present = ->(key : String) { (value = self[key]) ? !blank?(value) : false }
+    valid = present.call("title") && present.call("url") && present.call("description")
+    if (image = self["image"]) && !blank?(image)
+      valid = Location.new(http, image).valid? && valid
+    end
+    valid
+  end
+
+  # `render json: opengraph` after `valid?`: `instance_values`, which by
+  # then include the validation context and the (empty) errors.
+  pub def to_json : String
+    String.build do |io|
+      io << '{'
+      @attributes.each do |key, value|
+        io << encode(Any.new(key)) << ':' << encode(Any.new(value)) << ','
+      end
+      io << %("context_for_validation":{"context":null},"errors":{}})
+    end
+  end
+end
+
+# `Metadata.from_url(url)`.
+pub def metadata_from_url(http : Http, url : String) : Metadata | UnfurlError
+  body = fetch_page(http, url)
+  return body if body.is_a?(UnfurlError)
+  found = opengraph_attributes(body)
+  og = ->(key : String) { (pair = found.find { |attribute| attribute[0] == key }) ? pair[1] : nil }
+  metadata = Metadata.new(found.map { |key, value| {key, value.as(String?)} })
+  # `valid_canonical_url(url, fallback)`
+  canonical = og.call("url")
+  metadata.assign("url", canonical && Location.new(http, canonical).valid? ? canonical : url)
+  metadata.assign("image", valid_image(http, og.call("image")))
+  metadata
+end
+
+# `fetch_document(untrusted_url)`: tweets are read through fxtwitter.com.
+# A tweet whose page can't be read raises (`nil.force_encoding`), as does a
+# URL `URI.parse` rejects with `URI::InvalidComponentError`.
+def fetch_page(http : Http, url : String) : String? | UnfurlError
+  parsed = parse_uri(url)
+  if parsed.is_a?(UriError)
+    return UnfurlError.new("URI::InvalidComponentError") if parsed.component
+    return Location.new(http, url).read_html
+  end
+  tweet = TWITTER_HOSTS.includes?(parsed.host || "") && (path = parsed.path) && !blank?(path) && path != "/"
+  return Location.new(http, url).read_html unless tweet
+  parsed.host = FX_TWITTER_HOST
+  Location.new(http, parsed.to_s).read_html || UnfurlError.new("NoMethodError")
+end
+
+# `valid_image_content_type(image)`: kept only when a HEAD says it's a
+# JPEG, PNG, GIF or WebP.
+def valid_image(http : Http, image : String?) : String?
+  return nil if image.nil? || blank?(image)
+  return nil if parse_uri(image).is_a?(UriError)
+  type = Location.new(http, image).fetch_content_type || return nil
+  ALLOWED_IMAGE_CONTENT_TYPES.includes?(type.downcase) ? image : nil
+end
+
+# The action after `params.require(:url)`: the JSON to render, nil for
+# `head :no_content`.
+pub def unfurl(http : Http, url : String) : String? | UnfurlError
+  metadata = metadata_from_url(http, url)
+  return metadata if metadata.is_a?(UnfurlError)
+  valid = metadata.validate(http)
+  return valid if valid.is_a?(UnfurlError)
+  valid ? metadata.to_json : nil
+end

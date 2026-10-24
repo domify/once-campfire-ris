@@ -1,0 +1,22 @@
+<%# reference/app/views/accounts/bots/edit.html.erb %>
+<% content_for "nav" do %>  <div class="flex-item-justify-start">
+    <%= link_back_to(ctx, account_bots_path) %>
+  </div>
+<% end %>
+<section class="panel" style="view-transition-name: chat-bot-<%= bot_id %>">
+  <% form = form_with(account_bot_path(bot_id)).model("user").method("patch").multipart.class("flex flex-column gap") %><%= form.wrap do %>
+    <% include "accounts/bots/_form.html.erb" %>
+<% end %>
+  <hr class="separator full-width margin-block-double">
+
+  <div class="flex align-center gap justify-space-between">
+    <%= button_to(account_bot_path(bot_id), attrs.method("delete").class("btn txt--small btn--negative").aria("label", "Delete this chat bot").data("turbo_confirm", "Are you sure you want to permanently remove this bot from the account? This can’t be undone.")) do %>
+      <%= image_tag(ctx, "trash.svg", attrs.aria_hidden.size(20)) %>
+      <%= image_tag(ctx, "bot.svg", attrs.aria_hidden.size(20)) %>
+<% end %>
+    <%= button_to(account_bot_key_path(bot_id), attrs.method("put").class("btn full-width txt--small btn--negative").aria("label", "Generate a new key").data("turbo_confirm", "Are you sure you want to change the bot key? All usage of this bot must be updated.")) do %>
+      <%= image_tag(ctx, "refresh.svg", attrs.aria_hidden.size(20)) %>
+      <%= image_tag(ctx, "key.svg", attrs.aria_hidden.size(20)) %>
+<% end %>  </div>
+</section>
+

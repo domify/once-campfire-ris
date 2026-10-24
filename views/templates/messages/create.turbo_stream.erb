@@ -1,0 +1,2 @@
+<%# reference/app/views/messages/create.turbo_stream.erb -%>
+<turbo-stream action="append" target="messages_rooms_<%= room_kind %>_<%= message.room_id %>"><template><%= message_fragment(ctx, message) %></template></turbo-stream>

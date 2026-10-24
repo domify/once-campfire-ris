@@ -1,0 +1,141 @@
+# `Time.current` the app reads, `ActiveSupport::Testing::TimeHelpers` as the
+# same clock moved by hand, and the timestamp formats Rails' messages carry.
+#
+# The models, cookies and sessions read the time from a `Clock` as they go;
+# what needs it once (verifiers, storage) takes a `now` argument instead.
+# Parity runs freeze the whole app (`CAMPFIRE_FROZEN_TIME`), and tests move
+# one.
+module rils/rails_compat/clock
+
+import std/time::{Time, Span}
+import std/text
+
+# Real time, shifted by `travel`, or frozen with `travel_to`.
+pub class Clock
+  @offset : Span
+  @frozen : Time?
+
+  def initialize
+    @offset = Span.zero
+    @frozen = nil
+  end
+
+  pub def self.frozen_at(at : Time) : Clock
+    clock = Clock.new
+    clock.travel_to(at)
+    clock
+  end
+
+  pub def now : Time
+    @frozen || Time.utc + @offset
+  end
+
+  # `travel_to`: freezes time at *at*.
+  pub def travel_to(at : Time) : Nil
+    @frozen = at
+  end
+
+  # `travel`: moves the clock forward by *by*, keeping it frozen if it was.
+  pub def travel(by : Span) : Nil
+    if frozen = @frozen
+      @frozen = frozen + by
+    else
+      @offset = @offset + by
+    end
+  end
+
+  pub def travel_back : Nil
+    @offset = Span.zero
+    @frozen = nil
+  end
+end
+
+# `Time#iso8601(3)` in UTC: `2046-01-01T12:00:00.000Z` (fraction truncated,
+# not rounded).
+pub def iso8601_millis(time : Time) : String
+  "#{Time.pad4(time.year)}-#{Time.pad2(time.month)}-#{Time.pad2(time.day)}T#{Time.pad2(time.hour)}:#{Time.pad2(time.minute)}:#{Time.pad2(time.second)}.#{Time.pad3(time.millisecond)}Z"
+end
+
+# `n.years.from_now`: calendar years, the 29th of February landing on the
+# 28th when the year it lands in has none.
+pub def add_years(time : Time, years : Int32) : Time
+  year = time.year + years
+  day = time.day
+  day = Time.days_in_month(year, time.month) if day > Time.days_in_month(year, time.month)
+  Time.utc(year, time.month, day, time.hour, time.minute, time.second, 0, time.nanosecond)
+end
+
+# An RFC 3339 timestamp (`2046-01-01T12:00:00.000Z`, `...+02:00`, a fraction
+# of any length), or nil for anything else.
+pub def parse_timestamp(text : String) : Time?
+  timestamp_in(text)
+end
+
+# `parse_timestamp` of text on the tape, read where it lies.
+pub def parse_timestamp(text : Str) : Time?
+  timestamp_in(text)
+end
+
+def timestamp_in(text : T) : Time? forall T
+  size = text.bytesize
+  return nil if size < 20
+  year = digits(text, 0, 4)
+  month = digits(text, 5, 2)
+  day = digits(text, 8, 2)
+  hour = digits(text, 11, 2)
+  minute = digits(text, 14, 2)
+  second = digits(text, 17, 2)
+  return nil unless year && month && day && hour && minute && second
+  return nil unless byte_of(text, 4) == '-'.ord && byte_of(text, 7) == '-'.ord && byte_of(text, 13) == ':'.ord && byte_of(text, 16) == ':'.ord
+  return nil unless byte_of(text, 10) == 'T'.ord || byte_of(text, 10) == 't'.ord || byte_of(text, 10) == ' '.ord
+  return nil if month < 1 || month > 12 || day < 1 || day > Time.days_in_month(year, month)
+  return nil if hour > 23 || minute > 59 || second > 60
+  i = 19
+  nanosecond = 0
+  if i < size && byte_of(text, i) == '.'.ord
+    i += 1
+    scale = 100_000_000
+    start = i
+    while i < size && byte_of(text, i) >= 48 && byte_of(text, i) <= 57
+      nanosecond += (byte_of(text, i) - 48).to_i32 * scale
+      scale //= 10
+      i += 1
+    end
+    return nil if i == start
+  end
+  return nil if i >= size
+  offset = 0
+  if byte_of(text, i) == 'Z'.ord || byte_of(text, i) == 'z'.ord
+    i += 1
+  elsif byte_of(text, i) == '+'.ord || byte_of(text, i) == '-'.ord
+    sign = byte_of(text, i) == '-'.ord ? -1 : 1
+    offset_hours = digits(text, i + 1, 2)
+    offset_minutes = digits(text, i + 4, 2)
+    return nil unless offset_hours && offset_minutes && i + 3 < size && byte_of(text, i + 3) == ':'.ord
+    offset = sign * (offset_hours * 60 + offset_minutes)
+    i += 6
+  else
+    return nil
+  end
+  return nil unless i == size
+  Time.utc(year, month, day, hour, minute, second > 59 ? 59 : second, 0, nanosecond) - Span.minutes(offset.to_i64)
+end
+
+def digits(text : T, start : Int32, count : Int32) : Int32? forall T
+  return nil if start + count > text.bytesize
+  value = 0
+  count.times do |i|
+    byte = byte_of(text, start + i)
+    return nil unless byte >= 48 && byte <= 57
+    value = value * 10 + (byte - 48).to_i32
+  end
+  value
+end
+
+def byte_of(text : String, index : Int32) : UInt8
+  text.as_tape[index]
+end
+
+def byte_of(text : Str, index : Int32) : UInt8
+  text[index]
+end

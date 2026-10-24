@@ -1,0 +1,138 @@
+# The Rust port's tests of the param builder, each value checked against
+# `ActionDispatch::ParamBuilder.from_query_string` in the reference.
+module rils/kit/params_test
+
+import std/json::{JSON, Any}
+import rils/rails_compat/json::{generate}
+import rils/kit/params::*
+import web/web/spec::*
+
+def parse(query : String) : String
+  result = from_query_string(query)
+  raise "#{query}: #{result.message}" if result.is_a?(ParamError)
+  generate(result.to_json_any)
+end
+
+def error_kind(query : String) : ParamErrorKind?
+  result = from_query_string(query)
+  result.is_a?(ParamError) ? result.kind : nil
+end
+
+describe "params" do
+  it "split flat pairs" do
+    assert parse("a=1&b=2") == %({"a":"1","b":"2"})
+    assert parse("") == %({})
+    assert parse("a") == %({"a":null})
+    assert parse("a=") == %({"a":""})
+    assert parse("a=1&a=2") == %({"a":"2"})
+    assert parse("&&a=1&") == %({"a":"1"})
+    assert parse("a=1&  b=2") == %({"a":"1","b":"2"})
+    assert parse("=1") == %({})
+    assert parse("a=b=c") == %({"a":"b=c"})
+    assert parse("a;b=1") == %({"a;b":"1"})
+  end
+
+  it "decode" do
+    assert parse("a=x+y%20z") == %({"a":"x y z"})
+    assert parse("a%5Bb%5D=1") == %({"a":{"b":"1"}})
+    assert parse("caf%C3%A9=%E2%9C%93") == %({"café":"✓"})
+    assert error_kind("a=%") == ParamErrorKind::Invalid
+    assert error_kind("a=%zz") == ParamErrorKind::Invalid
+    assert error_kind("a=%FF") == ParamErrorKind::Invalid
+    # An empty top-level key is skipped before the encoding check.
+    assert parse("=%FF") == %({})
+  end
+
+  it "nest hashes" do
+    assert parse("a[b]=1") == %({"a":{"b":"1"}})
+    assert parse("a[b][c]=1&a[b][d]=2") == %({"a":{"b":{"c":"1","d":"2"}}})
+    assert parse("a[b]c=1") == %({"a":{"b":{"c":"1"}}})
+    assert parse("[a]=1") == %({"[a]":"1"})
+    assert parse("a[=1") == %({"a[":"1"})
+    assert parse("a[b=1") == %({"a":{"[b":"1"}})
+    assert parse("a]=1") == %({"a]":"1"})
+    assert parse("a[]]=1") == %({"a":[{"]":"1"}]})
+    assert parse("a[[]]=1") == %({"a":{"[":{"]":"1"}}})
+  end
+
+  it "build arrays" do
+    assert parse("a[]=1&a[]=2") == %({"a":["1","2"]})
+    assert parse("a[]") == %({"a":[]})
+    assert parse("a[]=&a[]") == %({"a":[""]})
+    assert parse("a[][]=1") == %({"a":[["1"]]})
+    assert parse("a[][]") == %({"a":[[]]})
+    assert parse("a[b][]=1&a[b][]=2") == %({"a":{"b":["1","2"]}})
+  end
+
+  it "put hashes inside arrays" do
+    assert parse("a[][b]=1&a[][c]=2&a[][b]=3") == %({"a":[{"b":"1","c":"2"},{"b":"3"}]})
+    assert parse("a[][b][c]=1&a[][b][d]=2") == %({"a":[{"b":{"c":"1","d":"2"}}]})
+    assert parse("a[][b][c]=1&a[][b][c]=2") == %({"a":[{"b":{"c":"1"}},{"b":{"c":"2"}}]})
+    assert parse("a[][b][]=1&a[][b][]=2") == %({"a":[{"b":["1","2"]}]})
+    assert parse("a[]b=1") == %({"a":[{"b":"1"}]})
+    assert parse("a[][b]") == %({"a":[{"b":null}]})
+  end
+
+  it "replace nil by structure" do
+    # `||=` treats nil as unset.
+    assert parse("a&a[]=1") == %({"a":["1"]})
+    assert parse("a&a[b]=1") == %({"a":{"b":"1"}})
+  end
+
+  it "refuse type conflicts" do
+    ["a=1&a[]=2", "a=1&a[b]=2", "a[]=1&a[b]=2", "a[b]=1&a[]=2", "a[b]=1&a[b][c]=2"].each do |query|
+      assert error_kind(query) == ParamErrorKind::Type, query
+    end
+  end
+
+  it "stop at the depth limit" do
+    assert error_kind("a#{"[b]" * (DEPTH_LIMIT - 1)}=1").nil?
+    assert error_kind("a#{"[b]" * DEPTH_LIMIT}=1") == ParamErrorKind::TooDeep
+  end
+
+  it "limit form bodies" do
+    pairs = form_pairs("a=1\0")
+    raise "form" if pairs.is_a?(ParamError)
+    built = from_pairs(pairs)
+    raise "built" if built.is_a?(ParamError)
+    assert generate(built.to_json_any) == %({"a":"1"})
+    many = form_pairs(Array.new(FORM_PARAMS_LIMIT + 1, "a=1").join("&"))
+    assert many.is_a?(ParamError) && many.kind.limit?
+  end
+
+  it "deep munge JSON bodies" do
+    params = from_json_body(%({"a": [1, null, "x"], "b": {"c": null}, "d": true}))
+    raise "json" if params.is_a?(ParamError)
+    assert generate(params.to_json_any) == %({"a":[1,"x"],"b":{"c":null},"d":true})
+    wrapped = from_json_body("[1,2]")
+    raise "json" if wrapped.is_a?(ParamError)
+    assert generate(wrapped.to_json_any) == %({"_json":[1,2]})
+    bad = from_json_body("{bad")
+    assert bad.is_a?(ParamError) && bad.kind.parse?
+  end
+
+  it "require and permit" do
+    params = from_query_string("user[name]=Jo&user[admin]=1&user[tags][]=a&user[settings][x][y]=1&user[bad][]=1&blank=+&user[date(1i)]=2024")
+    raise "params" if params.is_a?(ParamError)
+    assert params.require("blank").nil?
+    assert params.require("missing").nil?
+    user = params.require("user") || raise("no user")
+    permitted = user.permit([Permit.new("name"), Permit.new("date"), Permit.array("tags"), Permit.any_hash("settings"), Permit.new("bad")])
+    assert generate(permitted.to_json_any) == %({"name":"Jo","date(1i)":"2024","tags":["a"],"settings":{"x":{"y":"1"}}})
+  end
+
+  it "permit nested filters" do
+    params = from_query_string("a[b][c]=1&a[b][d]=2&list[][c]=1&list[][d]=2&ff[0][c]=1&ff[1][c]=2")
+    raise "params" if params.is_a?(ParamError)
+    nested = [Permit.new("c")]
+    permitted = params.permit([Permit.nested("a", [Permit.nested("b", nested)]), Permit.nested("list", nested), Permit.nested("ff", nested)])
+    assert generate(permitted.to_json_any) == %({"a":{"b":{"c":"1"}},"list":[{"c":"1"}],"ff":{"0":{"c":"1"},"1":{"c":"2"}}})
+  end
+
+  it "fetch with a default" do
+    params = from_query_string("user_ids[]=1&user_ids[]=2")
+    raise "params" if params.is_a?(ParamError)
+    assert generate(params.fetch("user_ids", Param.new([] of Param)).to_json_any) == %(["1","2"])
+    assert generate(params.fetch("nope", Param.new([] of Param)).to_json_any) == %([])
+  end
+end

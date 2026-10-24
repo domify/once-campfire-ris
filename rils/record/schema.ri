@@ -1,0 +1,110 @@
+# The schema exactly as `bin/rails db:prepare` creates it on a fresh
+# database, and the connection settings from `reference/config/database.yml`
+# plus the sqlite3 adapter's `DEFAULT_PRAGMAS`.
+#
+# `SCHEMA_SQL` is the `sqlite_master` of a database the reference app
+# created with `db:prepare` (loading `reference/db/schema.rb`), minus the
+# objects SQLite derives on its own (FTS5 shadow tables, `sqlite_sequence`,
+# autoindexes). A fresh `db:prepare` loads `schema.rb`, so columns come out
+# in alphabetical order; databases that were migrated keep migration order.
+# All queries name their columns, so both work.
+module rils/record/schema
+
+import rils/record/sqlite::{Connection, SqlValue}
+import rils/record/timestamp::{Timestamp}
+import rils/record/schema_sql::{SCHEMA_SQL}
+
+# Every migration in `reference/db/migrate`, oldest first.
+pub MIGRATION_VERSIONS = [
+  "20231215043540", "20231220143106", "20240110071740", "20240115124901",
+  "20240130003150", "20240130213001", "20240131105830", "20240209110503",
+  "20250825100957", "20250825100958", "20250825100959", "20251126092013",
+  "20251126115722", "20251126130131", "20251212154340",
+]
+
+# SHA1 of `reference/db/schema.rb`, which `db:schema:load` records in
+# `ar_internal_metadata`.
+pub SCHEMA_SHA1 = "f75da8dad38bfb179ffd757bd7a7c2b3f818bc29"
+
+# Indexes this app adds to the Rails schema, created on boot when missing
+# (new and existing databases alike). Additive only, so the database still
+# works with the Rails image.
+pub ADDITIONS = [
+  # A room's messages are paged by `created_at` (`last_page`, `page_before`,
+  # `page_after`), and with only `index_messages_on_room_id` every room page
+  # sorted the room's whole history: 60 ms at 236k messages, against
+  # 0.02 ms with this index.
+  %(CREATE INDEX IF NOT EXISTS "index_messages_on_room_id_and_created_at" ON "messages" ("room_id", "created_at")),
+  # A refresh asks for the room's messages updated since the page loaded
+  # (`page_updated_since`), usually a handful, and with nothing on
+  # `updated_at` it walked the whole room by `created_at` looking for them:
+  # 200 ms at 1M messages, against under 1 ms with this index.
+  %(CREATE INDEX IF NOT EXISTS "index_messages_on_room_id_and_updated_at" ON "messages" ("room_id", "updated_at")),
+]
+
+# `timeout: 5000` in `config/database.yml`.
+pub BUSY_TIMEOUT_MS = 5000
+
+# Applies the per-connection settings Rails applies
+# (`SQLite3Adapter#configure_connection`), except `mmap_size`: every reader
+# remaps a memory-mapped database after each commit.
+pub def configure_connection(conn : Connection) : Nil
+  conn.busy_timeout(BUSY_TIMEOUT_MS)
+  conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = wal; PRAGMA synchronous = normal; PRAGMA journal_size_limit = 67108864; PRAGMA cache_size = 2000")
+end
+
+pub enum Prepared
+  # The database was empty; the schema was loaded.
+  Loaded
+  # The schema was already current.
+  UpToDate
+end
+
+# `bin/rails db:prepare`: loads the schema into an empty database, or
+# verifies an existing one is fully migrated. Migrations aren't ported, so a
+# database with pending migrations is refused (boot the Rails image once to
+# migrate it). Then adds `ADDITIONS`.
+pub def prepare(conn : Connection, environment : String, now : Timestamp) : Prepared | String
+  prepared = Prepared::UpToDate
+  if table_exists?(conn, "schema_migrations")
+    pending = pending_migrations(conn)
+    return "pending migrations: #{pending.join(", ")}" unless pending.empty?
+  else
+    load_schema(conn, environment, now)
+    prepared = Prepared::Loaded
+  end
+  ADDITIONS.each { |addition| conn.execute_batch(addition) }
+  prepared
+end
+
+pub def pending_migrations(conn : Connection) : Array(String)
+  MIGRATION_VERSIONS.reject do |version|
+    conn.exists?("SELECT 1 FROM schema_migrations WHERE version = ?", [version] of SqlValue)
+  end
+end
+
+def load_schema(conn : Connection, environment : String, now : Timestamp) : Nil
+  conn.execute_batch("BEGIN IMMEDIATE")
+  conn.execute_batch(SCHEMA_SQL)
+  # `assume_migrated_upto_version` inserts the current version, then the
+  # rest newest first.
+  MIGRATION_VERSIONS.reversed.each do |version|
+    conn.execute(%(INSERT INTO "schema_migrations" ("version") VALUES (?)), [version] of SqlValue)
+  end
+  set_internal_metadata(conn, "environment", environment, now)
+  set_internal_metadata(conn, "schema_sha1", SCHEMA_SHA1, now)
+  conn.execute_batch("COMMIT")
+end
+
+def set_internal_metadata(conn : Connection, key : String, value : String, now : Timestamp) : Nil
+  existing = conn.query_one(%(SELECT "value" FROM "ar_internal_metadata" WHERE "key" = ?), [key] of SqlValue) { |row| row.text(0) }
+  if existing.nil?
+    conn.execute(%(INSERT INTO "ar_internal_metadata" ("key", "value", "created_at", "updated_at") VALUES (?, ?, ?, ?)), [key, value, now, now] of SqlValue)
+  elsif existing != value
+    conn.execute(%(UPDATE "ar_internal_metadata" SET "value" = ?, "updated_at" = ? WHERE "key" = ?), [value, now, key] of SqlValue)
+  end
+end
+
+def table_exists?(conn : Connection, name : String) : Bool
+  conn.exists?("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", [name] of SqlValue)
+end

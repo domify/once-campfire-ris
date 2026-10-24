@@ -1,0 +1,238 @@
+# The program `Rils::Template::Template.def_render` runs at compile time:
+# `template/process CALLER TEMPLATE` finds TEMPLATE under the `templates/`
+# directory nearest CALLER and prints the iyi source that renders it into
+# `__io__`, a `Rils::Template::Template::Buffer`. std/eiy's own generator prints
+# literal text and `<%= %>` through one verb, so a buffer can't tell markup
+# from a user's name; this one keeps them apart:
+#
+#   * text                  `__io__.text("...")`, written as is
+#   * `<%= expr %>`         `__io__.emit(expr)`, escaped unless it is `Html`
+#   * `<%== expr %>`        `__io__.raw(expr)`, never escaped
+#   * `<%= helper(...) do |x| %>...<% end %>` the block's output captured
+#     (`__io__.capture`) and handed to the helper, which returns `Html`
+#   * `<% include "path" %>` the template at path, inlined in this scope
+#     (Askama's `{% include %}`)
+#   * `content_for`, `capture` and `region` at the start of a tag are the
+#     buffer's
+#
+# Whitespace follows Askama, whose templates these were: `<%-` drops every
+# blank (newlines too) before the tag, `-%>` every blank after it, and a
+# template file's one trailing newline is dropped. `<%#` is a comment and
+# `<%%` a literal `<%`.
+
+module views_template_process
+
+import std/text
+import std/eiy::{Eiy}
+
+BLOCK_KEYWORDS = ["if", "unless", "while", "until", "case", "begin"]
+
+class Generator
+  @root : String
+  @out : String::Builder
+  # One entry per open `do`/`if`/... block: what its `end` closes. A plain
+  # block's is "end", an output tag's also the capture and the call around
+  # it.
+  @blocks : Array(String)
+
+  def initialize(@root : String)
+    @out = String::Builder.new(4096)
+    @blocks = [] of String
+  end
+
+  def to_s : String
+    raise "unclosed block in a template: #{@blocks.size} `end` missing" unless @blocks.empty?
+    @out.to_s
+  end
+
+  def generate(path : String) : Nil
+    filename = @root + "/" + path
+    source = File.read(filename)
+    source = source[0, source.bytesize - 1] if source.ends_with?("\n")
+    lexer = Eiy::Lexer.new(source)
+    token = next_token(lexer, filename)
+    while true
+      if token.string?
+        text = token.value
+        token = next_token(lexer, filename)
+        text = rstrip_blanks(text) if (token.output? || token.control?) && token.suppress_leading?
+        @out << "__io__.text(" << quote(text) << ")\n" unless text.empty?
+      elsif token.output? || token.control?
+        output = token.output?
+        code = token.value
+        line = token.line_number
+        column = token.column_number
+        trailing = token.suppress_trailing?
+        token = next_token(lexer, filename)
+        token.value = lstrip_blanks(token.value) if trailing && token.string?
+        if output
+          output_tag(code, filename, line, column)
+        else
+          control_tag(code, filename, line, column)
+        end
+      else
+        break
+      end
+    end
+  end
+
+  private def next_token(lexer : Eiy::Lexer, filename : String) : Eiy::Lexer::Token
+    token = lexer.next_token?
+    return token if token
+    raise "#{filename}: #{lexer.error || "template refused"}"
+  end
+
+  private def output_tag(code : String, filename : String, line : Int32, column : Int32) : Nil
+    verb = "emit"
+    if code.starts_with?("=")
+      verb = "raw"
+      code = code[1, code.bytesize - 1]
+      column += 1
+    end
+    own = buffer_call?(code.strip)
+    code = "__io__." + code.lstrip if own
+    if block_opener?(code)
+      # `capture do` is the buffer's own block: no second capture inside it.
+      @blocks << (own ? "end))\n" : "end\nend))\n")
+      @out << "#<loc:push>__io__." << verb << "(("
+      loc(filename, line, column)
+      @out << code << (own ? "\n" : "\n__io__.capture do\n") << "#<loc:pop>\n"
+    else
+      @out << "#<loc:push>__io__." << verb << "(("
+      loc(filename, line, column)
+      @out << code << "\n))#<loc:pop>\n"
+    end
+  end
+
+  private def control_tag(code : String, filename : String, line : Int32, column : Int32) : Nil
+    return if code.starts_with?("#")
+    stripped = code.strip
+    if stripped.starts_with?("include ")
+      generate(unquote(stripped[8, stripped.bytesize - 8].strip, filename, line))
+      return
+    end
+    if stripped == "end"
+      raise "#{filename}:#{line}: `end` without a block" if @blocks.empty?
+      @out << @blocks.pop
+      return
+    end
+    @blocks << "end\n" if opens_block?(stripped)
+    code = "__io__." + code.lstrip if buffer_call?(stripped)
+    @out << "#<loc:push>"
+    loc(filename, line, column)
+    @out << code << "\n#<loc:pop>\n"
+  end
+
+  private def opens_block?(code : String) : Bool
+    return true if block_opener?(code)
+    word = first_word(code)
+    BLOCK_KEYWORDS.includes?(word) && !code.ends_with?(" end")
+  end
+
+  # `... do` or `... do |args|` at the end of the code.
+  private def block_opener?(code : String) : Bool
+    code = code.strip
+    if code.ends_with?("|")
+      bar = code.rindex('|', code.bytesize - 2)
+      return false unless bar
+      code = code[0, bar].rstrip
+    end
+    code == "do" || code.ends_with?(" do") || code.ends_with?(")do")
+  end
+
+  private def buffer_call?(code : String) : Bool
+    word = first_word(code)
+    word == "content_for" || word == "capture" || word == "region"
+  end
+
+  private def first_word(code : String) : String
+    i = 0
+    while i < code.bytesize
+      c = code[i]
+      break unless (c >= 'a' && c <= 'z') || c == '_'
+      i += 1
+    end
+    code[0, i]
+  end
+
+  private def unquote(literal : String, filename : String, line : Int32) : String
+    unless literal.bytesize >= 2 && literal.starts_with?("\"") && literal.ends_with?("\"")
+      raise "#{filename}:#{line}: include takes a quoted path, not #{literal}"
+    end
+    literal[1, literal.bytesize - 2]
+  end
+
+  private def blank?(c : Char) : Bool
+    c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f'
+  end
+
+  # `<%-`: every blank before the tag goes, newlines too.
+  private def rstrip_blanks(text : String) : String
+    last = text.bytesize
+    while last > 0 && blank?(text[last - 1])
+      last -= 1
+    end
+    text[0, last]
+  end
+
+  # `-%>`: every blank after the tag goes.
+  private def lstrip_blanks(text : String) : String
+    first = 0
+    while first < text.bytesize && blank?(text[first])
+      first += 1
+    end
+    text[first, text.bytesize - first]
+  end
+
+  private def loc(filename : String, line : Int32, column : Int32) : Nil
+    @out << "#<loc:" << quote(filename) << "," << line.to_s << "," << column.to_s << ">"
+  end
+
+  # *text* as an iyi string literal. Templates are UTF-8 text, so only the
+  # quote, backslash, `#` and control bytes need writing out.
+  private def quote(text : String) : String
+    String.build(text.bytesize + 16) do |io|
+      io << "\""
+      last = 0
+      i = 0
+      while i < text.bytesize
+        escape = case text[i]
+                 when '"'  then "\\\""
+                 when '\\' then "\\\\"
+                 when '#'  then "\\#"
+                 when '\n' then "\\n"
+                 when '\r' then "\\r"
+                 when '\t' then "\\t"
+                 else            nil
+                 end
+        if escape
+          io << text[last, i - last]
+          io << escape
+          last = i + 1
+        end
+        i += 1
+      end
+      io << text[last, text.bytesize - last]
+      io << "\""
+    end
+  end
+end
+
+# The `templates/` directory nearest *caller* that holds *path*.
+def templates_root(caller : String, path : String) : String
+  dir = caller
+  while true
+    slash = dir.rindex('/')
+    raise "no templates/#{path} above #{caller}" unless slash
+    dir = dir[0, slash]
+    root = dir + "/templates"
+    return root if File.exists?(root + "/" + path)
+  end
+end
+
+args = Program.args
+raise "usage: template/process CALLER TEMPLATE, not #{args.size} arguments" unless args.size == 2
+
+generator = Generator.new(templates_root(args[0], args[1]))
+generator.generate(args[1])
+print generator.to_s

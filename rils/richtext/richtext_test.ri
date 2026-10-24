@@ -1,0 +1,175 @@
+# The Rust port's differential corpus (vectors/richtext/expected.json, its
+# crates/richtext/tests/corpus) through ris: every body's presentation,
+# plain text, editor value and mentions as the Rails pipeline produced
+# them, with the port's deliberate differences, all exact: the ris port
+# of the pipeline, over htmlparse, held to the Rails output the Rust port
+# is.
+module rils/richtext/richtext_test
+
+import std/text
+import std/file::{File}
+import std/json::{JSON, Any}
+import rils/richtext/richtext::*
+import rils/richtext/records::*
+import web/web/spec::*
+
+CORPUS = JSON.parse(File.read("#{__DIR__}/../../vectors/richtext/expected.json"))
+
+# Stands in for the app, as the Rust corpus test's: SGIDs Rails minted are
+# "verified" by exact match, GIDs are looked up by model and id.
+class CorpusResolver < Resolver
+  @users : Hash(Int64, MentionUser)
+  @signed : Array(Any)
+  @rooms : Array(Int64)
+  getter lookups : Int32
+
+  def initialize
+    @users = {} of Int64 => MentionUser
+    CORPUS["users"].as_a.each do |u|
+      @users[u["id"].as_i64] = MentionUser.new(u["id"].as_i64, u["name"].as_s, u["title"].as_s, u["attachable_sgid"].as_s, u["user_path"].as_s, u["avatar_path"].as_s)
+    end
+    @signed = CORPUS["signed"].as_a
+    @rooms = CORPUS["rooms"].as_a.map(&.as_i64)
+    @lookups = 0
+  end
+
+  pub def locate_signed(sgid : String) : SignedLookup
+    @lookups += 1
+    @signed.each do |s|
+      next unless s["sgid"].as_s == sgid
+      model = s["model"].as_s
+      return SignedLookup.new(user: @users[s["id"].as_i64]) if model == "User" && s["exists"].as_bool
+      return SignedLookup.new(missing_model: model)
+    end
+    SignedLookup.new
+  end
+
+  pub def find_gid(gid : String) : GidLookup
+    @lookups += 1
+    return GidLookup.new unless gid.starts_with?("gid://") && gid.bytesize == gid.size
+    parts = gid[6, gid.bytesize - 6].split('?')[0].split('/')
+    return GidLookup.new unless parts.size == 3
+    id = parts[2].to_i64? || return GidLookup.new
+    case parts[1]
+    when "User" then (user = @users[id]?) ? GidLookup.new(user: user) : GidLookup.new
+    when "Room" then @rooms.includes?(id) ? GidLookup.new(outcome: "other") : GidLookup.new
+    else             GidLookup.new
+    end
+  end
+end
+
+# Rails' presentation as the port renders it on purpose (the Rust port's
+# README, Known differences): `<` and `>` escaped in attribute values, the
+# links rails_autolink inserts inside an attribute value (its stored XSS)
+# left as the text they replaced, and `name` attributes dropped.
+def with_port_divergences(rails : String) : String
+  inserted_link = "<a target=\"_blank\" href=\""
+  state = "text"
+  String.build(rails.bytesize) do |io|
+    i = 0
+    while i < rails.bytesize
+      if state == "value" && rails.byte_index(inserted_link, i) == i
+        text_start = (rails.byte_index("\">", i) || raise "unclosed link") + 2
+        text_end = rails.byte_index("</a>", text_start) || raise "unclosed link"
+        io << rails[text_start, text_end - text_start].gsub(">", "&gt;")
+        i = text_end + 4
+        next
+      end
+      if state == "tag" && rails.byte_index(" name=\"", i) == i
+        value_end = rails.byte_index("\"", i + 7) || raise "unclosed name"
+        i = value_end + 1
+        next
+      end
+      c = rails[i, 1]
+      if state == "text" && c == "<"
+        state = "tag"
+      elsif state == "tag" && c == ">"
+        state = "text"
+      elsif state == "tag" && c == "\""
+        state = "value"
+      elsif state == "value" && c == "\""
+        state = "tag"
+      end
+      if state == "value" && c == "<"
+        io << "&lt;"
+      elsif state == "value" && c == ">"
+        io << "&gt;"
+      else
+        io << c
+      end
+      i += 1
+    end
+  end
+end
+
+def ok(outcome : Any) : String?
+  value = outcome.as_h["ok"]?
+  value ? value.as_s? : nil
+end
+
+def raised?(outcome : Any) : Bool
+  !outcome.as_h["error"]?.nil?
+end
+
+describe "the rich text pipeline" do
+  it "renders the corpus as Rails does" do
+    resolver = CorpusResolver.new
+    mismatches = [] of String
+    cases = CORPUS["cases"].as_a
+    cases.each do |c|
+      name = c["name"].as_s
+      body = c["body"].as_s
+      host = c.as_h["host"]? ? c["host"].as_s? : nil
+
+      # presentation; a deleted user's mention renders ☒ on purpose where Rails raises
+      expected = raised?(c["presentation"]) ? nil : with_port_divergences(ok(c["presentation"]) || "")
+      actual = present_message(body, host, resolver)
+      raised_message = c.as_h["presentation_raised_message"]?
+      missing_partial = raised_message && (raised_message.as_s? || "").includes?("to_missing_attachable_partial_path")
+      if missing_partial && actual.is_a?(String)
+        mismatches << "[presentation] #{name}: no ☒" unless actual.includes?("☒")
+      elsif expected.nil?
+        mismatches << "[presentation] #{name}: expected unrenderable" unless actual.is_a?(Unrenderable)
+      elsif !actual.is_a?(String) || actual != expected
+        mismatches << "[presentation] #{name}\n  expected: #{expected.inspect}\n  actual:   #{actual.is_a?(String) ? actual.inspect : "unrenderable"}"
+      end
+
+      # plain text
+      text = to_plain_text(body, host, resolver)
+      if raised?(c["plain_text"])
+        mismatches << "[plain_text] #{name}: expected to raise" unless text.is_a?(RichtextError)
+      elsif !text.is_a?(String) || text != (ok(c["plain_text"]) || "")
+        mismatches << "[plain_text] #{name}\n  expected: #{ok(c["plain_text"]).inspect}\n  actual:   #{text.is_a?(String) ? text.inspect : "raised"}"
+      end
+
+      # editor value; a missing attachable leaves the editor on purpose where Rails raises
+      editable = editable_value(body, host, resolver)
+      message = c["editable"].as_h["message"]?
+      missing_in_editor = message && (message.as_s? || "").includes?("MissingAttachable")
+      if raised?(c["editable"])
+        mismatches << "[editable] #{name}: expected to raise" unless editable.is_a?(RichtextError) || missing_in_editor
+      elsif editable.is_a?(RichtextError) || editable != ok(c["editable"])
+        mismatches << "[editable] #{name}\n  expected: #{ok(c["editable"]).inspect}\n  actual:   #{editable.is_a?(RichtextError) ? "raised" : editable.inspect}"
+      end
+
+      # mentioned users
+      ids = mentioned_user_ids(body, host, resolver)
+      expected_ids = c["mentioned"].as_h["ok"]?
+      if expected_ids.nil?
+        mismatches << "[mentioned] #{name}: expected to raise" unless ids.is_a?(RichtextError)
+      elsif ids.is_a?(RichtextError) || ids != expected_ids.as_a.map(&.as_i64)
+        mismatches << "[mentioned] #{name}"
+      end
+    end
+    mismatches.each { |m| STDERR.puts "MISMATCH #{m}" }
+    assert mismatches.empty?
+    assert cases.size > 600
+    # Mentions were resolved through the answer loop, not skipped.
+    assert resolver.lookups > 0
+  end
+
+  it "takes the script out of a body and links its URLs" do
+    html = present_message("<p>Hi <script>alert(1)</script><b>there</b> https://example.com</p>", "once.campfire.test", Resolver.new)
+    assert html == "<div class=\"lexxy-content\">\n  <p>Hi <b>there</b> <a target=\"_blank\" href=\"https://example.com\">https://example.com</a></p>\n</div>\n"
+  end
+end

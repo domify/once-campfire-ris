@@ -1,0 +1,73 @@
+# The Action Cable wire format (`ActionCable::INTERNAL` in
+# actioncable/lib/action_cable.rb).
+#
+# Frames are Ruby hashes run through `ActiveSupport::JSON.encode`, so key
+# order is the order the hash literal is written in `Connection::Base` and
+# `Channel::Base`.
+module rils/cable/protocol
+
+import rils/rails_compat/json::{Value, encode, encode_string}
+
+# Offered in `Sec-WebSocket-Protocol`; the first one the client lists that's
+# in here wins (websocket-driver's hybi negotiation walks the client's list,
+# not the server's).
+pub PROTOCOLS = ["actioncable-v1-json", "actioncable-unsupported"]
+
+pub DEFAULT_MOUNT_PATH = "/cable"
+
+# `ActionCable::Server::Connections::BEAT_INTERVAL`, in seconds.
+pub BEAT_INTERVAL = 3
+
+# `ActionCable::INTERNAL[:disconnect_reasons]`.
+pub enum DisconnectReason
+  Unauthorized
+  InvalidRequest
+  ServerRestart
+  Remote
+end
+
+pub def reason_name(reason : DisconnectReason) : String
+  case reason
+  in DisconnectReason::Unauthorized   then "unauthorized"
+  in DisconnectReason::InvalidRequest then "invalid_request"
+  in DisconnectReason::ServerRestart  then "server_restart"
+  in DisconnectReason::Remote         then "remote"
+  end
+end
+
+# `{"type":"welcome"}`
+pub def welcome : String
+  %({"type":"welcome"})
+end
+
+# `{"type":"ping","message":<unix seconds>}` (`Connection::Base#beat`).
+pub def ping(unix_seconds : Int64) : String
+  %({"type":"ping","message":#{unix_seconds}})
+end
+
+# `{"type":"disconnect","reason":...,"reconnect":...}`
+# (`Connection::Base#close`). *reason* is `nil` when Rails calls `close`
+# without one, and *reconnect* is whatever JSON value the remote disconnect
+# carried (it's `message.fetch("reconnect", true)`, unvalidated).
+pub def disconnect(reason : DisconnectReason?, reconnect : Value) : String
+  named = reason ? %("#{reason_name(reason)}") : "null"
+  %({"type":"disconnect","reason":#{named},"reconnect":#{encode(reconnect)}})
+end
+
+# `{"identifier":...,"type":"confirm_subscription"}`
+pub def confirmation(identifier : String) : String
+  %({"identifier":#{encode_string(identifier)},"type":"confirm_subscription"})
+end
+
+# `{"identifier":...,"type":"reject_subscription"}`
+pub def rejection(identifier : String) : String
+  %({"identifier":#{encode_string(identifier)},"type":"reject_subscription"})
+end
+
+# `{"identifier":...,"message":...}` where *encoded_message* is already
+# Active Support JSON. Rails decodes each broadcast and re-encodes it inside
+# this hash; passing the encoded payload through is equivalent and saves the
+# round trip per subscriber.
+pub def message(encoded_identifier : String, encoded_message : String) : String
+  %({"identifier":#{encoded_identifier},"message":#{encoded_message}})
+end

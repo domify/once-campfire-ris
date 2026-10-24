@@ -1,0 +1,41 @@
+# `link_to`, `link_to_if` and `mail_to` (`UrlHelper`).
+module views/helpers/links
+
+import std/text
+import std/int
+import rils/ruby/uri::{url_encode}
+import rils/template/html::{Html, escape}
+import views/helpers/tag::*
+
+# `link_to(url, options) { content }`.
+pub def link_to(url : String, options : Attrs, content : Html) : Html
+  content_tag("a", link_options(url, options), content)
+end
+
+# `link_to(url, options) do ... end`.
+pub def link_to(url : String, options : Attrs, & : -> Html) : Html
+  link_to(url, options, yield)
+end
+
+# `link_to`'s attributes: `href` goes after the given options.
+pub def link_options(url : String, options : Attrs) : Attrs
+  options.dup.attr("href", url)
+end
+
+# `link_to(text, url, options)` with a plain-text name.
+pub def link_to_text(text : String, url : String, options : Attrs) : Html
+  link_to(url, options, Html.new(escape(text)))
+end
+
+# `link_to_if(condition, name, url, options)`: just the escaped name when
+# false.
+pub def link_to_if(condition : Bool, text : String, url : String, options : Attrs) : Html
+  condition ? link_to_text(text, url, options) : Html.new(escape(text))
+end
+
+# `mail_to(email)`: the address percent-escaped (`ERB::Util.url_encode`,
+# keeping "@") in the href, and the plain address as the link text.
+pub def mail_to(email : String) : Html
+  encoded = url_encode(email).gsub("%40", "@")
+  content_tag("a", attrs.attr("href", "mailto:#{encoded}"), Html.new(escape(email)))
+end

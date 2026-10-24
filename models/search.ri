@@ -1,0 +1,74 @@
+# `reference/app/models/search.rb`
+module models/search
+
+import rils/record/sqlite::{Connection, Row, SqlValue, placeholders}
+import rils/record/timestamp::{Timestamp}
+import rils/record/database::{Tx}
+
+# How many recent searches `trim_recent_searches` keeps.
+pub RECENT_SEARCHES = 10
+
+SEARCH_COLUMNS = %("searches"."id", "searches"."user_id", "searches"."query", "searches"."created_at", "searches"."updated_at")
+
+pub class Search
+  getter id : Int64
+  getter user_id : Int64
+  getter query : String
+  getter created_at : Timestamp
+  property updated_at : Timestamp
+
+  def initialize(@id : Int64, @user_id : Int64, @query : String, @created_at : Timestamp, @updated_at : Timestamp)
+  end
+
+  def self.from_row(row : Row) : Search
+    Search.new(row.int(0), row.int(1), row.text(2), row.time(3), row.time(4))
+  end
+
+  # `user.searches.ordered`: most recent first.
+  pub def self.ordered_for_user(conn : Connection, user_id : Int64) : Array(Search)
+    conn.query_all(%(SELECT #{SEARCH_COLUMNS} FROM "searches" WHERE "searches"."user_id" = ? ORDER BY "searches"."updated_at" DESC), [user_id] of SqlValue) { |row| Search.from_row(row) }
+  end
+
+  pub def self.count(conn : Connection) : Int64
+    conn.count(%(SELECT COUNT(*) FROM "searches"))
+  end
+
+  pub def self.count_for_user(conn : Connection, user_id : Int64) : Int64
+    conn.count(%(SELECT COUNT(*) FROM "searches" WHERE "searches"."user_id" = ?), [user_id] of SqlValue)
+  end
+
+  # `user.searches.record(query)`: `find_or_create_by(query:).touch`.
+  # Creating trims the user's searches to the ten most recent.
+  pub def self.record(tx : Tx, user_id : Int64, query : String) : Search
+    search = tx.conn.query_one(%(SELECT #{SEARCH_COLUMNS} FROM "searches" WHERE "searches"."user_id" = ? AND "searches"."query" = ? LIMIT 1), [user_id, query] of SqlValue) { |row| Search.from_row(row) }
+    search = create(tx, user_id, query) unless search
+    now = tx.now
+    tx.conn.execute(%(UPDATE "searches" SET "updated_at" = ? WHERE "searches"."id" = ?), [now, search.id] of SqlValue)
+    search.updated_at = now
+    search
+  end
+
+  def self.create(tx : Tx, user_id : Int64, query : String) : Search
+    now = tx.now
+    id = tx.conn.query_one(%(INSERT INTO "searches" ("created_at", "query", "updated_at", "user_id") VALUES (?, ?, ?, ?) RETURNING "id"), [now, query, now, user_id] of SqlValue) { |row| row.int(0) }
+    raise "insert into searches returned no id" unless id
+    trim_recent_searches(tx, user_id)
+    Search.new(id, user_id, query, now, now)
+  end
+
+  # `user.searches.destroy_all`
+  pub def self.destroy_all_for_user(tx : Tx, user_id : Int64) : Nil
+    ids = tx.conn.query_all(%(SELECT "searches"."id" FROM "searches" WHERE "searches"."user_id" = ?), [user_id] of SqlValue) { |row| row.int(0) }
+    ids.each { |id| tx.conn.execute(%(DELETE FROM "searches" WHERE "searches"."id" = ?), [id] of SqlValue) }
+  end
+
+  # `user.searches.excluding(user.searches.ordered.limit(10)).destroy_all`
+  def self.trim_recent_searches(tx : Tx, user_id : Int64) : Nil
+    keep = tx.conn.query_all(%(SELECT "searches"."id" FROM "searches" WHERE "searches"."user_id" = ? ORDER BY "searches"."updated_at" DESC LIMIT ?), [user_id, RECENT_SEARCHES] of SqlValue) { |row| row.int(0) }
+    keep << 0_i64 if keep.empty?
+    values = [user_id] of SqlValue
+    keep.each { |id| values << id }
+    doomed = tx.conn.query_all(%(SELECT "searches"."id" FROM "searches" WHERE "searches"."user_id" = ? AND "searches"."id" NOT IN (#{placeholders(keep.size)})), values) { |row| row.int(0) }
+    doomed.each { |id| tx.conn.execute(%(DELETE FROM "searches" WHERE "searches"."id" = ?), [id] of SqlValue) }
+  end
+end

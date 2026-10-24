@@ -1,0 +1,107 @@
+# The useragent gem's answers for the corpus the reference generated
+# (vectors/campfire_user_agents.json, reference-tools/campfire/user_agents.rb):
+# browser, version, platform, os, bot? and mobile? for every agent,
+# ApplicationPlatform and allow_browser's decision, and Version's parsing
+# and ordering.
+module rils/user_agent_test
+
+import std/text
+import std/file::{File}
+import std/json::{JSON, Any}
+import rils/user_agent::*
+import models/application_platform::{ApplicationPlatform}
+import web/web/spec::*
+
+VECTORS = JSON.parse(File.read("#{__DIR__}/../vectors/campfire_user_agents.json"))
+
+# Ruby's answer, or "raised" where it raised, as text.
+def expected(value : Any) : String
+  h = value.as_h?
+  return "raised" if h && h.has_key?("error")
+  value.to_json
+end
+
+def answer(value : String? | Raised) : String
+  case value
+  when Raised then "raised"
+  when String then Any.new(value).to_json
+  else             "null"
+  end
+end
+
+def answer(value : Version? | Raised) : String
+  case value
+  when Raised  then "raised"
+  when Version then Any.new(value.to_s).to_json
+  else              "null"
+  end
+end
+
+def answer(value : Bool | Raised) : String
+  value.is_a?(Raised) ? "raised" : value.to_s
+end
+
+def check(failures : Array(String), label : String, expected : String, actual : String) : Nil
+  failures << "#{label}: expected #{expected}, got #{actual}" unless expected == actual
+end
+
+describe "the useragent gem" do
+  it "parses every agent as the gem does" do
+    failures = [] of String
+    cases = VECTORS["user_agents"].as_a
+    cases.each do |c|
+      ua = c["ua"].as_s? || ""
+      agent = parse(ua)
+      check(failures, "#{ua} browser", expected(c["browser"]), answer(agent.try_browser))
+      check(failures, "#{ua} version", expected(c["version"]), answer(agent.try_version))
+      check(failures, "#{ua} platform", expected(c["platform"]), answer(agent.try_platform))
+      check(failures, "#{ua} os", expected(c["os"]), answer(agent.try_os))
+      check(failures, "#{ua} bot", expected(c["bot"]), agent.bot?.to_s)
+      check(failures, "#{ua} mobile", expected(c["mobile"]), answer(agent.try_mobile))
+
+      platform = ApplicationPlatform.new(c["ua"].as_s?)
+      view = platform.to_view
+      p = c["application_platform"]
+      {"ios" => view.ios, "android" => view.android, "mac" => view.mac, "chrome" => view.chrome, "firefox" => view.firefox,
+       "safari" => view.safari, "edge" => view.edge, "apple_messages" => view.apple_messages, "mobile" => view.mobile,
+       "desktop" => view.desktop, "windows" => view.windows}.each do |key, value|
+        want = p[key]
+        # A predicate Ruby raises for answers false here.
+        want_text = want.as_h? ? "false" : want.to_json
+        check(failures, "#{ua} #{key}?", want_text, value.to_s)
+      end
+      os = p["operating_system"]
+      check(failures, "#{ua} operating_system", os.as_h? || os.raw.nil? ? "\"\"" : os.to_json, Any.new(view.operating_system).to_json)
+      browser = p["browser"]
+      check(failures, "#{ua} platform browser", browser.as_h? || browser.raw.nil? ? "\"\"" : browser.to_json, Any.new(view.browser).to_json)
+      check(failures, "#{ua} blocked", expected(c["blocked"]), answer(platform.try_browser_blocked))
+    end
+    failures.first(40).each { |f| STDERR.puts f }
+    STDERR.puts "#{failures.size} mismatches" unless failures.empty?
+    assert failures.empty?
+    assert cases.size > 300
+  end
+
+  it "parses and orders versions as the gem does" do
+    failures = [] of String
+    VECTORS["versions"].as_a.each do |c|
+      version = Version.new(c["string"].as_s)
+      to_a = version.to_a.map { |s| s.int ? "i:#{s.text}" : "s:#{s.text}" }
+      failures << "#{c.to_json}: nil=#{version.ruby_nil?} to_a=#{to_a}" unless version.ruby_nil? == c["nil"].as_bool && to_a == c["to_a"].as_a.map(&.as_s)
+    end
+    VECTORS["comparisons"].as_a.each do |c|
+      a = Version.new(c["a"].as_s)
+      b = Version.new(c["b"].as_s)
+      ok = a.compare(b) == c["cmp"].as_i && (a < b) == c["lt"].as_bool && (a == b) == c["eq"].as_bool
+      failures << "#{c.to_json}: cmp=#{a.compare(b)}" unless ok
+    end
+    failures.first(20).each { |f| STDERR.puts f }
+    assert failures.empty?
+  end
+
+  it "parses a blank agent as the default" do
+    agent = parse("  ")
+    assert agent.try_browser == "Mozilla"
+    assert agent.try_version.as(Version).to_s == "4.0"
+  end
+end

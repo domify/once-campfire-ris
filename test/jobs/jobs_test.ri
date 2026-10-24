@@ -1,0 +1,119 @@
+# The jobs, performed: a bot's webhook reply posted as the bot, Web Push to
+# the subscriptions of everyone involved, a banned user's messages
+# removed, and a blob nothing is attached to purged.
+module test/jobs/jobs_test
+
+import std/text
+import std/indexable
+import std/file::{File}
+import std/json::{JSON}
+import rils/rails_compat/encoding::{urlsafe_encode_unpadded}
+import rils/rails_compat/ec::{generate_key}
+import test/models/testing::{id}
+import rils/record/sqlite::{SqlValue}
+import models/message::{Message, NewMessage}
+import models/push_subscription::{PushSubscription}
+import models/user::{User}
+import rils/record/events::{PushMessage, DeliverWebhook, RemoveBannedContent, PurgeBlob}
+import rils/storage/blob::{Blob}
+import rils/storage/filename::{Filename}
+import integrations/net::{Http, HttpAnswer, NetError}
+import integrations/vapid::{Vapid}
+import test/testing::*
+import web/web/spec::*
+
+class FakeService < Http
+  getter requests : Array(Tuple(String, String, String?, String?))
+
+  def initialize(@status : Int32, @content_type : String?, @body : String)
+    super(->(host : String) { ["142.250.185.206"].as(Array(String)?) })
+    @requests = [] of Tuple(String, String, String?, String?)
+  end
+
+  pub def request(method : String, url : String, address : String?, headers : Array(Tuple(String, String)) = [] of Tuple(String, String), body : String? = nil, timeout_ms : Int32 = 7000, max_bytes : Int64 = 10_485_760_i64) : HttpAnswer | NetError
+    @requests << {method, url, address, body}
+    found = {} of String => String
+    if type = @content_type
+      found["content-type"] = type
+    end
+    HttpAnswer.new(@status, found, @body)
+  end
+end
+
+describe "Bot::WebhookJob" do
+  it "posts the payload and the reply as the bot" do
+    client = Client.new
+    service = FakeService.new(200, "text/plain", "Beep boop")
+    client.app.http = service
+    room = id("watercooler")
+    message = client.t.write { |tx| Message.create(tx, NewMessage.new(room, id("david"), "hook-1", "Hello Bender")) }
+    client.app.jobs.perform_later(DeliverWebhook.new(id("bender"), message.id))
+    client.app.jobs.perform_all
+    method, url, address, payload = service.requests.first
+    assert method == "POST" && url == "http://example.com/bender" && address.nil?
+    sent = JSON.parse(payload || "")
+    assert sent["message"]["body"]["plain"].as_s == "Hello Bender"
+    assert sent["room"]["path"].as_s.starts_with?("/rooms/#{room}/")
+    reply = client.t.read { |conn| Message.last(conn) || raise "none" }
+    assert reply.creator_id == id("bender")
+    assert client.t.read { |conn| reply.plain_text_body(conn, client.app.db.env.rich_text) } == "Beep boop"
+  end
+end
+
+describe "Room::PushMessageJob" do
+  it "pushes to the subscriptions of everyone involved, encrypted and signed" do
+    client = Client.new
+    secret, point = generate_key
+    client.app.vapid = Vapid.from(urlsafe_encode_unpadded(point), urlsafe_encode_unpadded(secret))
+    service = FakeService.new(201, nil, "")
+    client.app.http = service
+    _, receiver = generate_key
+    room = id("watercooler")
+    client.t.write do |tx|
+      tx.conn.execute(%(DELETE FROM "push_subscriptions"), [] of SqlValue)
+      subscription = PushSubscription.build(id("jason"), "https://fcm.googleapis.com/fcm/send/abc", urlsafe_encode_unpadded(receiver), urlsafe_encode_unpadded("0123456789abcdef"), "Test")
+      PushSubscription.create(tx, subscription, ->(host : String) { "142.250.185.206".as(String?) })
+    end
+    message = client.t.write { |tx| Message.create(tx, NewMessage.new(room, id("david"), "push-1", "Ping")) }
+    client.app.jobs.pending.clear
+    client.app.jobs.perform_later(PushMessage.new(room, message.id))
+    client.app.jobs.perform_all
+    assert service.requests.size == 1
+    _, url, address, body = service.requests.first
+    assert url == "https://fcm.googleapis.com/fcm/send/abc" && address == "142.250.185.206"
+    assert (body || "").bytesize > 86
+  end
+
+  it "destroys a subscription the push service says is gone" do
+    client = Client.new
+    secret, point = generate_key
+    client.app.vapid = Vapid.from(urlsafe_encode_unpadded(point), urlsafe_encode_unpadded(secret))
+    client.app.http = FakeService.new(410, nil, "")
+    _, receiver = generate_key
+    room = id("watercooler")
+    client.t.write do |tx|
+      tx.conn.execute(%(DELETE FROM "push_subscriptions"), [] of SqlValue)
+      PushSubscription.create(tx, PushSubscription.build(id("jason"), "https://fcm.googleapis.com/fcm/send/gone", urlsafe_encode_unpadded(receiver), urlsafe_encode_unpadded("0123456789abcdef"), "Test"), ->(host : String) { "142.250.185.206".as(String?) })
+    end
+    message = client.t.write { |tx| Message.create(tx, NewMessage.new(room, id("david"), "push-2", "Ping")) }
+    client.app.jobs.pending.clear
+    client.app.jobs.perform_later(PushMessage.new(room, message.id))
+    client.app.jobs.perform_all
+    assert client.t.read { |conn| PushSubscription.count(conn) } == 0
+  end
+end
+
+describe "RemoveBannedContentJob and purges" do
+  it "removes a banned user's messages and purges a blob nothing is attached to" do
+    client = Client.new
+    client.app.jobs.perform_later(RemoveBannedContent.new(id("kevin")))
+    client.app.jobs.perform_all
+    assert client.t.read { |conn| Message.by_creator(conn, id("kevin")) }.empty?
+    blob = client.t.write { |tx| client.app.storage.create_and_upload(tx.conn, "loose", Filename.new("loose.txt"), "text/plain", tx.now) }
+    path = client.app.storage.path_for(blob)
+    client.app.jobs.perform_later(PurgeBlob.new(blob.id))
+    client.app.jobs.perform_all
+    assert client.t.read { |conn| Blob.find(conn, blob.id) }.nil?
+    assert !File.exists?(path)
+  end
+end

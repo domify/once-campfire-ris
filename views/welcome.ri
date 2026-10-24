@@ -1,0 +1,29 @@
+# Views for `reference/app/views/welcome`.
+module views/welcome
+
+import std/text
+import rils/routes/paths::{user_sidebar_path}
+import rils/template/html::{Html}
+import rils/template/recorded::{RecordedPage}
+import rils/template/template::{Template, Buffer}
+import views/context::{ViewContext}
+import views/layouts::{render_in_layout}
+import views/helpers/tag::*
+import views/helpers/assets::{image_tag}
+import views/helpers/users::{sidebar_turbo_frame_tag}
+
+# `welcome/show.html.erb`: for a user who isn't in any room yet.
+pub class Show
+  getter ctx : ViewContext
+  # `Current.user.name`.
+  getter current_user_name : String
+
+  def initialize(@ctx : ViewContext, @current_user_name : String)
+  end
+
+  Template.def_page("welcome/show.html.erb")
+
+  pub def page(frame : Bool = false) : RecordedPage
+    render_in_layout(@ctx, "No rooms yet", "sidebar", frame) { |buffer| render_into(buffer) }
+  end
+end

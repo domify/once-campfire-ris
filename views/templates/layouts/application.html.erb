@@ -1,0 +1,68 @@
+<%# reference/app/views/layouts/application.html.erb. A page's content_for regions are head, nav, footer and sidebar; the page itself is `content`. -%>
+<!DOCTYPE html>
+<html>
+  <head>
+    <%= page_title_tag(page_title) %>
+
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no, interactive-widget=resizes-content">
+    <meta name="view-transition" content="same-origin">
+    <meta name="color-scheme" content="light dark">
+    <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+    <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <%# csrf_meta_tags: none, forgery protection is by Sec-Fetch-Site (Ctx#verify_authenticity_token) %>
+    <%# csp_meta_tag: no content security policy is configured %>
+    <%= current_user_meta_tags(ctx) %>
+    <%= script_aware_action_cable_meta_tag(ctx) %>
+
+    <%= builder_tag("meta", attrs.name("vapid-public-key").attr("content", ctx.vapid_public_key)) %>
+    <%= builder_tag("meta", attrs.name("turbo-prefetch").attr("content", "true")) %>
+
+    <%= builder_tag("link", attrs.attr("rel", "manifest").attr("href", "/webmanifest.json")) %>
+    <%= builder_tag("link", attrs.attr("rel", "icon").attr("href", ctx.account.logo_url).type("image/png")) %>
+    <%= builder_tag("link", attrs.attr("rel", "apple-touch-icon").attr("href", ctx.account.logo_url)) %>
+
+    <%== ctx.assets.stylesheet_tags %>
+    <%= custom_styles_tag(ctx) %>
+
+    <%== ctx.assets.importmap_tags %>
+
+    <%= yield_region("head") %>
+  </head>
+
+  <body class="<%= body_classes(ctx, body_class) %>" data-controller="local-time lightbox">
+    <a href="#main-content" class="skip-navigation btn">Skip to main content</a>
+
+    <nav id="nav">
+      <%= yield_region("nav") %>
+    </nav>
+
+<% if notice = ctx.flash_notice || ctx.flash_alert %>      <div class="flash" data-controller="element-removal" data-action="animationend->element-removal#remove">
+        <div class="flash__inner shadow" style="<% if ctx.flash_alert %>--flash-background: var(--color-negative)<% end %>">
+<% if ctx.flash_alert %>            <%= image_tag(ctx, "alert.svg", attrs.aria("hidden", true).size(24).class("colorize--white")) %></span>
+<% else %>            <%= image_tag(ctx, "check.svg", attrs.aria("hidden", true).size(24).class("colorize--white")) %></span>
+<% end %>        </div>
+        <span class="for-screen-reader" role="alert" aria-atomic="true"><%= notice %></span>
+      </div>
+<% end %>
+    <main id="main-content">
+      <%= content %>
+
+      <footer id="footer">
+        <%= yield_region("footer") %>
+      </footer>
+    </main>
+
+    <aside id="sidebar" data-controller="toggle-class" data-toggle-class-toggle-class="open">
+      <%= yield_region("sidebar") %>
+    </aside>
+
+    <% include "layouts/_lightbox.html.erb" %>
+
+
+    <a href="https://once.com" id="app-logo" target="_blank" aria-label="Once software from 37signals home page">
+      <%= image_tag(ctx, "campfire-icon.png", attrs.alt("Campfire logo").attr("width", 256).attr("height", 216)) %>
+    </a>
+  </body>
+</html>
+

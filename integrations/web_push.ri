@@ -1,0 +1,171 @@
+# Web Push: `Room::PushMessageJob` (reference/app/jobs/room/push_message_job.rb)
+# over `Room::MessagePusher`, `WebPush::Notification`
+# (reference/lib/web_push/notification.rb) and the web-push gem 3.1.0:
+# RFC 8291 message encryption with the RFC 8188 `aes128gcm` coding, laid
+# out as the gem does it, and VAPID (RFC 8292) as
+# `WebPush::Request#build_vapid_header` writes it.
+#
+# Every endpoint is resolved through the private network guard and the
+# request pinned to that address (`WebPush::PersistentRequest`). A
+# subscription the push service says is gone (404, 410) or whose key isn't
+# a P-256 point is destroyed (the pool's `invalid_subscription_handler`).
+module integrations/web_push
+
+import std/text
+import std/json::{Any}
+import std/time::{Time}
+import rils/rails_compat/json::{encode}
+import rils/rails_compat/encoding::{urlsafe_decode, urlsafe_encode_unpadded}
+import rils/rails_compat/crypto::{Digest, hmac, random_bytes, uuid}
+import rils/rails_compat/ec::{generate_key, public_key, ecdh, es256_sign, aes128gcm_encrypt, valid_point?}
+import models/message::{Message}
+import models/push_subscription::{PushSubscription, PushPayload, Pushes}
+import rils/record/errors::{RecordNotFound}
+import rils/ruby/uri_parser::{Uri, UriError, parse_uri}
+import config/app::{App}
+import integrations/vapid::{Vapid}
+import integrations/net::{Http, HttpAnswer, NetError, GuardError}
+
+TTL_SECONDS        = 60 * 60 * 24 * 7 * 4
+URGENCY            = "high"
+REQUEST_TIMEOUT_MS = 10_000
+ICON_PATH          = "/account/logo"
+
+# What delivery failed with, by the gem's class name.
+pub class PushError
+  getter kind : String
+  getter message : String
+
+  def initialize(@kind : String, @message : String)
+  end
+
+  # Whether the subscription should go.
+  pub def invalidates_subscription? : Bool
+    ["WebPush::ExpiredSubscription", "WebPush::InvalidSubscription", "OpenSSL::PKey::EC::Point::Error"].includes?(@kind)
+  end
+end
+
+# HKDF-SHA256 (RFC 5869) for at most one block of output.
+def hkdf(salt : String, ikm : String, info : String, length : Int32) : String
+  prk = hmac(Digest::Sha256, salt, ikm)
+  okm = hmac(Digest::Sha256, prk, info + "\x01")
+  okm[0, length]
+end
+
+def strip_leading_zeros(bytes : String) : String
+  at = 0
+  bytes.each_byte { |byte| byte == 0 ? (at += 1) : break }
+  bytes[at, bytes.bytesize - at]
+end
+
+def be32(value : Int32) : String
+  String.build(4) do |io|
+    io.write_byte(((value >> 24) & 0xff).to_u8)
+    io.write_byte(((value >> 16) & 0xff).to_u8)
+    io.write_byte(((value >> 8) & 0xff).to_u8)
+    io.write_byte((value & 0xff).to_u8)
+  end
+end
+
+# `WebPush::Encryption.encrypt`: a single record whose size field is the
+# ciphertext length (or *record_size*), the plaintext padded with
+# *padding*.
+pub def encrypt_with(message : String, p256dh : String?, auth : String?, server_private : String, salt : String, record_size : Int32? = nil, padding : String = "\x02\x00") : String | PushError
+  return PushError.new("ArgumentError", "message cannot be blank") if message.empty?
+  return PushError.new("ArgumentError", "p256dh cannot be blank") if p256dh.nil? || p256dh.empty?
+  return PushError.new("ArgumentError", "auth cannot be blank") if auth.nil? || auth.empty?
+  # `OpenSSL::BN.new(bytes, 2)` drops leading zero bytes before the point
+  # is decoded.
+  decoded = urlsafe_decode(p256dh) || return PushError.new("ArgumentError", "invalid base64")
+  client_public = strip_leading_zeros(decoded)
+  auth_secret = urlsafe_decode(auth) || return PushError.new("ArgumentError", "invalid base64")
+  shared = ecdh(server_private, client_public) || return PushError.new("OpenSSL::PKey::EC::Point::Error", "invalid encoding")
+  server_public = public_key(server_private) || raise "invalid server key"
+  prk = hkdf(auth_secret, shared, "WebPush: info\0" + client_public + server_public, 32)
+  key = hkdf(salt, prk, "Content-Encoding: aes128gcm\0", 16)
+  nonce = hkdf(salt, prk, "Content-Encoding: nonce\0", 12)
+  ciphertext = aes128gcm_encrypt(key, nonce, message + padding)
+  return PushError.new("ArgumentError", "encrypted payload is too big") if ciphertext.bytesize > 4096
+  salt + be32(record_size || ciphertext.bytesize) + server_public.bytesize.chr.to_s + server_public + ciphertext
+end
+
+# With a fresh server key and salt.
+pub def encrypt(message : String, p256dh : String?, auth : String?) : String | PushError
+  secret, _ = generate_key
+  encrypt_with(message, p256dh, auth, secret, random_bytes(16))
+end
+
+# `WebPush::Notification#deliver`'s message.
+pub def encoded_message(title : String, body : String, path : String, badge : Int64) : String
+  options = {"body" => Any.new(body), "icon" => Any.new(ICON_PATH), "data" => Any.new({"path" => Any.new(path), "badge" => Any.new(badge)})}
+  encode(Any.new({"title" => Any.new(title), "options" => Any.new(options)}))
+end
+
+# `WebPush::Request#verify_response`
+def verify_response(status : Int32, host : String) : PushError?
+  kind = case status
+         when 410 then "WebPush::ExpiredSubscription"
+         when 404 then "WebPush::InvalidSubscription"
+         when 401, 403 then "WebPush::Unauthorized"
+         when 413 then "WebPush::PayloadTooLarge"
+         when 429 then "WebPush::TooManyRequests"
+         else
+           return nil if status >= 200 && status < 300
+           status >= 500 && status < 600 ? "WebPush::PushServiceError" : "WebPush::ResponseError"
+         end
+  PushError.new(kind, "host: #{host}, status: #{status}")
+end
+
+# `WebPush.payload_send(...)` to *subscription*'s endpoint: nothing when
+# it doesn't resolve to a public address.
+pub def deliver(http : Http, vapid : Vapid, subscription : PushSubscription, message : String, now : Int64) : PushError?
+  endpoint = subscription.endpoint || return nil
+  uri = parse_uri(endpoint)
+  return PushError.new("ArgumentError", "bad URI(is not URI?): #{endpoint.inspect}") if uri.is_a?(UriError)
+  host = uri.host || ""
+  ip = subscription.resolved_endpoint_ip(->(name : String) { (found = http.resolve(name)).is_a?(String) ? found : nil.as(String?) }) || return nil
+  payload = encrypt(message, subscription.p256dh_key, subscription.auth_key)
+  return payload if payload.is_a?(PushError)
+  headers = [{"Content-Type", "application/octet-stream"}, {"Ttl", TTL_SECONDS.to_s}, {"Urgency", URGENCY}, {"Content-Encoding", "aes128gcm"},
+             {"Authorization", vapid.authorization("#{(uri.scheme || "").downcase}://#{host}", now)}]
+  answer = http.request("POST", endpoint, ip, headers, payload, timeout_ms: REQUEST_TIMEOUT_MS)
+  return PushError.new(answer.timed_out ? "Net::ReadTimeout" : "SystemCallError", answer.message) if answer.is_a?(NetError)
+  verify_response(answer.status, host)
+end
+
+# `Room::PushMessageJob#perform`: the payload to the subscriptions of
+# everyone involved in everything, then to mentioned users involved in
+# mentions, each with its user's unread count as the badge.
+pub def push_message(app : App, room_id : Int64, message_id : Int64) : Nil
+  vapid = app.vapid || return
+  found = app.db.read do |conn|
+    message = Message.find_by_id(conn, message_id)
+    pushes = message ? Pushes.for(conn, app.db.env.rich_text, message, app.db.env.now) : nil
+    if pushes.is_a?(Pushes)
+      (pushes.everything + pushes.mentions).map { |subscription| {subscription, subscription.badge(conn), pushes.payload} }
+    end
+  end
+  return unless found
+  now = Time.utc.to_unix
+  found.each do |subscription, badge, payload|
+    failed = deliver(app.http, vapid, subscription, encoded_message(payload.title, payload.body, payload.path, badge), now)
+    next unless failed
+    STDERR.puts "Web Push to subscription #{subscription.id} failed: #{failed.kind} #{failed.message}"
+    destroy_subscription(app, subscription.id) if failed.invalidates_subscription?
+  end
+end
+
+# The pool's `invalid_subscription_handler`.
+def destroy_subscription(app : App, id : Int64) : Nil
+  app.db.write do |tx|
+    found = PushSubscription.find(tx.conn, id)
+    found.destroy(tx) if found.is_a?(PushSubscription)
+  end
+end
+
+# `Users::PushSubscriptions::TestNotificationsController#create`: a
+# "Campfire Test" notification with a random body, delivered inline.
+pub def deliver_test_notification(app : App, subscription : PushSubscription, badge : Int64, path : String) : PushError?
+  vapid = app.vapid || return nil
+  deliver(app.http, vapid, subscription, encoded_message("Campfire Test", uuid, path, badge), Time.utc.to_unix)
+end

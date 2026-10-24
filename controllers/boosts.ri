@@ -1,0 +1,120 @@
+# `Messages::BoostsController` (reference/app/controllers/messages/
+# boosts_controller.rb). Its `show`/`edit`/`update` routes have no action.
+module controllers/boosts
+
+import std/text
+import models/message::{Message, create_boost, destroy_boost}
+import models/boost::{Boost}
+import models/room::{Room}
+import models/user::{User}
+import rils/record/errors::{RecordNotFound}
+import rils/routes/paths::{message_boosts_path}
+import rils/kit/ctx::{Ctx, ActionResult}
+import rils/kit/errors::{HttpError}
+import rils/kit/response::{Response}
+import rils/kit/format::{HTML}
+import rils/kit/params::{permit_keys}
+import rils/ruby/integers::{integer_cast}
+import views/messages/messages::{BoostsIndex, BoostsNew, BoostPartial, BoostView}
+import config/app::{App}
+import rils/ruby/all_emoji::{all_emoji?}
+import controllers/concerns::{Passed, before_actions}
+import controllers/messages::{MessagePresenter, current_user}
+
+pub def boosts_index(app : App, c : Ctx) : ActionResult
+  found = passed_and_message(app, c)
+  return found if found.is_a?(HttpError)
+  passed, message, room = found
+  format = c.respond_to([HTML])
+  return format if format.is_a?(HttpError)
+  ctx = app.layout_context(c, current_user(passed.user), passed.platform)
+  view = MessagePresenter.new(app, ctx, room, c.request.host).view(message)
+  app.render_layout(c, 200, nil, nil, ctx) { |buffer| BoostsIndex.new(ctx, view).render_into(buffer) }
+end
+
+pub def boosts_new(app : App, c : Ctx) : ActionResult
+  found = passed_and_message(app, c)
+  return found if found.is_a?(HttpError)
+  passed, message, room = found
+  format = c.respond_to([HTML])
+  return format if format.is_a?(HttpError)
+  ctx = app.layout_context(c, current_user(passed.user), passed.platform)
+  presenter = MessagePresenter.new(app, ctx, room, c.request.host)
+  view = presenter.view(message)
+  user = presenter.user_view(passed.user)
+  app.render_layout(c, 200, nil, nil, ctx) { |buffer| BoostsNew.new(ctx, view, user).render_into(buffer) }
+end
+
+pub def boosts_create(app : App, c : Ctx) : ActionResult
+  found = passed_and_message(app, c)
+  return found if found.is_a?(HttpError)
+  passed, message, room = found
+  # params.require(:boost).permit(:content)
+  params = c.require("boost")
+  return params if params.is_a?(HttpError)
+  content = params.permit(permit_keys(["content"])).str("content")
+  boost = create_boost_for(app, message, passed.user, content)
+  return boost if boost.is_a?(HttpError)
+  broadcast_boost_create(app, c, room, message, boost)
+  c.redirect_to(c.url_for(message_boosts_path(message.id)))
+end
+
+pub def boosts_destroy(app : App, c : Ctx) : ActionResult
+  found = passed_and_message(app, c)
+  return found if found.is_a?(HttpError)
+  passed, message, room = found
+  boost = set_boost(app, c, message, passed.user)
+  return boost if boost.is_a?(HttpError)
+  destroy_boost_of(app, room, boost)
+  # No destroy template: `head :no_content`.
+  c.head(204)
+end
+
+# The before-actions and `set_message`.
+def passed_and_message(app : App, c : Ctx) : Tuple(Passed, Message, Room) | HttpError
+  passed = before_actions(app, c)
+  return passed if passed.is_a?(HttpError)
+  message = set_message(app, c, passed.user)
+  return message if message.is_a?(HttpError)
+  room = app.db.read { |conn| Room.find_by_id(conn, message.room_id) } || return HttpError.not_found
+  {passed, message, room}
+end
+
+# `Current.user.reachable_messages.find(params[:message_id])`
+pub def set_message(app : App, c : Ctx, user : User) : Message | HttpError
+  raw = c.param_str("message_id") || return HttpError.not_found
+  id = integer_cast(raw) || return HttpError.not_found
+  found = app.db.read { |conn| Message.find_reachable(conn, user.id, id) }
+  found.is_a?(RecordNotFound) ? HttpError.not_found : found
+end
+
+# `@message.boosts.find_by!(id: params[:id], booster: Current.user)`
+pub def set_boost(app : App, c : Ctx, message : Message, user : User) : Boost | HttpError
+  raw = c.param_str("id") || return HttpError.not_found
+  id = integer_cast(raw) || return HttpError.not_found
+  found = app.db.read { |conn| Boost.find_by_message_and_booster(conn, message.id, id, user.id) }
+  found.is_a?(RecordNotFound) ? HttpError.not_found : found
+end
+
+# `@message.boosts.create!(content:)`, boosted by *user*. A nil content
+# violates the column's NOT NULL (a 500).
+pub def create_boost_for(app : App, message : Message, user : User, content : String?) : Boost | HttpError
+  return HttpError.internal("NOT NULL constraint failed: boosts.content") unless content
+  app.db.write { |tx| create_boost(tx, message, user.id, content) }
+end
+
+# `@boost.destroy!` then `broadcast_remove`.
+pub def destroy_boost_of(app : App, room : Room, boost : Boost) : Nil
+  app.db.write { |tx| destroy_boost(tx, boost) }
+  app.broadcasts.boost_remove(room, boost)
+end
+
+# `broadcast_create`: `messages/boosts/_boost` appended to the message's
+# boosts.
+pub def broadcast_boost_create(app : App, c : Ctx, room : Room, message : Message, boost : Boost) : Nil
+  ctx = app.view_context(c.request)
+  booster = app.db.read { |conn| User.find_by_id(conn, boost.booster_id) } || return
+  presenter = MessagePresenter.new(app, ctx, room, nil)
+  view = BoostView.new(boost.id, boost.message_id, boost.content, all_emoji?(boost.content), presenter.user_view(booster))
+  app.broadcasts.boost_create(room, message, BoostPartial.new(ctx, view).render.to_s)
+end

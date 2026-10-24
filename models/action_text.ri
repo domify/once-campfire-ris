@@ -1,0 +1,81 @@
+# Action Text's record lookups for `richtext/`, from the database: a
+# mention attachment resolves to its user through a signed GlobalID (or,
+# for users only, the GlobalID inside an unverified one)
+# (`reference/lib/rails_ext/action_text_attachables.rb`), and the adapter
+# the models read plain text and mentions through.
+module models/action_text
+
+import std/text
+import rils/rails_compat/clock::{Clock}
+import rils/rails_compat/key_generator::{Secrets}
+import rils/rails_compat/global_id::{GlobalId, ATTACHABLE_PURPOSE, attachable_sgid, locate_signed}
+import rils/record/sqlite::{Connection}
+import rils/record/database::{RichText}
+import models/user::{User}
+import rils/routes/paths::{user_path}
+import rils/richtext/richtext::{RichtextError, to_plain_text, mentioned_user_ids}
+import rils/richtext/records::{Resolver, SignedLookup, GidLookup, MentionUser}
+import views/helpers/user_paths::{avatar_path}
+
+# GlobalID's models other than users: found, but not what a mention is.
+OTHER_MODELS = ["Message", "Room", "Rooms::Open", "Rooms::Closed", "Rooms::Direct", "Boost", "Account"]
+
+pub class DbResolver < Resolver
+  def initialize(@conn : Connection, @secrets : Secrets, @clock : Clock)
+  end
+
+  pub def locate_signed(sgid : String) : SignedLookup
+    gid = locate_signed(@secrets, sgid, ATTACHABLE_PURPOSE, @clock.now) || return SignedLookup.new
+    if gid.model_name == "User" && (user = find_user(gid.id))
+      SignedLookup.new(user: mention_user(user))
+    else
+      SignedLookup.new(missing_model: gid.model_name)
+    end
+  end
+
+  pub def find_gid(gid : String) : GidLookup
+    found = GlobalId.parse(gid) || return GidLookup.new
+    if found.model_name == "User"
+      user = find_user(found.id)
+      user ? GidLookup.new(user: mention_user(user)) : GidLookup.new
+    elsif OTHER_MODELS.includes?(found.model_name)
+      GidLookup.new(outcome: "other")
+    else
+      GidLookup.new(outcome: "raises")
+    end
+  end
+
+  # `GlobalID::Locator` finds by primary key; an id that isn't an integer
+  # matches no row.
+  def find_user(id : String) : User?
+    number = id.to_i64? || return nil
+    User.find_by_id(@conn, number)
+  end
+
+  def mention_user(user : User) : MentionUser
+    MentionUser.new(user.id, user.name, user.title, attachable_sgid(@secrets, GlobalId.new("User", user.id)), user_path(user.id), avatar_path(@secrets, user))
+  end
+end
+
+# The models' Action Text: plain text and mentions by the real pipeline.
+# What Ruby raises there raises here too.
+pub class CampfireRichText < RichText
+  def initialize(@secrets : Secrets, @clock : Clock)
+  end
+
+  pub def resolver(conn : Connection) : DbResolver
+    DbResolver.new(conn, @secrets, @clock)
+  end
+
+  pub def to_plain_text(conn : Connection, html : String) : String
+    text = to_plain_text(html, nil, resolver(conn))
+    raise text.message if text.is_a?(RichtextError)
+    text
+  end
+
+  pub def mentioned_user_ids(conn : Connection, html : String) : Array(Int64)
+    ids = mentioned_user_ids(html, nil, resolver(conn))
+    raise ids.message if ids.is_a?(RichtextError)
+    ids
+  end
+end

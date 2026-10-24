@@ -1,0 +1,98 @@
+# Replays the Rust port's opengraph cases (vectors/opengraph: fake DNS and a
+# fake server for the fake public addresses) and compares the response,
+# the DNS lookups and the requests made with what the reference did
+# (`testdata/oracle/opengraph.rb`).
+module test/integrations/opengraph_test
+
+import std/text
+import std/file::{File}
+import std/json::{JSON, Any}
+import rils/rails_compat/encoding::{strict_decode}
+import rils/ruby/uri_parser::{Uri, parse_uri}
+import integrations/net::{Http, HttpAnswer, NetError}
+import integrations/opengraph::{unfurl, UnfurlError}
+import web/web/spec::*
+
+VECTORS = "#{__DIR__}/../../vectors/opengraph"
+
+class FakeHttp < Http
+  getter requests : Array(String)
+
+  def initialize(lookup : Proc(String, Array(String)?), @routes : Array(Any), @public : Array(String))
+    super(lookup)
+    @requests = [] of String
+  end
+
+  # A fake public address connects to the fake server; any other one is
+  # refused.
+  pub def request(method : String, url : String, address : String?, headers : Array(Tuple(String, String)) = [] of Tuple(String, String), body : String? = nil, timeout_ms : Int32 = 7000, max_bytes : Int64 = 10_485_760_i64) : HttpAnswer | NetError
+    return NetError.new("connection refused") unless address && @public.includes?(address)
+    uri = parse_uri(url)
+    return NetError.new("bad URL") unless uri.is_a?(Uri)
+    target = uri.request_uri
+    @requests << "#{method} #{uri.host} #{target}"
+    route = @routes.find do |r|
+      r["method"].as_s == method && (r["host"].as_s == "*" || r["host"].as_s == uri.host) && r["path"].as_s == target
+    end
+    return HttpAnswer.new(404, {} of String => String, "") unless route
+    content = if b64 = route.as_h["body_b64"]?
+                strict_decode(b64.as_s) || ""
+              elsif repeat = route.as_h["body_repeat"]?
+                repeat[0].as_s * repeat[1].as_i64.to_i32
+              else
+                (route.as_h["body"]? || Any.new("")).as_s
+              end
+    if pad = route.as_h["pad_to"]?
+      content += " " * (pad.as_i64.to_i32 - content.bytesize) if content.bytesize < pad.as_i64
+    end
+    # curl's `--max-filesize` gives up on a body past the limit.
+    return NetError.new("Maximum file size exceeded") if content.bytesize > max_bytes
+    found = {} of String => String
+    route["headers"].as_a.each { |pair| found[pair[0].as_s.downcase] = pair[1].as_s }
+    HttpAnswer.new(route["status"].as_i64.to_i32, found, method == "HEAD" ? "" : content)
+  end
+end
+
+describe "unfurling" do
+  it "answers, looks up and fetches like the reference" do
+    spec = JSON.parse(File.read("#{VECTORS}/opengraph_cases.json"))
+    expected = JSON.parse(File.read("#{VECTORS}/opengraph_expected.json")).as_a
+    public = spec["public_ips"].as_a.map(&.as_s)
+    failures = [] of String
+    spec["cases"].as_a.each_with_index do |c, i|
+      wanted = expected[i]
+      lookups = [] of String
+      served = {} of String => Int32
+      lookup = ->(host : String) do
+        lookups << host
+        lists = spec["hosts"].as_h[host]?
+        return nil.as(Array(String)?) unless lists
+        at = served[host]? || 0
+        served[host] = at + 1
+        list = lists.as_a[at < lists.as_a.size ? at : lists.as_a.size - 1]
+        list.as_a.map(&.as_s).as(Array(String)?)
+      end
+      http = FakeHttp.new(lookup, spec["routes"].as_a, public)
+      result = unfurl(http, c["url"].as_s)
+      response = if result.is_a?(UnfurlError)
+                   "500 #{result.message}"
+                 elsif result
+                   "200 #{result}"
+                 else
+                   "204"
+                 end
+      w = wanted["response"]
+      want_response = case w["status"].as_i64
+                      when 200 then "200 #{w["body"].as_s}"
+                      when 500 then "500 #{w["error"].as_s}"
+                      else          w["status"].as_i64.to_s
+                      end
+      want_lookups = wanted["lookups"].as_a.map(&.as_s)
+      want_requests = wanted["requests"].as_a.map { |r| "#{r[0].as_s} #{r[1].as_s.partition(':')[0]} #{r[2].as_s}" }
+      unless response == want_response && lookups == want_lookups && http.requests == want_requests
+        failures << "#{c["name"].as_s}:\n  expected #{want_response} #{want_lookups} #{want_requests}\n  actual   #{response} #{lookups} #{http.requests}"
+      end
+    end
+    raise "#{failures.size} of #{spec["cases"].as_a.size} cases differ:\n#{failures.join("\n")}" unless failures.empty?
+  end
+end

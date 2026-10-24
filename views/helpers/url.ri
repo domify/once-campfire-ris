@@ -1,0 +1,36 @@
+# URL building that `routes/` leaves to the caller: query strings
+# (`Hash#to_query`).
+module views/helpers/url
+
+import std/text
+import std/int
+import rils/ruby/uri::{cgi_escape}
+import rils/routes/paths::{rooms_directs_path}
+
+# A query parameter value: a scalar or an array (`key[]=a&key[]=b`).
+pub alias Param = String | Array(String)
+
+# `url_for`'s extra params: `Hash#to_query`, which sorts by key.
+pub def with_query(path : String, params : Array(Tuple(String, Param))) : String
+  pairs = [] of String
+  params.sorted_by { |(key, _)| key }.each do |(key, value)|
+    case value
+    when String
+      pairs << "#{cgi_escape(key)}=#{cgi_escape(value)}"
+    when Array(String)
+      escaped = cgi_escape("#{key}[]")
+      value.each { |item| pairs << "#{escaped}=#{cgi_escape(item)}" }
+    end
+  end
+  pairs.empty? ? path : "#{path}?#{pairs.join("&")}"
+end
+
+# `rooms_directs_path(user_ids: [ id, ... ])`.
+pub def rooms_directs_with_users(user_ids : Array(Int64)) : String
+  with_query(rooms_directs_path, [{"user_ids", user_ids.map(&.to_s)}] of Tuple(String, Param))
+end
+
+# `rooms_directs_path(user_ids: [ user.id ])`.
+pub def rooms_directs_with_user(user_id : Int64) : String
+  rooms_directs_with_users([user_id])
+end

@@ -1,0 +1,357 @@
+# `AccountsController` and what's under it (reference/app/controllers/
+# accounts*): the settings page, its people, chat bots, the join code, the
+# logo and the custom styles.
+module controllers/accounts
+
+import rils/template/template::{Buffer}
+import std/text
+import rils/record/sqlite::{Connection, SqlValue}
+import models/account::{Account}
+import models/user::{User, UserChanges, Role, USER_SELECT}
+import models/room::{Room}
+import rils/record/errors::{RecordNotFound}
+import rils/routes/paths::{edit_account_path, account_bots_path, edit_account_custom_styles_path}
+import rils/kit/ctx::{Ctx, ActionResult, Redirect, Freshness, ExpiresIn}
+import rils/kit/errors::{HttpError, halt}
+import rils/kit/response::{Response, SendOptions}
+import rils/kit/format::{HTML, TURBO_STREAM}
+import rils/kit/params::{Param, ParamMap, Permit, permit_keys}
+import rils/ruby/integers::{integer_cast}
+import rils/storage/paths::{blob_redirect_path}
+import rils/storage/variation::{Variation}
+import views/accounts::{Edit, AccountUser, UsersIndexTurboStream, Bot, BotRoom, BotForm, BotsIndex, BotsNew, BotsEdit, CustomStylesEdit}
+import config/app::{App}
+import views/helpers/user_paths::{avatar_path, to_fs_usec}
+import models/attachments::{Record, AttachmentChange, stage_upload, apply_change, analyze_later, destroy_attachment, attached_blob, processed_variant}
+import controllers/concerns::{Passed, Before, before_actions, ensure_can_administer}
+import controllers/messages::{current_user}
+import controllers/pagination::{Page}
+
+# `set_page_and_extract_portion_from users, per_page: 500`
+PER_PAGE = [500_i64]
+
+# `Current.account` where the reference dereferences it.
+def current_account(app : App) : Account | HttpError
+  app.db.read { |conn| Account.first(conn) } || HttpError.internal("undefined method for nil (no account)")
+end
+
+def account_user(app : App, user : User) : AccountUser
+  AccountUser.new(user.id, user.name, user.bio, user.role.name, user.status.name, avatar_path(app.secrets, user))
+end
+
+# The before-actions, then `ensure_can_administer`.
+def administer(app : App, c : Ctx) : Passed | HttpError
+  passed = before_actions(app, c)
+  return passed if passed.is_a?(HttpError)
+  forbidden = ensure_can_administer(passed.user)
+  forbidden ? forbidden : passed
+end
+
+# `edit`: everyone, administrators first; the page only decides whether a
+# next-page loader follows.
+pub def edit_account(app : App, c : Ctx) : ActionResult
+  passed = before_actions(app, c)
+  return passed if passed.is_a?(HttpError)
+  account = current_account(app)
+  return account if account.is_a?(HttpError)
+  format = c.respond_to([HTML])
+  return format if format.is_a?(HttpError)
+  user = passed.user
+  users = app.db.read { |conn| account_users(conn, user.can_administer?(nil)) }
+  page = Page.new(c.param_str("page"), users.size.to_i64, PER_PAGE)
+  shown = users.map { |found| account_user(app, found) }
+  ctx = app.layout_context(c, current_user(user), passed.platform)
+  view = Edit.new(ctx, account.id, account.join_code, account.settings.restrict_room_creation_to_administrators?,
+    shown.select(&.administrator?), shown.reject(&.administrator?), page.last? ? nil : page.next_param.to_s)
+  app.render_layout(c, 200, "Account settings", nil, ctx) { |buffer| view.render_into(buffer) }
+end
+
+# `account_users.ordered.without_bots`: active and banned users for an
+# administrator, active ones otherwise.
+def account_users(conn : Connection, can_administer : Bool) : Array(User)
+  status = can_administer ? %("users"."status" IN (0, 2)) : %("users"."status" = 0)
+  User.find_by_sql(conn, %(#{USER_SELECT} WHERE #{status} AND "users"."role" != 2 ORDER BY LOWER(name)), [] of SqlValue)
+end
+
+# `update`: `@account.update!(params.require(:account).permit(:name, :logo,
+# settings: {}))`.
+pub def update_account(app : App, c : Ctx) : ActionResult
+  passed = administer(app, c)
+  return passed if passed.is_a?(HttpError)
+  account = current_account(app)
+  return account if account.is_a?(HttpError)
+  params = c.require("account")
+  return params if params.is_a?(HttpError)
+  permitted = params.permit([Permit.new("name"), Permit.new("logo"), Permit.any_hash("settings")])
+  name = (param = permitted["name"]?) ? param.to_s? : nil
+  settings = nil.as(Array(Tuple(String, String))?)
+  if (given = permitted["settings"]?) && (hash = given.as_h?)
+    pairs = [] of Tuple(String, String)
+    hash.each { |key, value| pairs << {key, value.to_s? || ""} }
+    settings = pairs
+  end
+  logo = AttachmentChange.from_params(permitted, "logo")
+  return HttpError.internal("Could not find or build blob: expected attachable") if logo && logo.invalid
+  staged = (logo && (upload = logo.upload)) ? stage_upload(app, upload) : nil
+  result = app.db.write do |tx|
+    failed = account.update(tx, name, nil, settings)
+    if failed
+      tx.roll_back
+      failed
+    else
+      apply_change(tx, Record.account(account.id), "logo", logo, staged)
+    end
+  end
+  staged.discard if staged
+  return HttpError.internal(result) if result.is_a?(String)
+  analyze_later(app, result)
+  c.redirect_to(c.url_for(edit_account_path), Redirect.new(notice: "✓"))
+end
+
+# `Accounts::UsersController#index`: the next page of active people, as
+# a turbo stream.
+pub def index_account_users(app : App, c : Ctx) : ActionResult
+  passed = before_actions(app, c)
+  return passed if passed.is_a?(HttpError)
+  format = c.respond_to([TURBO_STREAM])
+  return format if format.is_a?(HttpError)
+  users = app.db.read { |conn| User.active_ordered_without_bots(conn) }
+  page = Page.new(c.param_str("page"), users.size.to_i64, PER_PAGE)
+  shown = page.records(users).map { |found| account_user(app, found) }
+  page.apply_headers(c)
+  view = UsersIndexTurboStream.new(app.view_context(c.request), shown, page.last? ? nil : page.next_param.to_s)
+  c.render(200, TURBO_STREAM, app.written(->(buffer : Buffer) { view.render_into(buffer) }))
+end
+
+# `update`: `role: params.require(:user)[:role].presence_in(%w[ member
+# administrator ]) || "member"`.
+pub def update_account_user(app : App, c : Ctx) : ActionResult
+  passed = administer(app, c)
+  return passed if passed.is_a?(HttpError)
+  user = set_active_user(app, c)
+  return user if user.is_a?(HttpError)
+  params = c.require("user")
+  return params if params.is_a?(HttpError)
+  role = (param = params["role"]) && param.as_s? == "administrator" ? Role::Administrator : Role::Member
+  app.db.write { |tx| user.update(tx, UserChanges.new(role: role)) }
+  c.redirect_to(c.url_for(edit_account_path))
+end
+
+# `destroy`: `@user.deactivate`.
+pub def destroy_account_user(app : App, c : Ctx) : ActionResult
+  passed = administer(app, c)
+  return passed if passed.is_a?(HttpError)
+  user = set_active_user(app, c)
+  return user if user.is_a?(HttpError)
+  app.db.write { |tx| user.deactivate(tx) }
+  c.redirect_to(c.url_for(edit_account_path))
+end
+
+# `User.active.find(params[:user_id] || params[:id])`
+def set_active_user(app : App, c : Ctx) : User | HttpError
+  raw = c.param_str("user_id") || c.param_str("id") || return HttpError.not_found
+  id = integer_cast(raw) || return HttpError.not_found
+  found = app.db.read { |conn| User.find_active(conn, id) }
+  found.is_a?(RecordNotFound) ? HttpError.not_found : found
+end
+
+# `Accounts::BotsController#index`: `User.active_bots.ordered`.
+pub def index_bots(app : App, c : Ctx) : ActionResult
+  passed = administer(app, c)
+  return passed if passed.is_a?(HttpError)
+  format = c.respond_to([HTML])
+  return format if format.is_a?(HttpError)
+  bots = app.db.read { |conn| User.active_bots_ordered(conn).map { |bot| bot_view(app, conn, bot) } }
+  ctx = app.layout_context(c, current_user(passed.user), passed.platform)
+  view = BotsIndex.new(ctx, bots)
+  app.render_layout(c, 200, "Chat bots", nil, ctx) { |buffer| view.render_into(buffer) }
+end
+
+# A bot row: its key and `bot.rooms.without_directs.ordered`.
+def bot_view(app : App, conn : Connection, bot : User) : Bot
+  rooms = Room.for_user_without_directs(conn, bot.id).sorted_by { |room| (room.name || "").downcase }
+  Bot.new(bot.id, bot.name, bot.bio, avatar_path(app.secrets, bot), bot.bot_key, rooms.map { |room| BotRoom.new(room.id, room.name || "") })
+end
+
+pub def new_bot(app : App, c : Ctx) : ActionResult
+  passed = administer(app, c)
+  return passed if passed.is_a?(HttpError)
+  format = c.respond_to([HTML])
+  return format if format.is_a?(HttpError)
+  ctx = app.layout_context(c, current_user(passed.user), passed.platform)
+  view = BotsNew.new(ctx)
+  app.render_layout(c, 200, "New chat bot", nil, ctx) { |buffer| view.render_into(buffer) }
+end
+
+# `create`: `User.create_bot! bot_params`.
+pub def create_bot(app : App, c : Ctx) : ActionResult
+  passed = administer(app, c)
+  return passed if passed.is_a?(HttpError)
+  params = bot_params(c)
+  return params if params.is_a?(HttpError)
+  name = (param = params["name"]?) ? param.to_s? : nil
+  return HttpError.internal("NOT NULL constraint failed: users.name") unless name
+  # `create_webhook!(url: webhook_url) if webhook_url`: "" included.
+  webhook_url = (param = params["webhook_url"]?) ? param.to_s? : nil
+  avatar = AttachmentChange.from_params(params, "avatar")
+  return HttpError.internal("Could not find or build blob: expected attachable") if avatar && avatar.invalid
+  staged = (avatar && (upload = avatar.upload)) ? stage_upload(app, upload) : nil
+  blob = app.db.write do |tx|
+    bot = User.create_bot(tx, name, webhook_url)
+    apply_change(tx, Record.user(bot.id), "avatar", avatar, staged)
+  end
+  staged.discard if staged
+  analyze_later(app, blob)
+  c.redirect_to(c.url_for(account_bots_path))
+end
+
+pub def edit_bot(app : App, c : Ctx) : ActionResult
+  passed = administer(app, c)
+  return passed if passed.is_a?(HttpError)
+  bot = find_active_bot(app, c, "id")
+  return bot if bot.is_a?(HttpError)
+  format = c.respond_to([HTML])
+  return format if format.is_a?(HttpError)
+  form = app.db.read do |conn|
+    avatar = attached_blob(conn, Record.user(bot.id), "avatar")
+    # `image_tag bot.avatar`: the blob's absolute redirect URL.
+    BotForm.new(bot.name, bot.webhook_url(conn), avatar ? c.url_for(blob_redirect_path(app.storage.verifier, avatar)) : nil)
+  end
+  ctx = app.layout_context(c, current_user(passed.user), passed.platform)
+  view = BotsEdit.new(ctx, bot.id, form)
+  app.render_layout(c, 200, "Edit bot", nil, ctx) { |buffer| view.render_into(buffer) }
+end
+
+# `update`: `@bot.update_bot! bot_params`, the webhook first.
+pub def update_bot(app : App, c : Ctx) : ActionResult
+  passed = administer(app, c)
+  return passed if passed.is_a?(HttpError)
+  bot = find_active_bot(app, c, "id")
+  return bot if bot.is_a?(HttpError)
+  params = bot_params(c)
+  return params if params.is_a?(HttpError)
+  changes = UserChanges.new(name: (param = params["name"]?) ? param.to_s? : nil)
+  webhook_url = (param = params["webhook_url"]?) ? param.to_s? : nil
+  avatar = AttachmentChange.from_params(params, "avatar")
+  return HttpError.internal("Could not find or build blob: expected attachable") if avatar && avatar.invalid
+  staged = (avatar && (upload = avatar.upload)) ? stage_upload(app, upload) : nil
+  blob = app.db.write do |tx|
+    bot.update_bot(tx, changes, webhook_url)
+    apply_change(tx, Record.user(bot.id), "avatar", avatar, staged)
+  end
+  staged.discard if staged
+  analyze_later(app, blob)
+  c.redirect_to(c.url_for(account_bots_path))
+end
+
+# `destroy`: `@bot.deactivate`.
+pub def destroy_bot(app : App, c : Ctx) : ActionResult
+  passed = administer(app, c)
+  return passed if passed.is_a?(HttpError)
+  bot = find_active_bot(app, c, "id")
+  return bot if bot.is_a?(HttpError)
+  app.db.write { |tx| bot.deactivate(tx) }
+  c.redirect_to(c.url_for(account_bots_path))
+end
+
+# `Accounts::Bots::KeysController#update`: a new key.
+pub def update_bot_key(app : App, c : Ctx) : ActionResult
+  passed = administer(app, c)
+  return passed if passed.is_a?(HttpError)
+  bot = find_active_bot(app, c, "bot_id")
+  return bot if bot.is_a?(HttpError)
+  app.db.write { |tx| bot.reset_bot_key(tx) }
+  c.redirect_to(c.url_for(account_bots_path))
+end
+
+# `User.active_bots.find(params[key])`
+def find_active_bot(app : App, c : Ctx, key : String) : User | HttpError
+  raw = c.param_str(key) || return HttpError.not_found
+  id = integer_cast(raw) || return HttpError.not_found
+  found = app.db.read { |conn| User.find_active_bot(conn, id) }
+  found.is_a?(RecordNotFound) ? HttpError.not_found : found
+end
+
+# `params.require(:user).permit(:name, :avatar, :webhook_url)`
+def bot_params(c : Ctx) : ParamMap | HttpError
+  user = c.require("user")
+  return user if user.is_a?(HttpError)
+  user.permit(permit_keys(["name", "avatar", "webhook_url"]))
+end
+
+# `Accounts::JoinCodesController#create`: `Current.account.reset_join_code`.
+pub def create_join_code(app : App, c : Ctx) : ActionResult
+  passed = administer(app, c)
+  return passed if passed.is_a?(HttpError)
+  account = current_account(app)
+  return account if account.is_a?(HttpError)
+  app.db.write { |tx| account.reset_join_code(tx) }
+  c.redirect_to(c.url_for(edit_account_path))
+end
+
+# `expires_in 5.minutes, public: true, stale_while_revalidate: 1.week`
+LOGO_MAX_AGE                = 5_i64 * 60
+LOGO_STALE_WHILE_REVALIDATE = 7_i64 * 24 * 60 * 60
+
+# `Accounts::LogosController#show` (`allow_unauthenticated_access`): the
+# logo's variant as a PNG, or the stock app icon.
+pub def show_logo(app : App, c : Ctx) : ActionResult
+  c.use_live_response
+  passed = before_actions(app, c, Before.unauthenticated)
+  return passed if passed.is_a?(HttpError)
+  account = app.db.read { |conn| Account.first(conn) }
+  # `stale?(etag: Current.account)`; there's no template to digest.
+  freshness = Freshness.new(etag: account ? "accounts/#{account.id}-#{to_fs_usec(account.updated_at)}" : nil)
+  if not_modified = c.fresh_when(freshness)
+    return not_modified
+  end
+  c.expires_in(LOGO_MAX_AGE, ExpiresIn.new(public: true, stale_while_revalidate: LOGO_STALE_WHILE_REVALIDATE))
+  small = c.param_str("size") == "small"
+  # `logo.variant(size).processed if logo.variable?`: :small is 192,
+  # :large 512, both PNG.
+  size = small ? 192_i64 : 512_i64
+  variant = account ? processed_variant(app, Record.account(account.id), "logo", Variation.resize_to_limit(size, size, "png")) : nil
+  path = variant ? app.storage.path_for(variant) : "#{__DIR__}/../reference/app/assets/images/logos/#{small ? "app-icon-192.png" : "app-icon.png"}"
+  c.send_file(path, SendOptions.inline("image/png"))
+end
+
+# `destroy`: `Current.account.logo.destroy`.
+pub def destroy_logo(app : App, c : Ctx) : ActionResult
+  c.use_live_response
+  passed = administer(app, c)
+  return passed if passed.is_a?(HttpError)
+  account = current_account(app)
+  return account if account.is_a?(HttpError)
+  app.db.write { |tx| destroy_attachment(tx, Record.account(account.id), "logo") }
+  c.redirect_to(c.url_for(edit_account_path))
+end
+
+# `Accounts::CustomStylesController#edit`.
+pub def edit_custom_styles(app : App, c : Ctx) : ActionResult
+  passed = administer(app, c)
+  return passed if passed.is_a?(HttpError)
+  account = current_account(app)
+  return account if account.is_a?(HttpError)
+  format = c.respond_to([HTML])
+  return format if format.is_a?(HttpError)
+  ctx = app.layout_context(c, current_user(passed.user), passed.platform)
+  view = CustomStylesEdit.new(ctx, account.custom_styles)
+  app.render_layout(c, 200, "Custom styles", nil, ctx) { |buffer| view.render_into(buffer) }
+end
+
+# `update`: `@account.update!(params.require(:account).permit(:custom_styles))`.
+pub def update_custom_styles(app : App, c : Ctx) : ActionResult
+  passed = administer(app, c)
+  return passed if passed.is_a?(HttpError)
+  account = current_account(app)
+  return account if account.is_a?(HttpError)
+  params = c.require("account")
+  return params if params.is_a?(HttpError)
+  permitted = params.permit(permit_keys(["custom_styles"]))
+  if permitted.has_key?("custom_styles")
+    styles = (param = permitted["custom_styles"]?) ? param.to_s? : nil
+    failed = app.db.write { |tx| account.update(tx, nil, {styles}, nil) }
+    return HttpError.internal(failed) if failed
+  end
+  c.redirect_to(c.url_for(edit_account_custom_styles_path), Redirect.new(notice: "✓"))
+end

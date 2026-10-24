@@ -1,0 +1,631 @@
+# The reference's asset pipeline as `bin/rails assets:precompile` builds it
+# with Propshaft 1.2.1 (its lib/propshaft/*), worked out once at boot from
+# the files on disk, as the Rust port's `crates/assets/build.rs` works it
+# out at build time: the load path, each asset's digest and digested path,
+# the CSS and JS compilers' rewritten URLs, the manifest, every stylesheet
+# for `stylesheet_link_tag :all`, and the import map
+# (`assets/importmap`).
+#
+# `overrides/` comes first on the load path, so the port's own frontend
+# changes shadow the reference's files of the same logical path, then
+# `vendor/LOAD_PATH` (the reference's and the vendored gems' asset
+# directories, in `Rails.application.assets.load_path` order).
+module rils/assets/pipeline
+
+import std/text
+import std/file::{File}
+import std/dir::{Dir}
+import std/digest::{SHA1}
+import rils/rails_compat/crypto::{uuid}
+
+pub PREFIX = "/assets"
+
+# The repository: `reference/` and `assets/` sit under it.
+ROOT = "#{__DIR__}/../.."
+
+# An asset's bytes are read from its source when they're needed, not kept:
+# a thread's load path holds names, not the 17 MB they come to.
+pub class Asset
+  getter logical_path : String
+  getter source : String
+
+  def initialize(@logical_path : String, @source : String)
+  end
+
+  pub def content : String
+    File.read(@source)
+  end
+end
+
+# What a digested URL serves: the compiled bytes of a CSS or JS asset, the
+# file's own otherwise.
+pub class Served
+  getter body : String
+  getter content_type : String
+
+  def initialize(@body : String, @content_type : String)
+  end
+end
+
+pub class LoadPath
+  getter assets : Array(Asset)
+  getter version : String
+  @by_logical_path : Hash(String, Int32)
+  @digested : Hash(Int32, String)
+
+  def initialize(paths : Array(String), @version : String)
+    @assets = [] of Asset
+    @by_logical_path = {} of String => Int32
+    @digested = {} of Int32 => String
+    dedup(paths).each do |path|
+      next unless Dir.exists?(path)
+      files = [] of String
+      all_files_from_tree(path, files)
+      files.sorted.each do |file|
+        next if basename(file).starts_with?('.')
+        logical_path = file[path.bytesize + 1, file.bytesize - path.bytesize - 1]
+        next if @by_logical_path.has_key?(logical_path)
+        @by_logical_path[logical_path] = @assets.size
+        @assets << Asset.new(logical_path, file)
+      end
+    end
+  end
+
+  # The reference's load path: `overrides/` and then `vendor/LOAD_PATH`'s
+  # directories, with `config.assets.version` from its initializer.
+  pub def self.reference(root : String = ROOT) : LoadPath
+    rails_root = "#{root}/reference"
+    paths = ["#{root}/rils/assets/overrides"]
+    File.read("#{root}/rils/assets/vendor/LOAD_PATH").lines.each do |line|
+      line = line.strip
+      next if line.empty?
+      kind, _, dir = line.partition(":")
+      case kind
+      when "reference" then paths << "#{rails_root}/#{dir}"
+      when "vendor"    then paths << "#{root}/rils/assets/vendor/#{dir}"
+      else                  raise "vendor/LOAD_PATH: bad line #{line.inspect}"
+      end
+    end
+    LoadPath.new(paths, assets_version(rails_root))
+  end
+
+  pub def find(logical_path : String) : Int32?
+    @by_logical_path[logical_path]?
+  end
+
+  pub def kind(index : Int32) : String
+    case extname(@assets[index].logical_path)
+    when ".css" then "css"
+    when ".js"  then "js"
+    else             "other"
+    end
+  end
+
+  # `Propshaft::Asset#digest`: SHA1 of the content, the content of
+  # everything it references (recursively, in discovery order) and the
+  # assets version, its first eight hex digits.
+  pub def digest(index : Int32) : String
+    sha = SHA1.new
+    sha.update(@assets[index].content)
+    referenced_by(index).each do |referenced|
+      sha.update(@assets[referenced].content)
+    end
+    sha.update(@version)
+    sha.hexfinal[0, 8]
+  end
+
+  # `Propshaft::Asset#digested_path`.
+  pub def digested_path(index : Int32) : String
+    @digested[index]? || (@digested[index] = compute_digested_path(index))
+  end
+
+  def compute_digested_path(index : Int32) : String
+    logical_path = @assets[index].logical_path
+    return logical_path if already_digested?(logical_path)
+    dot = digestable_extension_start(logical_path) || return logical_path
+    "#{logical_path[0, dot]}-#{digest(index)}#{logical_path[dot, logical_path.bytesize - dot]}"
+  end
+
+  # `Propshaft::Compilers#compile`: nil when no compiler is registered for
+  # the type.
+  pub def compiled_content(index : Int32) : String?
+    kind = kind(index)
+    return nil if kind == "other"
+    output = compile_asset_urls(index, kind)
+    compile_source_mapping_urls(index, output)
+  end
+
+  def referenced_by(index : Int32) : Array(Int32)
+    kind = kind(index)
+    references = [] of Int32
+    collect_references(index, kind, references) unless kind == "other"
+    references
+  end
+
+  # `CssAssetUrls#referenced_by` / `JsAssetUrls#referenced_by`: a
+  # referenced asset is scanned with the same pattern whatever its own type.
+  def collect_references(index : Int32, kind : String, references : Array(Int32)) : Nil
+    asset = @assets[index]
+    directory = dirname(asset.logical_path)
+    each_asset_url(asset.content, kind) do |found|
+      referenced = find(resolve_path(directory, found.url))
+      if referenced && !references.includes?(referenced)
+        references << referenced
+        collect_references(referenced, kind, references)
+      end
+    end
+  end
+
+  def compile_asset_urls(index : Int32, kind : String) : String
+    input = @assets[index].content
+    directory = dirname(@assets[index].logical_path)
+    String.build(input.bytesize) do |io|
+      last = 0
+      each_asset_url(input, kind) do |found|
+        io << input[last, found.start - last]
+        replacement = if referenced = find(resolve_path(directory, found.url))
+                        "\"#{PREFIX}/#{digested_path(referenced)}#{found.fingerprint}\""
+                      else
+                        "\"#{found.url}\""
+                      end
+        io << (kind == "css" ? "url(#{replacement})" : replacement)
+        last = found.stop
+      end
+      io << input[last, input.bytesize - last]
+    end
+  end
+
+  # `SourceMappingUrls#compile`: a trailing `sourceMappingURL` comment
+  # points at the digested map, or goes when there's no such map.
+  def compile_source_mapping_urls(index : Int32, input : String) : String
+    found = source_mapping_url(input) || return input
+    url = strip_asset_prefix(found.url)
+    directory = dirname(@assets[index].logical_path)
+    resolved = directory == "." ? url : plus(directory, url)
+    comment = if referenced = find(resolved)
+                "#{found.comment_start}# sourceMappingURL=#{PREFIX}/#{digested_path(referenced)}#{found.comment_end}"
+              else
+                "#{found.comment_start}#{found.comment_end}"
+              end
+    input[0, found.start] + comment + input[found.stop, input.bytesize - found.stop]
+  end
+
+  # Every digested URL and what it serves, the manifest's included.
+  pub def files : Hash(String, Served)
+    files = {} of String => Served
+    @assets.each_with_index do |asset, index|
+      body = compiled_content(index) || asset.content
+      files["#{PREFIX}/#{digested_path(index)}"] = Served.new(body, mime_type(extname(asset.logical_path)))
+    end
+    files["#{PREFIX}/.manifest.json"] = Served.new(manifest_json, "application/json")
+    files
+  end
+
+  # `Propshaft::Processor#process` into *out_dir*`/assets`: each compiled
+  # CSS or JS asset and the manifest written there, the URL of every
+  # digested asset mapped to the file that serves it (the source itself
+  # when nothing compiles it). A digested name stands for its content, so
+  # one already there is kept; each file is written under a name of its
+  # own and renamed into place, for the threads and processes that boot
+  # side by side.
+  pub def precompile(out_dir : String) : Hash(String, String)
+    served = {} of String => String
+    @assets.each_with_index do |asset, index|
+      url = "#{PREFIX}/#{digested_path(index)}"
+      if compiled = compiled_content(index)
+        target = "#{out_dir}#{url}"
+        write_atomically(target, compiled) unless File.exists?(target)
+        served[url] = target
+      else
+        served[url] = asset.source
+      end
+    end
+    manifest = "#{out_dir}#{PREFIX}/.manifest.json"
+    write_atomically(manifest, manifest_json)
+    served["#{PREFIX}/.manifest.json"] = manifest
+    served
+  end
+
+  # `Propshaft::Processor#write_manifest`, in load path order.
+  pub def manifest_json : String
+    entries = [] of String
+    @assets.each_with_index do |asset, index|
+      entries << "#{json(asset.logical_path)}:{\"digested_path\":#{json(digested_path(index))},\"integrity\":null}"
+    end
+    "{#{entries.join(",")}}"
+  end
+
+  # `Propshaft::Helper#all_stylesheets_paths`: every CSS logical path,
+  # sorted.
+  pub def all_stylesheet_paths : Array(String)
+    @assets.map(&.logical_path).select { |path| extname(path) == ".css" }.sorted
+  end
+end
+
+def write_atomically(path : String, content : String) : Nil
+  Dir.mkdir_p(dirname(path))
+  temporary = "#{path}.#{uuid}.tmp"
+  File.write(temporary, content)
+  File.rename(temporary, path)
+end
+
+# A `url(...)` or `RAILS_ASSET_URL(...)` the compilers rewrite: its bytes
+# in the source, the URL and the `?query` or `#fragment` after it.
+pub class AssetUrl
+  getter start : Int32
+  getter stop : Int32
+  getter url : String
+  getter fingerprint : String
+
+  def initialize(@start : Int32, @stop : Int32, @url : String, @fingerprint : String)
+  end
+end
+
+# Ruby's `\s`.
+def space?(c : Char) : Bool
+  c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r'
+end
+
+# The matches of `CssAssetUrls::ASSET_URL_PATTERN` (*kind* "css") or
+# `JsAssetUrls::ASSET_URL_PATTERN` ("js"), left to right:
+#
+#   head\(\s*["']?(?!(?:excluded))([^"'\s?#)]+)([#?][^"')]+)?\s*["']?\)
+#
+# A greedy scan finds what the regexp does for every URL Campfire's assets
+# hold; it doesn't backtrack into a shorter URL.
+pub def each_asset_url(input : String, kind : String, & : AssetUrl -> Nil) : Nil
+  head = kind == "css" ? "url(" : "RAILS_ASSET_URL("
+  excluded = kind == "css" ? ["#", "%23", "data:", "http:", "https:", "//"] : ["#", "%23", "data", "http", "//"]
+  size = input.bytesize
+  at = 0
+  while start = input.index(head, at)
+    at = start + 1
+    i = start + head.bytesize
+    i = skip_spaces(input, i)
+    i += 1 if i < size && quote?(at(input, i))
+    next if excluded.any? { |prefix| input.byte_index(prefix, i) == i }
+    url_start = i
+    while i < size
+      c = at(input, i)
+      break if quote?(c) || space?(c) || c == '?' || c == '#' || c == ')'
+      i += 1
+    end
+    next if i == url_start
+    url = input[url_start, i - url_start]
+    fingerprint = ""
+    if i < size && (at(input, i) == '#' || at(input, i) == '?')
+      tail_start = i
+      i += 1
+      while i < size && !quote?(at(input, i)) && at(input, i) != ')'
+        i += 1
+      end
+      next if i == tail_start + 1
+      fingerprint = input[tail_start, i - tail_start]
+      # `[^"')]+` takes trailing whitespace too; the `\s*` after it then
+      # matches nothing.
+    end
+    i = skip_spaces(input, i)
+    i += 1 if i < size && quote?(at(input, i))
+    next unless i < size && at(input, i) == ')'
+    yield AssetUrl.new(start, i + 1, url, fingerprint)
+    at = i + 1
+  end
+end
+
+def quote?(c : Char) : Bool
+  c == '"' || c == '\''
+end
+
+# The trailing comment `SourceMappingUrls::SOURCE_MAPPING_PATTERN` finds:
+#
+#   (//|/\*)# sourceMappingURL=(.+\.map)(\s*?\*/)?\s*?(?=\n?\z)
+pub class SourceMappingUrl
+  getter start : Int32
+  getter stop : Int32
+  getter comment_start : String
+  getter url : String
+  getter comment_end : String
+
+  def initialize(@start : Int32, @stop : Int32, @comment_start : String, @url : String, @comment_end : String)
+  end
+end
+
+pub def source_mapping_url(input : String) : SourceMappingUrl?
+  marker = "# sourceMappingURL="
+  at = 0
+  while found = input.index(marker, at)
+    at = found + 1
+    next if found < 2
+    opener = input[found - 2, 2]
+    next unless opener == "//" || opener == "/*"
+    line_start = found + marker.bytesize
+    line_end = input.index('\n', line_start) || input.bytesize
+    line = input[line_start, line_end - line_start]
+    # `.+\.map` is greedy: the last ".map" on the line that leaves a valid
+    # rest.
+    candidate = line.rindex(".map")
+    while candidate && candidate > 0
+      url_end = line_start + candidate + 4
+      if ending = mapping_comment_end(input, url_end)
+        return SourceMappingUrl.new(found - 2, ending[1], opener, input[line_start, candidate + 4], ending[0])
+      end
+      candidate = candidate > 0 ? line.rindex(".map", candidate - 1) : nil
+    end
+  end
+  nil
+end
+
+# After the URL: `(\s*?\*/)?\s*?` up to `\n?\z`. The comment end, and where
+# the match stops (before a final newline).
+def mapping_comment_end(input : String, from : Int32) : Tuple(String, Int32)?
+  size = input.bytesize
+  i = from
+  i = skip_spaces(input, i)
+  comment_end = ""
+  if input.byte_index("*/", i) == i
+    comment_end = input[from, i + 2 - from]
+    i += 2
+  else
+    i = from
+  end
+  rest = input[i, size - i]
+  return nil unless rest.chars.all? { |c| space?(c) }
+  stop = input.ends_with?('\n') && size - 1 >= i ? size - 1 : size
+  {comment_end, stop}
+end
+
+# `url.gsub(%r{^(.+/)?#{url_prefix}/}, "")`: one line, so the first match.
+def strip_asset_prefix(url : String) : String
+  marker = "#{PREFIX}/"
+  index = url.index(marker) || return url
+  url[index + marker.bytesize, url.bytesize - index - marker.bytesize]
+end
+
+# `config.assets.version` from config/initializers/assets.rb.
+def assets_version(rails_root : String) : String
+  path = "#{rails_root}/config/initializers/assets.rb"
+  return "1" unless File.exists?(path)
+  File.read(path).lines.each do |line|
+    next if line.lstrip.starts_with?('#')
+    _, found, value = line.partition("config.assets.version")
+    next if found.empty?
+    value = value.lstrip
+    next unless value.starts_with?('=')
+    return value[1, value.bytesize - 1].strip.strip("\"'")
+  end
+  "1"
+end
+
+# `Propshaft::LoadPath#dedup`: drop paths nested in an earlier sorted
+# path, keeping the original order.
+def dedup(paths : Array(String)) : Array(String)
+  sorted = paths.sorted_by { |path| path.gsub('/', '\0') }
+  kept = [] of String
+  sorted.each do |path|
+    last = kept.last?
+    kept << path if last.nil? || !path.starts_with?(last)
+  end
+  seen = [] of String
+  paths.select do |path|
+    if kept.includes?(path) && !seen.includes?(path)
+      seen << path
+      true
+    else
+      false
+    end
+  end
+end
+
+def all_files_from_tree(path : String, files : Array(String)) : Nil
+  Dir.children(path).each do |entry|
+    child = "#{path}/#{entry}"
+    if Dir.exists?(child)
+      all_files_from_tree(child, files)
+    else
+      files << child
+    end
+  end
+end
+
+def basename(path : String) : String
+  slash = path.rindex('/')
+  slash ? path[slash + 1, path.bytesize - slash - 1] : path
+end
+
+def already_digested?(path : String) : Bool
+  marker = path.index(".digested") || return false
+  dash = path.rindex('-', marker) || return false
+  digest = path[dash + 1, marker - dash - 1]
+  digest.bytesize >= 7 && digest.bytesize <= 128 && digest.chars.all? { |c| c.ascii_alphanumeric? || c == '_' || c == '-' }
+end
+
+# The start of the extension `sub(/\.(\w+(\.map)?)$/)` replaces.
+def digestable_extension_start(path : String) : Int32?
+  i = 0
+  while dot = path.index('.', i)
+    rest = path[dot + 1, path.bytesize - dot - 1]
+    return dot if word?(rest) || (rest.ends_with?(".map") && word?(rest[0, rest.bytesize - 4]))
+    i = dot + 1
+  end
+  nil
+end
+
+def word?(s : String) : Bool
+  !s.empty? && s.chars.all? { |c| c.ascii_alphanumeric? || c == '_' }
+end
+
+# Ruby's `File.extname`.
+pub def extname(path : String) : String
+  base = basename(path).lstrip('.')
+  dot = base.rindex('.') || return ""
+  base[dot, base.bytesize - dot]
+end
+
+def dirname(path : String) : String
+  slash = path.rindex('/') || return "."
+  path[0, slash]
+end
+
+# `CssAssetUrls#resolve_path`.
+def resolve_path(directory : String, filename : String) : String
+  if filename.starts_with?("../")
+    cleanpath(plus(directory, filename))
+  elsif filename.starts_with?('/')
+    filename[1, filename.bytesize - 1]
+  else
+    plus(directory, filename.starts_with?("./") ? filename[2, filename.bytesize - 2] : filename)
+  end
+end
+
+# `Pathname#+` for relative paths.
+def plus(left : String, right : String) : String
+  prefix = left.split('/').reject(&.empty?)
+  suffix = right.split('/').reject(&.empty?)
+  kept = [] of String
+  loop do
+    while suffix[0]? == "."
+      suffix.shift
+    end
+    last = prefix.empty? ? nil : prefix.pop
+    break if last.nil?
+    next if last == "."
+    if last == ".." || suffix[0]? != ".."
+      kept << last
+      break
+    end
+    suffix.shift
+  end
+  joined = prefix + kept + suffix
+  joined.empty? ? "." : joined.join("/")
+end
+
+# `Pathname#cleanpath` for relative paths.
+def cleanpath(path : String) : String
+  out = [] of String
+  path.split('/').each do |component|
+    case component
+    when "", "." then nil
+    when ".."
+      if (last = out.last?) && last != ".."
+        out.pop
+      else
+        out << component
+      end
+    else
+      out << component
+    end
+  end
+  out.empty? ? "." : out.join("/")
+end
+
+# `JSON.generate`'s string escaping.
+pub def json(s : String) : String
+  String.build(s.bytesize + 2) do |io|
+    io << '"'
+    s.each_char do |c|
+      case c
+      when '"'  then io << "\\\""
+      when '\\' then io << "\\\\"
+      when '\n' then io << "\\n"
+      when '\r' then io << "\\r"
+      when '\t' then io << "\\t"
+      when '\b' then io << "\\b"
+      when '\f' then io << "\\f"
+      else
+        if c.ord < 0x20
+          io << "\\u" << c.ord.to_s(16).rjust(4, '0')
+        else
+          io << c
+        end
+      end
+    end
+    io << '"'
+  end
+end
+
+# `Rack::Mime::MIME_TYPES` for what the load path holds.
+pub def mime_type(extname : String) : String
+  case extname
+  when ".css"          then "text/css"
+  when ".js"           then "text/javascript"
+  when ".map", ".json" then "application/json"
+  when ".svg"          then "image/svg+xml"
+  when ".png"          then "image/png"
+  when ".jpg", ".jpeg" then "image/jpeg"
+  when ".gif"          then "image/gif"
+  when ".webp"         then "image/webp"
+  when ".ico"          then "image/vnd.microsoft.icon"
+  when ".mp3"          then "audio/mpeg"
+  when ".woff2"        then "font/woff2"
+  when ".woff"         then "font/woff"
+  when ".txt"          then "text/plain"
+  when ".html"         then "text/html"
+  else                      "application/octet-stream"
+  end
+end
+
+# The byte at *i* as a char: what the patterns compare is ASCII.
+def at(s : String, i : Int32) : Char
+  s[i, 1][0]
+end
+
+def skip_spaces(s : String, i : Int32) : Int32
+  while i < s.bytesize && space?(at(s, i))
+    i += 1
+  end
+  i
+end
+
+# What `stylesheet_link_tag :all, "data-turbo-track": "reload"` renders,
+# and the preload links Rails puts in the response's `link` header while
+# rendering it (`config.action_view.preload_links_header`).
+pub class StylesheetTags
+  getter html : String
+  getter preload_links : Array(String)
+
+  def initialize(@html : String, @preload_links : Array(String))
+  end
+end
+
+# Propshaft's `stylesheet_link_tag *sources, **options`: one Rails
+# `stylesheet_link_tag` a source, joined by newlines.
+pub def stylesheet_link_tag_all(load_path : LoadPath, options : Array(Tuple(String, String))) : StylesheetTags
+  html = [] of String
+  preload_links = [] of String
+  load_path.all_stylesheet_paths.each do |source|
+    index = load_path.find(source) || raise "The asset '#{source}' was not found in the load path."
+    href = "#{PREFIX}/#{load_path.digested_path(index)}"
+    preload_links << "<#{href}>; rel=preload; as=style; nopush"
+    tag = String.build do |io|
+      io << "<link rel=\"stylesheet\" href=\"" << html_escape(href) << '"'
+      options.each { |(name, value)| io << ' ' << name << "=\"" << html_escape(value) << '"' }
+      io << " />"
+    end
+    html << tag
+  end
+  StylesheetTags.new(html.join("\n"), preload_links)
+end
+
+# `send_preload_links_header` once a stylesheet: Propshaft calls Rails'
+# `stylesheet_link_tag` a source at a time, so each call's `break` drops
+# only its own link, one that would take the header past 1,000 bytes
+# (the comma not counted); a later, shorter one can still fit.
+pub def append_preload_links(header : String, links : Array(String)) : String
+  String.build do |io|
+    io << header
+    size = header.bytesize
+    links.each do |link|
+      next if size + link.bytesize > 1000
+      if size > 0
+        io << ','
+        size += 1
+      end
+      io << link
+      size += link.bytesize
+    end
+  end
+end
+
+def html_escape(s : String) : String
+  s.gsub("&", "&amp;").gsub("<", "&lt;").gsub(">", "&gt;").gsub("\"", "&quot;").gsub("'", "&#39;")
+end

@@ -1,0 +1,62 @@
+# What the pipeline asks the app: the users attachments point at, as
+# Action Text looks them up (the Rust port's `AttachableResolver`).
+module rils/richtext/records
+
+# What `users/_mention.html.erb` renders of a user.
+pub class MentionUser
+  getter id : Int64
+  getter name : String
+  # `User#title`: name and bio joined with " – ".
+  getter title : String
+  # `user.attachable_sgid`.
+  getter attachable_sgid : String
+  getter user_path : String
+  # `fresh_user_avatar_path(user)`.
+  getter avatar_path : String
+
+  def initialize(@id : Int64, @name : String, @title : String, @attachable_sgid : String, @user_path : String,
+                 @avatar_path : String)
+  end
+end
+
+# `SignedGlobalID.parse(sgid, for: "attachable")`'s record: a user, a
+# verified signature whose record is gone (*missing_model*), or nothing.
+pub class SignedLookup
+  getter user : MentionUser?
+  getter missing_model : String?
+
+  def initialize(@user : MentionUser? = nil, @missing_model : String? = nil)
+  end
+end
+
+# `GlobalID.find(gid)`: a user, another model ("other"), nothing
+# ("not_found"), or raising ("raises").
+pub class GidLookup
+  getter user : MentionUser?
+  getter outcome : String
+
+  def initialize(@user : MentionUser? = nil, @outcome : String = "not_found")
+  end
+end
+
+# The app's records, as Action Text looks them up. Finds nothing unless a
+# subclass says otherwise.
+pub class Resolver
+  pub def locate_signed(sgid : String) : SignedLookup
+    SignedLookup.new
+  end
+
+  pub def find_gid(gid : String) : GidLookup
+    GidLookup.new
+  end
+end
+
+# Everything rendering needs from the request and the app.
+pub class RenderContext
+  getter resolver : Resolver
+  # `Current.request_host`
+  getter host : String?
+
+  def initialize(@resolver : Resolver, @host : String?)
+  end
+end

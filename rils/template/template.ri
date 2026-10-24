@@ -1,0 +1,263 @@
+# Templates compiled into the program, as Askama compiles them in the Rust
+# port: ERB tags around iyi code, with Askama's whitespace rules.
+#
+#   * `<%= expr %>` prints the value escaped like ERB, unless it is `Html`
+#     (or a `Fragment` or `RecordedPage`), which prints as is. Escaping is
+#     the default; nothing a helper didn't mark safe gets through raw.
+#   * `<%== expr %>` prints the value raw: Askama's `|safe`, Rails' `raw`.
+#   * `<% code %>` runs iyi code; `<% if x %>`, `<% xs.each do |x| %>`,
+#     `<% end %>` and every other statement work.
+#   * `<%= helper(args) do %>...<% end %>` hands the block's output, as
+#     `Html`, to a helper that returns `Html` (Askama's filter blocks).
+#   * `<% include "path" %>` inlines the template at path in this scope.
+#   * `content_for "name" do ... end` collects a region for the layout,
+#     `region("name")` prints one, and `capture do ... end` is a block's
+#     output as `Html`.
+#   * `<%-` drops all whitespace before the tag and `-%>` all whitespace
+#     after it, like Askama's `{%-` and `-%}`; a file's last newline is
+#     dropped, as Askama drops it. `<%#` is a comment, `<%%` a literal.
+#
+# A view class says which template renders it:
+#
+#   class Show
+#     getter ctx : ViewContext
+#     Template.def_render("welcome/show.html.erb")
+#   end
+#
+# and gets `render_into(buffer)` and `render : Html`; `def_page` defines
+# only `render_into`, for a `Page`, which renders inside its layout. The
+# template's code runs inside the class, so its fields and methods are bare
+# names, and the helpers its module imports are too. Templates live under
+# `views/templates`, mirroring `reference/app/views`.
+module rils/template/template
+
+import rils/template/html::{Html, escape}
+import rils/template/recorded::{Fragment, RecordedPage, MIN_RECORDED}
+
+# What a template prints into: text, escaped values, captured blocks,
+# cached fragments (recorded rather than copied, see `views/recorded`) and
+# the `content_for` regions a page hands its layout.
+#
+# The text is written on the tape, escaped values straight into it; a
+# captured block or a region is copied out once and the writer cut back.
+# A `Buffer` is a value a template is handed, so what it keeps besides the
+# writer - the recorded fragments, the regions, how deep a capture is - is
+# one heap object its copies share.
+@[OnTape]
+pub struct Buffer
+  @io : Str::Builder
+  @state : BufferState
+  # The page a layout wraps, where the page's own buffer wrote it.
+  @content : Str
+
+  def initialize(capacity : Int32 = 1024)
+    @io = Str::Builder.new(capacity)
+    @state = BufferState.new
+    @content = "".as_tape
+  end
+
+  # Writing into *io*, a response's writer that leaves as it is written:
+  # a cached fragment is copied in rather than recorded.
+  def initialize(@io : Str::Builder)
+    @state = BufferState.new
+    @state.inline = true
+    @content = "".as_tape
+  end
+
+  # This buffer as a layout around *page*: `content` prints the page from
+  # where it lies, and its regions are the page's.
+  def wrap(page : Buffer) : Nil
+    @content = page.written
+    @state.content_fragments = page.fragments
+    @state.regions = page.regions
+  end
+
+  # What was printed, outside any region, where it lies: nothing copied.
+  def written : Str
+    @io.finish
+  end
+
+  def fragments : Array(Tuple(Int32, Fragment))
+    @state.fragments
+  end
+
+  # `content` in a layout: the page it wraps.
+  def emit(value : Yielded) : Nil
+    text = @content
+    position = 0
+    @state.content_fragments.each do |(offset, fragment)|
+      @io.append(text[position, offset - position])
+      emit(fragment)
+      position = offset
+    end
+    @io.append(text[position, text.bytesize - position])
+  end
+
+  # The template's own text.
+  def text(text : String) : Nil
+    @io.append(text)
+  end
+
+  def emit(value : Html) : Nil
+    @io.append(value.to_s)
+  end
+
+  def emit(value : String) : Nil
+    @io.append_html_escaped(value)
+  end
+
+  # A cached fragment: noted at this offset when it is long enough and the
+  # buffer isn't capturing a block (whose output becomes `Html` text).
+  def emit(fragment : Fragment) : Nil
+    if !@state.inline && @state.capturing == 0 && fragment.bytesize >= MIN_RECORDED
+      @state.fragments << {@io.length, fragment}
+    else
+      @io.append(fragment.html)
+    end
+  end
+
+  # A page rendered elsewhere, its fragments recorded here again.
+  def emit(page : RecordedPage) : Nil
+    text = page.text.as_tape
+    position = 0
+    page.fragments.each do |(offset, fragment)|
+      @io.append(text[position, offset - position])
+      emit(fragment)
+      position = offset
+    end
+    @io.append(text[position, text.bytesize - position])
+  end
+
+  def emit(value : Nil) : Nil
+  end
+
+  def emit(value) : Nil
+    @io.append_html_escaped(value.to_s)
+  end
+
+  # `<%== %>`.
+  def raw(value : Html) : Nil
+    emit(value)
+  end
+
+  def raw(value : Fragment) : Nil
+    emit(value)
+  end
+
+  def raw(value : RecordedPage) : Nil
+    emit(value)
+  end
+
+  def raw(value : Yielded) : Nil
+    emit(value)
+  end
+
+  def raw(value) : Nil
+    @io.append(value.to_s)
+  end
+
+  # What the block prints, as `Html`, instead of printing it: `Html` is a
+  # heap value a helper may keep, so the block's text leaves the tape here.
+  def capture(& : -> _) : Html
+    mark = @io.length
+    @state.capturing += 1
+    yield
+    @state.capturing -= 1
+    html = Html.new(@io.finish[mark, @io.length - mark].to_heap)
+    @io.truncate(mark)
+    html
+  end
+
+  # `content_for name do ... end`: the block's output appended to the
+  # region, its fragments still recorded. A region outlives this buffer's
+  # tape (`regions`), so its text leaves it here.
+  def content_for(name : String, & : -> _) : Nil
+    mark = @io.length
+    saved_fragments = @state.fragments
+    @state.fragments = [] of Tuple(Int32, Fragment)
+    yield
+    recorded = @state.fragments.map { |(offset, fragment)| {offset - mark, fragment} }
+    page = RecordedPage.new(@io.finish[mark, @io.length - mark].to_heap, recorded)
+    @io.truncate(mark)
+    @state.fragments = saved_fragments
+    if before = @state.regions[name]?
+      shifted = before.fragments.dup
+      page.fragments.each { |(offset, fragment)| shifted << {before.text.bytesize + offset, fragment} }
+      page = RecordedPage.new(before.text + page.text, shifted)
+    end
+    @state.regions[name] = page
+  end
+
+  # The region's content, empty when nothing was given for it.
+  def region(name : String) : RecordedPage
+    @state.regions[name]? || RecordedPage.new("")
+  end
+
+  # Every region, for a layout that outlives this buffer's tape.
+  def regions : Hash(String, RecordedPage)
+    @state.regions
+  end
+
+  # What was printed, outside any region, copied off the tape: the page
+  # goes into the response, which the response cache may keep.
+  def to_page : RecordedPage
+    RecordedPage.new(@io.finish.to_heap, @state.fragments)
+  end
+
+  def to_html : Html
+    Html.new(to_page.to_s)
+  end
+end
+
+# What a `Buffer` keeps on the heap, shared by its copies.
+class BufferState
+  property fragments : Array(Tuple(Int32, Fragment))
+  property regions : Hash(String, RecordedPage)
+  property capturing : Int32
+  # Whether fragments are copied in, not recorded.
+  property inline : Bool
+  # The fragments of the page a layout wraps, at their offsets in it.
+  property content_fragments : Array(Tuple(Int32, Fragment))
+
+  def initialize
+    @fragments = [] of Tuple(Int32, Fragment)
+    @regions = {} of String => RecordedPage
+    @capturing = 0
+    @inline = false
+    @content_fragments = [] of Tuple(Int32, Fragment)
+  end
+end
+
+# What `content` is in a layout: the page the layout's buffer wraps.
+pub struct Yielded
+end
+
+pub struct Template
+  # Defines `render_into(buffer)` and `render : Html` from the template at
+  # *path* under the nearest `templates/` directory.
+  macro def_render(path)
+    def render_into(__io__ : ::Rils::Template::Template::Buffer) : Nil
+      {{ run("./process", @caller.first.filename || "", path) }}
+    end
+
+    # On the caller's tape, a tape of its own when there is none. Its `Html`
+    # is copied off before the tape goes.
+    def render : ::Rils::Template::Html::Html
+      %html = ::Rils::Template::Html::Html.new("")
+      ::tape do
+        %buffer = ::Rils::Template::Template::Buffer.new
+        render_into(%buffer)
+        %html = %buffer.to_html
+      end
+      %html
+    end
+  end
+
+  # Defines only `render_into(buffer)`, for a page whose `render` puts it in
+  # a layout.
+  macro def_page(path)
+    def render_into(__io__ : ::Rils::Template::Template::Buffer) : Nil
+      {{ run("./process", @caller.first.filename || "", path) }}
+    end
+  end
+end

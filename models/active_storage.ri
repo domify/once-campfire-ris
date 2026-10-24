@@ -1,0 +1,96 @@
+# Rows of `active_storage_blobs` and `active_storage_attachments`, for the
+# models that have attachments. Uploading, analysis and variants belong to
+# `storage/`.
+module models/active_storage
+
+import rils/record/sqlite::{Connection, Row, SqlValue}
+import rils/record/timestamp::{Timestamp}
+import rils/record/database::{Tx}
+import rils/record/errors::{RecordNotFound}
+
+pub BLOB_COLUMNS = %("active_storage_blobs"."id", "active_storage_blobs"."key", "active_storage_blobs"."filename", "active_storage_blobs"."content_type", "active_storage_blobs"."metadata", "active_storage_blobs"."service_name", "active_storage_blobs"."byte_size", "active_storage_blobs"."checksum", "active_storage_blobs"."created_at")
+
+pub class Blob
+  getter id : Int64
+  getter key : String
+  getter filename : String
+  getter content_type : String?
+  # JSON text, e.g.
+  # `{"identified":true,"width":800,"height":600,"analyzed":true}`.
+  property metadata : String?
+  getter service_name : String
+  getter byte_size : Int64
+  getter checksum : String?
+  getter created_at : Timestamp
+
+  def initialize(@id : Int64, @key : String, @filename : String, @content_type : String?, @metadata : String?, @service_name : String, @byte_size : Int64, @checksum : String?, @created_at : Timestamp)
+  end
+
+  pub def self.from_row(row : Row, offset : Int32 = 0) : Blob
+    Blob.new(row.int(offset), row.text(offset + 1), row.text(offset + 2), row.text?(offset + 3), row.text?(offset + 4), row.text(offset + 5), row.int(offset + 6), row.text?(offset + 7), row.time(offset + 8))
+  end
+
+  pub def self.find(conn : Connection, id : Int64) : Blob | RecordNotFound
+    conn.query_one(%(SELECT #{BLOB_COLUMNS} FROM "active_storage_blobs" WHERE "active_storage_blobs"."id" = ? LIMIT 1), [id] of SqlValue) { |row| Blob.from_row(row) } || RecordNotFound.new("ActiveStorage::Blob")
+  end
+
+  pub def self.find_by_key(conn : Connection, key : String) : Blob?
+    conn.query_one(%(SELECT #{BLOB_COLUMNS} FROM "active_storage_blobs" WHERE "active_storage_blobs"."key" = ? LIMIT 1), [key] of SqlValue) { |row| Blob.from_row(row) }
+  end
+
+  # Inserts a blob row; *blob*'s id and `created_at` are ignored and
+  # assigned.
+  pub def self.create(tx : Tx, blob : Blob) : Blob
+    now = tx.now
+    id = tx.conn.query_one(%(INSERT INTO "active_storage_blobs" ("byte_size", "checksum", "content_type", "created_at", "filename", "key", "metadata", "service_name") VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING "id"), [blob.byte_size, blob.checksum, blob.content_type, now, blob.filename, blob.key, blob.metadata, blob.service_name] of SqlValue) { |row| row.int(0) }
+    raise "insert into active_storage_blobs returned no id" unless id
+    Blob.new(id, blob.key, blob.filename, blob.content_type, blob.metadata, blob.service_name, blob.byte_size, blob.checksum, now)
+  end
+
+  pub def update_metadata(tx : Tx, metadata : String) : Nil
+    tx.conn.execute(%(UPDATE "active_storage_blobs" SET "metadata" = ? WHERE "active_storage_blobs"."id" = ?), [metadata, @id] of SqlValue)
+    @metadata = metadata
+  end
+
+  pub def delete(tx : Tx) : Nil
+    tx.conn.execute(%(DELETE FROM "active_storage_blobs" WHERE "active_storage_blobs"."id" = ?), [@id] of SqlValue)
+  end
+end
+
+pub ATTACHMENT_COLUMNS = %("active_storage_attachments"."id", "active_storage_attachments"."name", "active_storage_attachments"."record_type", "active_storage_attachments"."record_id", "active_storage_attachments"."blob_id", "active_storage_attachments"."created_at")
+
+pub class Attachment
+  getter id : Int64
+  getter name : String
+  getter record_type : String
+  getter record_id : Int64
+  getter blob_id : Int64
+  getter created_at : Timestamp
+
+  def initialize(@id : Int64, @name : String, @record_type : String, @record_id : Int64, @blob_id : Int64, @created_at : Timestamp)
+  end
+
+  pub def self.from_row(row : Row, offset : Int32 = 0) : Attachment
+    Attachment.new(row.int(offset), row.text(offset + 1), row.text(offset + 2), row.int(offset + 3), row.int(offset + 4), row.time(offset + 5))
+  end
+
+  # `has_one_attached`'s lookup.
+  pub def self.find_for(conn : Connection, record_type : String, record_id : Int64, name : String) : Attachment?
+    conn.query_one(%(SELECT #{ATTACHMENT_COLUMNS} FROM "active_storage_attachments" WHERE "active_storage_attachments"."record_id" = ? AND "active_storage_attachments"."record_type" = ? AND "active_storage_attachments"."name" = ? LIMIT 1), [record_id, record_type, name] of SqlValue) { |row| Attachment.from_row(row) }
+  end
+
+  pub def self.create(tx : Tx, record_type : String, record_id : Int64, name : String, blob_id : Int64) : Attachment
+    now = tx.now
+    id = tx.conn.query_one(%(INSERT INTO "active_storage_attachments" ("blob_id", "created_at", "name", "record_id", "record_type") VALUES (?, ?, ?, ?, ?) RETURNING "id"), [blob_id, now, name, record_id, record_type] of SqlValue) { |row| row.int(0) }
+    raise "insert into active_storage_attachments returned no id" unless id
+    Attachment.new(id, name, record_type, record_id, blob_id, now)
+  end
+
+  pub def delete(tx : Tx) : Nil
+    tx.conn.execute(%(DELETE FROM "active_storage_attachments" WHERE "active_storage_attachments"."id" = ?), [@id] of SqlValue)
+  end
+
+  pub def blob(conn : Connection) : Blob | RecordNotFound
+    Blob.find(conn, @blob_id)
+  end
+end

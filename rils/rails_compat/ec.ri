@@ -1,0 +1,154 @@
+# P-256 for Web Push, from OpenSSL's libcrypto (the `EC_KEY` interface the
+# web-push gem's `OpenSSL::PKey::EC` stands on): keys, ECDH, ES256
+# signatures and AES-128-GCM. Binary data travels as a String of bytes;
+# private keys are 32-byte scalars, public keys 65-byte uncompressed
+# points.
+@[Ffi]
+module rils/rails_compat/ec
+
+import std/text
+import std/digest::{SHA256}
+
+@[Link("crypto")]
+lib LibEc
+  fun key_new = EC_KEY_new_by_curve_name(nid : Int32) : Void*
+  fun key_free = EC_KEY_free(key : Void*) : Void
+  fun key_group = EC_KEY_get0_group(key : Void*) : Void*
+  fun key_generate = EC_KEY_generate_key(key : Void*) : Int32
+  fun key_private = EC_KEY_get0_private_key(key : Void*) : Void*
+  fun key_public = EC_KEY_get0_public_key(key : Void*) : Void*
+  fun key_set_private = EC_KEY_set_private_key(key : Void*, bn : Void*) : Int32
+  fun key_set_public = EC_KEY_set_public_key(key : Void*, point : Void*) : Int32
+  fun point_new = EC_POINT_new(group : Void*) : Void*
+  fun point_free = EC_POINT_free(point : Void*) : Void
+  fun point_from = EC_POINT_oct2point(group : Void*, point : Void*, buffer : UInt8*, size : UInt64, ctx : Void*) : Int32
+  fun point_to = EC_POINT_point2oct(group : Void*, point : Void*, form : Int32, buffer : UInt8*, size : UInt64, ctx : Void*) : UInt64
+  fun point_mul = EC_POINT_mul(group : Void*, result : Void*, scalar : Void*, point : Void*, multiplier : Void*, ctx : Void*) : Int32
+  fun ecdh = ECDH_compute_key(output : UInt8*, size : UInt64, point : Void*, key : Void*, kdf : Void*) : Int32
+  fun sign = ECDSA_do_sign(digest : UInt8*, size : Int32, key : Void*) : Void*
+  fun signature_parts = ECDSA_SIG_get0(signature : Void*, r : Void**, s : Void**) : Void
+  fun signature_free = ECDSA_SIG_free(signature : Void*) : Void
+  fun bn_from = BN_bin2bn(buffer : UInt8*, size : Int32, bn : Void*) : Void*
+  fun bn_to = BN_bn2binpad(bn : Void*, buffer : UInt8*, size : Int32) : Int32
+  fun bn_free = BN_free(bn : Void*) : Void
+  fun aes_128_gcm = EVP_aes_128_gcm : Void*
+  fun context_new = EVP_CIPHER_CTX_new : Void*
+  fun context_free = EVP_CIPHER_CTX_free(context : Void*) : Void
+  fun context_ctrl = EVP_CIPHER_CTX_ctrl(context : Void*, type : Int32, arg : Int32, pointer : Void*) : Int32
+  fun encrypt_init = EVP_EncryptInit_ex(context : Void*, cipher : Void*, engine : Void*, key : UInt8*, iv : UInt8*) : Int32
+  fun encrypt_update = EVP_EncryptUpdate(context : Void*, output : UInt8*, output_size : Int32*, data : UInt8*, size : Int32) : Int32
+  fun encrypt_final = EVP_EncryptFinal_ex(context : Void*, output : UInt8*, output_size : Int32*) : Int32
+end
+
+# `NID_X9_62_prime256v1`
+P256            = 415
+UNCOMPRESSED    =   4
+GCM_SET_IVLEN   =   9
+GCM_GET_TAG     =  16
+
+def null : Void*
+  Pointer(Void).new(0_u64)
+end
+
+# A key with the private scalar *secret* (32 bytes) and its public point; nil for a scalar
+# that isn't a valid key.
+def key_from(secret : String) : Void*?
+  key = LibEc.key_new(P256)
+  bn = LibEc.bn_from(secret.to_unsafe, secret.bytesize, null)
+  group = LibEc.key_group(key)
+  point = LibEc.point_new(group)
+  ok = LibEc.key_set_private(key, bn) == 1 && LibEc.point_mul(group, point, bn, null, null, null) == 1 && LibEc.key_set_public(key, point) == 1
+  LibEc.point_free(point)
+  LibEc.bn_free(bn)
+  unless ok
+    LibEc.key_free(key)
+    return nil
+  end
+  key
+end
+
+def public_bytes(key : Void*) : String
+  String.new(65) { |output| LibEc.point_to(LibEc.key_group(key), LibEc.key_public(key), UNCOMPRESSED, output, 65_u64, null) }
+end
+
+# A new key pair: the private scalar and the public point.
+pub def generate_key : Tuple(String, String)
+  key = LibEc.key_new(P256)
+  raise "EC_KEY_generate_key failed" unless LibEc.key_generate(key) == 1
+  secret = String.new(32) { |output| LibEc.bn_to(LibEc.key_private(key), output, 32) }
+  point = public_bytes(key)
+  LibEc.key_free(key)
+  {secret, point}
+end
+
+# The public point of a private scalar, or nil for an invalid one.
+pub def public_key(secret : String) : String?
+  key = key_from(secret) || return nil
+  point = public_bytes(key)
+  LibEc.key_free(key)
+  point
+end
+
+# Whether *point* is on P-256 (an encoded point, compressed or not).
+pub def valid_point?(point : String) : Bool
+  key = LibEc.key_new(P256)
+  decoded = LibEc.point_new(LibEc.key_group(key))
+  ok = point.bytesize > 0 && LibEc.point_from(LibEc.key_group(key), decoded, point.to_unsafe, point.bytesize.to_u64, null) == 1
+  LibEc.point_free(decoded)
+  LibEc.key_free(key)
+  ok
+end
+
+# ECDH: the shared x coordinate (32 bytes), or nil when *peer* isn't a
+# point on the curve.
+pub def ecdh(secret : String, peer : String) : String?
+  key = key_from(secret) || return nil
+  point = LibEc.point_new(LibEc.key_group(key))
+  shared = nil.as(String?)
+  if peer.bytesize > 0 && LibEc.point_from(LibEc.key_group(key), point, peer.to_unsafe, peer.bytesize.to_u64, null) == 1
+    computed = 0
+    secret = String.new(32) { |output| computed = LibEc.ecdh(output, 32_u64, point, key, null) }
+    shared = computed == 32 ? secret : nil
+  end
+  LibEc.point_free(point)
+  LibEc.key_free(key)
+  shared
+end
+
+# ES256: the SHA-256 of *data* signed with the private *secret*, as JWS lays it out
+# (r and s, 32 bytes each).
+pub def es256_sign(secret : String, data : String) : String
+  key = key_from(secret) || raise "invalid signing key"
+  digest = String.new(32) do |output|
+    hashed = SHA256.hash_bytes(data)
+    32.times { |i| output[i] = hashed[i] }
+  end
+  signature = LibEc.sign(digest.to_unsafe, 32, key)
+  r = null
+  s = null
+  LibEc.signature_parts(signature, pointerof(r), pointerof(s))
+  out = String.new(64) do |output|
+    LibEc.bn_to(r, output, 32)
+    LibEc.bn_to(s, output + 32, 32)
+  end
+  LibEc.signature_free(signature)
+  LibEc.key_free(key)
+  out
+end
+
+# AES-128-GCM with no associated data: the ciphertext with its 16-byte
+# tag appended.
+pub def aes128gcm_encrypt(key : String, iv : String, plaintext : String) : String
+  context = LibEc.context_new
+  written = 0
+  LibEc.encrypt_init(context, LibEc.aes_128_gcm, null, Pointer(UInt8).new(0_u64), Pointer(UInt8).new(0_u64))
+  LibEc.context_ctrl(context, GCM_SET_IVLEN, iv.bytesize, null)
+  LibEc.encrypt_init(context, null, null, key.to_unsafe, iv.to_unsafe)
+  ciphertext = String.new(plaintext.bytesize) do |output|
+    LibEc.encrypt_update(context, output, pointerof(written), plaintext.to_unsafe, plaintext.bytesize) if plaintext.bytesize > 0
+    LibEc.encrypt_final(context, output + written, pointerof(written))
+  end
+  tag = String.new(16) { |output| LibEc.context_ctrl(context, GCM_GET_TAG, 16, output.as(Void*)) }
+  LibEc.context_free(context)
+  ciphertext + tag
+end

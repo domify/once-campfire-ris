@@ -1,0 +1,69 @@
+# The drawn table against `bin/rails routes` (`vectors/campfire_routes.json`):
+# every row in order, and the sample paths recognized as Rails recognizes
+# them.
+module rils/routes/draw_test
+
+import std/file
+import std/text
+import std/json::{JSON, Any}
+import rils/kit/router::{Router}
+import rils/routes/draw::{campfire_routes}
+import web/web/spec::*
+
+VECTORS = JSON.parse(File.read("#{__DIR__}/../../vectors/campfire_routes.json"))
+# Controllers the reference routes to but doesn't define: Rails'
+# `recognize_path` raises for them, the router still matches.
+MISSING_CONTROLLERS = ["rooms/settings"]
+
+def sorted_pairs(pairs : Array(Tuple(String, String))) : String
+  pairs.sorted_by { |p| p[0] }.map { |p| "#{p[0]}=#{p[1]}" }.join(",")
+end
+
+def json_pairs(value : Any) : String
+  pairs = [] of Tuple(String, String)
+  value.as_h.each { |k, v| pairs << {k, v.as_s} }
+  sorted_pairs(pairs)
+end
+
+describe "campfire routes" do
+  it "draw bin/rails routes in order" do
+    rails = VECTORS["routes"].as_a
+    ours = campfire_routes.drawn
+    wrong = [] of String
+    rails.each_with_index do |row, i|
+      expected = "#{row["verb"].as_s} #{row["path"].as_s} #{row["endpoint"].as_s} #{json_pairs(row["defaults"])}"
+      got = i < ours.size ? "#{ours[i].verb} #{ours[i].pattern} #{ours[i].endpoint} #{sorted_pairs(ours[i].defaults)}" : "(none)"
+      wrong << "##{i}: want #{expected}, got #{got}" unless expected == got
+    end
+    wrong << "#{ours.size} rows, Rails has #{rails.size}" unless ours.size == rails.size
+    puts wrong.join("\n") unless wrong.empty?
+    assert wrong.empty?
+  end
+
+  it "recognize paths like Rails" do
+    router = Router(String).new
+    campfire_routes.draw_into(router) { |row| row.endpoint }
+    wrong = [] of String
+    VECTORS["recognitions"].as_a.each do |sample|
+      verb = sample["verb"].as_s
+      path = sample["path"].as_s
+      endpoint = sample["endpoint"].as_s?
+      found = router.find(verb, path)
+      if endpoint
+        if found
+          params = [] of Tuple(String, String)
+          found[1].each { |k, v| params << {k, v.as_s? || ""} }
+          got = "#{found[0].endpoint} #{sorted_pairs(params)}"
+          want = "#{endpoint} #{json_pairs(sample["params"])}"
+          wrong << "#{verb} #{path}: want #{want}, got #{got}" unless got == want
+        else
+          wrong << "#{verb} #{path}: want #{endpoint}, got nothing"
+        end
+      elsif found && !MISSING_CONTROLLERS.includes?(found[0].endpoint.split('#').first)
+        wrong << "#{verb} #{path}: want nothing, got #{found[0].endpoint}"
+      end
+    end
+    puts wrong.join("\n") unless wrong.empty?
+    assert wrong.empty?
+  end
+end

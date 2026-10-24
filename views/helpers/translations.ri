@@ -1,0 +1,31 @@
+# `TranslationsHelper`: the language popups beside form fields.
+module views/helpers/translations
+
+import rils/template/html::{Html, join}
+import views/context::{ViewContext}
+import views/helpers/tag::*
+import views/helpers/assets::{image_tag}
+import views/helpers/translations_table::{TRANSLATIONS}
+
+# `translations_for(key)`.
+pub def translations_for(key : String) : Html
+  found = TRANSLATIONS.find { |(name, _)| name == key }
+  raise "unknown translation key #{key}" unless found
+  items = found[1].map do |(language, translation)|
+    content_tag_text("dt", attrs, language) + content_tag_text("dd", attrs.class("margin-none"), translation)
+  end
+  content_tag("dl", attrs.class("language-list"), join(items))
+end
+
+# `translation_button(key)`.
+pub def translation_button(ctx : ViewContext, key : String) : Html
+  summary = content_tag("summary", attrs.class("btn").tabindex(-1),
+    image_tag(ctx, "globe.svg", attrs.size(20).aria_hidden.class("color-icon")) +
+    content_tag_text("span", attrs.class("for-screen-reader"), "Translate"))
+  menu = content_tag("div", attrs.class("language-list-menu shadow").data("popup_target", "menu"), translations_for(key))
+  details = attrs.class("position-relative")
+    .data("controller", "popup")
+    .data("action", "keydown.esc->popup#close toggle->popup#toggle click@document->popup#closeOnClickOutside")
+    .data("popup_orientation_top_class", "popup-orientation-top")
+  content_tag("details", details, summary + menu)
+end

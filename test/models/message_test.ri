@@ -1,0 +1,221 @@
+# `test/models/message_test.rb`, `message/searchable_test.rb`,
+# `message/attachment_test.rb` (the parts that are data, not image
+# processing), and pagination.
+module test/models/message_test
+
+import std/time::{Time}
+import rils/record/sqlite::{SqlValue}
+import rils/record/timestamp::{Timestamp}
+import rils/record/events::{PushMessage, PurgeBlob}
+import test/models/testing::*
+import models/message::*
+import models/active_storage::{Blob}
+import web/web/spec::*
+
+def create(t : TestDb, room : String, creator : String, body : String, client_message_id : String) : Message
+  t.write { |tx| Message.create(tx, NewMessage.new(id(room), id(creator), client_message_id, body)) }
+end
+
+def search(t : TestDb, room : String, query : String) : Array(Int64)
+  Message.search_in_room(t.conn, id(room), query).map(&.id)
+end
+
+def ids(messages : Array(Message)) : Array(Int64)
+  messages.map(&.id)
+end
+
+def same?(a : Message, b : Message) : Bool
+  a.id == b.id && a.room_id == b.room_id && a.creator_id == b.creator_id && a.client_message_id == b.client_message_id && a.created_at == b.created_at && a.updated_at == b.updated_at
+end
+
+def blob(t : TestDb, key : String, metadata : String?) : Blob
+  t.write { |tx| Blob.create(tx, Blob.new(0_i64, key, "moon.jpg", "image/jpeg", metadata, "local", 1_i64, nil, tx.now)) }
+end
+
+describe "messages" do
+  it "enqueue a push when created" do
+    t = TestDb.new
+    message = create(t, "designers", "jason", "Hello", "123")
+    pushes = t.events.select(&.is_a?(PushMessage))
+    assert pushes.size == 1
+    push = pushes[0]
+    assert push.is_a?(PushMessage) && push.room_id == id("designers") && push.message_id == message.id
+  end
+
+  it "have mentionees among the room's members" do
+    t = TestDb.new
+    pets = id("pets")
+    mentionees = ->(user_ids : Array(Int64)) { mentionees_in_room(t.conn, pets, user_ids).map(&.id) }
+    assert mentionees.call([id("david")]) == [id("david")]
+    assert mentionees.call([id("david"), id("david")]) == [id("david")]
+    # Kevin isn't in All Pets.
+    assert mentionees.call([id("kevin")]).empty?
+  end
+
+  it "index their body for search" do
+    t = TestDb.new
+    message = create(t, "designers", "david", "My hovercraft is full of eels", "earth")
+    assert search(t, "designers", "eel") == [message.id]
+    t.write { |tx| message.update_body(tx, "My hovercraft is full of sharks") }
+    assert search(t, "designers", "sharks") == [message.id]
+    t.write { |tx| message.destroy(tx) }
+    assert search(t, "designers", "sharks").empty?
+  end
+
+  it "never read search words as query syntax" do
+    t = TestDb.new
+    message = create(t, "designers", "jason", "Do NOT feed the eel OR the shark", "c1")
+    ["NOT", "OR", "AND", "NEAR", "eel NOT", "NOT eel", "shark OR", "\"", "*", "", "a\0b", "\0"].each { |query| search(t, "designers", query) }
+    assert search(t, "designers", "NOT eel") == [message.id]
+    assert search(t, "designers", "eel dolphin").empty?
+    assert search(t, "designers", "eel\0shark") == [message.id]
+  end
+
+  it "are searched in message order" do
+    t = TestDb.new
+    created = ["first cat", "second cat", "third cat", "cat cat cat"].map do |body|
+      t.travel(1)
+      create(t, "designers", "david", body, body).id
+    end
+    assert search(t, "designers", "cat") == created
+  end
+
+  it "are indexed as plain text" do
+    t = TestDb.new
+    message = create(t, "designers", "david", "<span>My hovercraft is full of eels</span>", "earth")
+    assert search(t, "designers", "span").empty?
+    assert search(t, "designers", "eel") == [message.id]
+  end
+
+  it "are found by search only in the user's rooms" do
+    t = TestDb.new
+    message = create(t, "designers", "david", "hovercraft", "earth")
+    assert ids(Message.search_reachable(t.conn, id("kevin"), "hovercraft")) == [message.id]
+    assert Message.search_reachable(t.conn, id("bender"), "hovercraft").empty?
+  end
+
+  it "are found by search as the newest 100, oldest first" do
+    t = TestDb.new
+    created = (0...105).map do |n|
+      t.travel(1)
+      create(t, "designers", "david", "aardvark #{n}", "aardvark #{n}").id
+    end
+    assert ids(Message.search_reachable(t.conn, id("kevin"), "aardvark")) == tail(created, 100)
+  end
+
+  it "fall back to the room-first search when newer matches are out of reach" do
+    t = TestDb.new
+    first = create(t, "designers", "david", "sparsekeyword", "first-sparse")
+    t.write do |tx|
+      tx.conn.execute("DELETE FROM memberships WHERE user_id=? AND room_id!=?", [id("kevin"), id("designers")] of SqlValue)
+      1100.times do |n|
+        message = Message.create(tx, NewMessage.new(id("pets"), id("david"), "private-sparse-#{n}", "sparsekeyword"))
+        assert message.id > first.id
+      end
+    end
+    assert ids(Message.search_reachable(t.conn, id("kevin"), "sparsekeyword")) == [first.id]
+    assert Message.search_reachable(t.conn, -1_i64, "sparsekeyword").empty?
+  end
+
+  it "use an attachment's filename as the plain text of a blank body" do
+    t = TestDb.new
+    moon = blob(t, "abc123", %({"identified":true}))
+    message = t.write { |tx| Message.create(tx, NewMessage.new(id("hq"), id("david"), "message", nil, moon.id)) }
+    assert message.plain_text_body(t.conn, BasicRichText.new) == "moon.jpg"
+    assert message.content_type(t.conn, BasicRichText.new).attachment?
+    assert search(t, "hq", "moon") == [message.id]
+    t.write { |tx| message.destroy(tx) }
+    assert t.events.any?(&.is_a?(PurgeBlob))
+    assert t.conn.count("SELECT COUNT(*) FROM active_storage_attachments") == 0
+  end
+
+  it "play sounds" do
+    t = TestDb.new
+    message = create(t, "designers", "david", "/play trombone", "x")
+    assert message.content_type(t.conn, BasicRichText.new).sound?
+    sound = message.sound(t.conn, BasicRichText.new)
+    assert !sound.nil? && sound.name == "trombone"
+    message = create(t, "designers", "david", "/play nosuchsound", "y")
+    assert message.content_type(t.conn, BasicRichText.new).text?
+  end
+
+  # `create_message` answers with what `Message.create` returns, without
+  # reading it back, so that has to be the row as stored: after the
+  # commit's hooks, at the microseconds the columns keep.
+  it "are returned from create as stored" do
+    t = TestDb.new
+    cases = [
+      NewMessage.new(id("designers"), id("david"), "text", "<p>Hello <strong>there</strong></p>"),
+      NewMessage.new(id("designers"), id("david"), "empty body", ""),
+      NewMessage.new(id("designers"), id("david"), "nothing"),
+      NewMessage.new(id("designers"), id("david"), "attachment", nil, blob(t, "attachment", nil).id),
+      NewMessage.new(id("designers"), id("david"), "both", "With a picture", blob(t, "both", nil).id),
+      NewMessage.new(id("designers"), id("david"), nil, "no client id"),
+    ]
+    cases.each_with_index do |attributes, n|
+      # A frozen clock with nanoseconds, which the columns don't keep.
+      t.clock.travel_to(Time.unix(1_900_000_000_i64, 123_456_789)) if n == 1
+      created = t.write { |tx| Message.create(tx, attributes) }
+      assert same?(created, found(Message.find(t.conn, created.id))), "case #{n}"
+    end
+  end
+
+  it "default the client message id to a UUID" do
+    t = TestDb.new
+    message = t.write { |tx| Message.create(tx, NewMessage.new(id("hq"), id("bender"), body: "beep")) }
+    assert message.client_message_id.bytesize == 36
+  end
+
+  it "paginate" do
+    t = TestDb.new
+    watercooler = id("watercooler")
+    all = Message.last_page(t.conn, watercooler)
+    assert all.size == 10, "watercooler fixtures"
+    (all.size - 1).times { |i| assert all[i].created_at <= all[i + 1].created_at }
+    assert !Message.paged?(t.conn, watercooler)
+
+    middle = all[5]
+    assert ids(Message.page_before(t.conn, watercooler, middle)) == ids(all.first(5))
+    assert ids(Message.page_after(t.conn, watercooler, middle)) == ids(tail(all, 4))
+    assert ids(Message.page_around(t.conn, watercooler, middle)) == ids(all)
+    assert Message.exists_before?(t.conn, watercooler, middle)
+    assert !Message.exists_after?(t.conn, watercooler, all[9])
+
+    PAGE_SIZE.times do |n|
+      t.travel(1)
+      create(t, "watercooler", "david", "message #{n}", "c#{n}")
+    end
+    assert Message.paged?(t.conn, watercooler)
+    assert Message.last_page(t.conn, watercooler).size == PAGE_SIZE
+    assert Message.first_page(t.conn, watercooler)[0].id == all[0].id
+
+    since = all[9].created_at
+    created = Message.page_created_since(t.conn, watercooler, since)
+    assert created.size == PAGE_SIZE
+    created_ids = ids(created)
+    updated = Message.page_updated_since(t.conn, watercooler, since, created_ids)
+    assert updated.all? { |m| !created_ids.includes?(m.id) }
+  end
+
+  # What a refresh replaces: the newest page of the messages updated since,
+  # in creation order whatever order they were updated in.
+  it "page the updated ones newest first, in creation order" do
+    t = TestDb.new
+    watercooler = id("watercooler")
+    older = Message.first_page(t.conn, watercooler)
+    t.travel(60)
+    since = t.now
+    [older[2], older[0], older[1]].each do |message|
+      t.travel(1)
+      t.write { |tx| message.touch(tx) }
+    end
+    assert ids(Message.page_updated_since(t.conn, watercooler, since, [] of Int64)) == [older[0].id, older[1].id, older[2].id]
+
+    # Three touched and 38 created: the page leaves out the oldest.
+    created = (2...PAGE_SIZE).map do |n|
+      t.travel(1)
+      create(t, "watercooler", "david", "message #{n}", "c#{n}").id
+    end
+    assert ids(Message.page_updated_since(t.conn, watercooler, since, [] of Int64)) == [older[1].id, older[2].id] + created
+  end
+end

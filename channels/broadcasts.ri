@@ -1,0 +1,185 @@
+# Every broadcast the Rails app makes, with the stream names, targets and
+# `<turbo-stream>` markup its Turbo and Action Cable calls produce. The
+# HTML inside is rendered by the caller, as Turbo renders the partial
+# (`ApplicationController.render`, no request).
+#
+# Stream names: records are their GID param (`turbo_stream_from @room,
+# :messages` is `<room gid param>:messages`), symbols themselves. Targets
+# are `dom_id`s: STI rooms use their own `param_key`
+# (`messages_rooms_open_1`), and a message's `to_key` is its
+# `client_message_id` (`message_<uuid>`).
+module channels/broadcasts
+
+import std/text
+import std/json::{Any}
+import rils/rails_compat/json::{encode}
+import rils/rails_compat/global_id::{GlobalId}
+import rils/record/sqlite::{Connection}
+import models/room::{Room, Membership, Involvement}
+import models/message::{Message}
+import models/boost::{Boost}
+import rils/cable/pubsub::{PubSub}
+import rils/cable/turbo::{Action, broadcast_action_to}
+
+pub ROOMS           = "rooms"
+pub MESSAGES        = "messages"
+MAINTAIN_SCROLL = [{"maintain_scroll", "true".as(String?)}]
+
+# `Room.model_name.param_key` for the room's STI class: `Rooms::Open` is
+# `rooms_open`.
+pub def room_param_key(room : Room) : String
+  room.room_type.class_name.gsub("::", "_").downcase
+end
+
+# `dom_id(room, prefix)`.
+pub def room_dom_id(room : Room, prefix : String) : String
+  "#{prefix}_#{room_param_key(room)}_#{room.id}"
+end
+
+# `dom_id(message, prefix)`: messages are keyed by `client_message_id`.
+pub def message_dom_id(message : Message, prefix : String? = nil) : String
+  prefix ? "#{prefix}_message_#{message.client_message_id}" : "message_#{message.client_message_id}"
+end
+
+pub def room_gid_param(room : Room) : String
+  GlobalId.new(room.room_type.class_name, room.id).to_param
+end
+
+pub def user_gid_param(user_id : Int64) : String
+  GlobalId.new("User", user_id).to_param
+end
+
+# `UnreadRoomsChannel`'s stream: `"user_#{id}_unreads"`.
+pub def unread_rooms_stream(user_id : Int64) : String
+  "user_#{user_id}_unreads"
+end
+
+# `ReadRoomsChannel`'s stream: `"user_#{id}_reads"`.
+pub def read_rooms_stream(user_id : Int64) : String
+  "user_#{user_id}_reads"
+end
+
+# `nil.inquiry`: the NoMethodError `broadcast_visibility_changes` raises
+# for a membership whose involvement was nil.
+pub class NilInquiry
+  def message : String
+    "undefined method 'inquiry' for nil"
+  end
+end
+
+pub class Broadcasts
+  getter pubsub : PubSub
+
+  def initialize(@pubsub : PubSub)
+  end
+
+  def room_messages(room : Room) : Array(String)
+    [room_gid_param(room), MESSAGES]
+  end
+
+  def user_rooms(user_id : Int64) : Array(String)
+    [user_gid_param(user_id), ROOMS]
+  end
+
+  def to(streamables : Array(String), action : Action, target : String, html : String? = nil, attributes : Array(Tuple(String, String?)) = [] of Tuple(String, String?)) : Nil
+    broadcast_action_to(@pubsub, streamables, action, target, html, attributes)
+  end
+
+  # `ActionCable.server.broadcast "user_#{id}_reads", { room_id: }`
+  # (`PresenceChannel`).
+  pub def read_room(user_id : Int64, room_id : Int64) : Nil
+    @pubsub.broadcast(read_rooms_stream(user_id), encode(Any.new({"room_id" => Any.new(room_id)})))
+  end
+
+  # `message.broadcast_create`: append *html* (`messages/_message`) to the
+  # room, then tell every member's unread stream.
+  pub def message_create(conn : Connection, room : Room, html : String) : Nil
+    to(room_messages(room), Action::Append, room_dom_id(room, MESSAGES), html)
+    unread_room(conn, room)
+  end
+
+  # `broadcast_unread_room`: `{ roomId: }` to each member's
+  # `user_<id>_unreads`.
+  pub def unread_room(conn : Connection, room : Room) : Nil
+    payload = encode(Any.new({"roomId" => Any.new(room.id)}))
+    Membership.for_room(conn, room.id).each { |membership| @pubsub.broadcast(unread_rooms_stream(membership.user_id), payload) }
+  end
+
+  # `message.broadcast_remove`.
+  pub def message_remove(room : Room, message : Message) : Nil
+    to(room_messages(room), Action::Remove, message_dom_id(message))
+  end
+
+  # `MessagesController#update`: replace `[message, :presentation]` with
+  # *html* (`messages/_presentation`), keeping the scroll position.
+  pub def message_replace(room : Room, message : Message, html : String) : Nil
+    to(room_messages(room), Action::Replace, message_dom_id(message, "presentation"), html, MAINTAIN_SCROLL)
+  end
+
+  # `Messages::BoostsController#broadcast_create`: append *html*
+  # (`messages/boosts/_boost`) to `boosts_message_<client_message_id>`.
+  pub def boost_create(room : Room, message : Message, html : String) : Nil
+    to(room_messages(room), Action::Append, "boosts_message_#{message.client_message_id}", html, MAINTAIN_SCROLL)
+  end
+
+  # `broadcast_remove`: `dom_id(boost)`.
+  pub def boost_remove(room : Room, boost : Boost) : Nil
+    to(room_messages(room), Action::Remove, "boost_#{boost.id}")
+  end
+
+  # `RoomsController#destroy`: remove `[room, :list]` from everyone's
+  # `:rooms`.
+  pub def room_remove(room : Room) : Nil
+    to([ROOMS], Action::Remove, room_dom_id(room, "list"))
+  end
+
+  # `Rooms::OpensController#create`: prepend *html*
+  # (`users/sidebars/rooms/_shared`) to everyone's `shared_rooms`.
+  pub def open_room_create(html : String) : Nil
+    to([ROOMS], Action::Prepend, "shared_rooms", html)
+  end
+
+  # `Rooms::OpensController#update`: replace `[room, :list]` on `:rooms`.
+  # *room* is the room as an open room (`becomes!(Rooms::Open)`).
+  pub def open_room_update(room : Room, html : String) : Nil
+    to([ROOMS], Action::Replace, room_dom_id(room, "list"), html)
+  end
+
+  # `Rooms::ClosedsController#create`: prepend to each member's own stream.
+  pub def closed_room_create(conn : Connection, room : Room, html : String) : Nil
+    room.user_ids(conn).each { |user_id| to(user_rooms(user_id), Action::Prepend, "shared_rooms", html) }
+  end
+
+  # `Rooms::ClosedsController#update`: after `memberships.revise`, replace
+  # `[room, :list]` for each remaining member.
+  pub def closed_room_update(conn : Connection, room : Room, html : String) : Nil
+    target = room_dom_id(room, "list")
+    room.user_ids(conn).each { |user_id| to(user_rooms(user_id), Action::Replace, target, html) }
+  end
+
+  # `Rooms::DirectsController#create`: prepend
+  # `users/sidebars/rooms/_direct`, rendered per membership by *render*,
+  # to each member's `direct_rooms`.
+  pub def direct_room_create(conn : Connection, room : Room, & : Membership -> String) : Nil
+    room.memberships(conn).each do |membership|
+      to(user_rooms(membership.user_id), Action::Prepend, "direct_rooms", yield membership)
+    end
+  end
+
+  # `Rooms::InvolvementsController#update`
+  # (`broadcast_visibility_changes`). *previous* is
+  # `involvement_previously_was`. Rails raises on a nil previous
+  # involvement after the update saved.
+  pub def involvement_change(room : Room, membership : Membership, previous : Involvement?, & : -> String) : NilInquiry?
+    return nil if room.direct?
+    streamables = user_rooms(membership.user_id)
+    if membership.involved_in?(Involvement::Invisible)
+      to(streamables, Action::Remove, room_dom_id(room, "list"))
+    elsif previous.nil?
+      return NilInquiry.new
+    elsif previous == Involvement::Invisible
+      to(streamables, Action::Prepend, "shared_rooms", yield)
+    end
+    nil
+  end
+end

@@ -1,0 +1,227 @@
+# Routes as `config/routes.rb` spells them: `/rooms/:room_id/messages`,
+# `(.:format)` for an optional extension, and `*path` for the rest of the
+# path. Dynamic segments match Rails' default `[^/.?]+`; the values are
+# %-decoded, as Rails' path parameters are. A segment may start with a
+# literal before its parameter, as `@:message_id` does.
+module rils/kit/router
+
+import std/text
+import rils/kit/params::{ParamMap, Param, decode_www_form_component}
+
+class Segment
+  getter literal : String?
+  getter name : String?
+  getter glob : Bool
+  # The literal text before a parameter in the same segment (`@` of
+  # `@:message_id`).
+  getter prefix : String
+
+  def initialize(@literal : String?, @name : String?, @glob : Bool, @prefix : String = "")
+  end
+end
+
+pub class Route(A)
+  getter method : String
+  getter pattern : String
+  getter action : A
+  # `controller#action`, as `bin/rails routes` prints it.
+  getter endpoint : String
+  # The route's `defaults:`, under the path parameters.
+  getter defaults : Array(Tuple(String, String))
+  @segments : Array(Segment)
+  @format : Bool
+  @glob : Bool
+
+  def initialize(@method : String, @pattern : String, @action : A, @endpoint : String = "", @defaults : Array(Tuple(String, String)) = [] of Tuple(String, String))
+    @format = @pattern.ends_with?("(.:format)")
+    body = @format ? @pattern[0, @pattern.bytesize - 10] : @pattern
+    @segments = body.split('/').reject(&.empty?).map do |part|
+      if part.starts_with?(":")
+        Segment.new(nil, part.lchop(':'), false)
+      elsif part.starts_with?("*")
+        Segment.new(nil, part.lchop('*'), true)
+      elsif colon = part.index(':')
+        Segment.new(nil, part[colon + 1, part.bytesize - colon - 1], false, part[0, colon])
+      else
+        Segment.new(part, nil, false)
+      end
+    end
+    @glob = @segments.any?(&.glob)
+  end
+
+  # The path parameters when *path* matches, else nil.
+  pub def match(path : String) : ParamMap?
+    found = nil.as(ParamMap?)
+    tape { found = match_parts(PathParts.new(path.as_tape)) }
+    found
+  end
+
+  # `match` for a path already split into its non-empty segments. A route
+  # without a glob matches only as many segments as it has (an extension
+  # stays in its segment), so most routes are refused at once; a route is
+  # tried on the path's own bytes, and only the one that matches copies
+  # its parameters out.
+  def match_parts(parts : PathParts) : ParamMap?
+    return nil if !@glob && parts.size != @segments.size
+    count = parts.size
+    # The last segment's length without the extension `(.:format)` takes,
+    # and the extension; -1 while there is none.
+    last_size = count > 0 ? parts.span_size(count - 1) : 0
+    extension = -1
+    if @format && count > 0
+      if dot = parts.rindex(count - 1, '.')
+        dynamic_last = !@segments.empty? && (@segments.last.glob || (@segments.size == count && @segments.last.literal.nil?))
+        if dot + 1 < parts.span_size(count - 1) && dot > 0 && (dynamic_last || literal_matches?(parts, count - 1, dot))
+          last_size = dot
+          extension = dot + 1
+        end
+      end
+    end
+    return nil unless matches?(parts, last_size)
+    params = ParamMap.new
+    @defaults.each { |default| params[default[0]] = Param.new(default[1]) }
+    if extension >= 0
+      params["format"] = Param.new(parts.text(count - 1, extension, parts.span_size(count - 1) - extension))
+    end
+    @segments.each_with_index do |segment, index|
+      size = index == count - 1 ? last_size : parts.span_size(index)
+      if segment.glob
+        params[segment.name || ""] = Param.new(decode(parts.joined(index, last_size)))
+      elsif segment.literal.nil?
+        params[segment.name || ""] = Param.new(decode(parts.text(index, segment.prefix.bytesize, size - segment.prefix.bytesize)))
+      end
+    end
+    params
+  end
+
+  # Whether every segment matches, the last *last_size* bytes long.
+  def matches?(parts : PathParts, last_size : Int32) : Bool
+    count = parts.size
+    @segments.each_with_index do |segment, index|
+      return index == @segments.size - 1 && index < count if segment.glob
+      return false if index >= count
+      size = index == count - 1 ? last_size : parts.span_size(index)
+      if literal = segment.literal
+        return false unless parts.equals?(index, 0, size, literal)
+      else
+        prefix = segment.prefix
+        return false unless size > prefix.bytesize && parts.equals?(index, 0, prefix.bytesize, prefix)
+        return false if parts.includes?(index, prefix.bytesize, size - prefix.bytesize, '.')
+      end
+    end
+    @segments.size == count
+  end
+
+  def literal_matches?(parts : PathParts, index : Int32, size : Int32) : Bool
+    return false if index >= @segments.size
+    literal = @segments[index].literal
+    !literal.nil? && parts.equals?(index, 0, size, literal)
+  end
+
+  def decode(text : String) : String
+    decoded = decode_www_form_component(text.gsub("+", "%2B"))
+    decoded.is_a?(String) ? decoded : text
+  end
+end
+
+pub class Router(A)
+  getter routes : Array(Route(A))
+
+  def initialize
+    @routes = [] of Route(A)
+  end
+
+  pub def add(method : String, pattern : String, action : A, endpoint : String = "", defaults : Array(Tuple(String, String)) = [] of Tuple(String, String)) : Nil
+    @routes << Route(A).new(method, pattern, action, endpoint, defaults)
+  end
+
+  # The first route for *method* (HEAD matching GET) and *path*, with its
+  # path parameters.
+  pub def find(method : String, path : String) : Tuple(Route(A), ParamMap)?
+    find(method, path.as_tape)
+  end
+
+  # `find` for a path where it lies.
+  pub def find(method : String, path : Str) : Tuple(Route(A), ParamMap)?
+    found = nil.as(Tuple(Route(A), ParamMap)?)
+    tape do
+      parts = PathParts.new(path)
+      @routes.each do |route|
+        next unless route.method == method || (method == "HEAD" && route.method == "GET")
+        if params = route.match_parts(parts)
+          found = {route, params}
+          break
+        end
+      end
+    end
+    found
+  end
+end
+
+# A path's non-empty segments, as spans of the path on the tape: where each
+# starts, and how long it is.
+@[OnTape]
+pub struct PathParts
+  @path : Str
+  @spans : Ary(Int64)
+
+  def initialize(@path : Str)
+    @spans = Ary(Int64).new(8)
+    start = 0
+    i = 0
+    while i <= @path.bytesize
+      if i == @path.bytesize || @path[i] == '/'.ord
+        @spans.push((start.to_i64 << 32) | (i - start).to_i64) if i > start
+        start = i + 1
+      end
+      i += 1
+    end
+  end
+
+  def size : Int32
+    @spans.size
+  end
+
+  def span_start(index : Int32) : Int32
+    (@spans[index] >> 32).to_i32
+  end
+
+  def span_size(index : Int32) : Int32
+    (@spans[index] & 0xFFFFFFFF).to_i32
+  end
+
+  # Whether the *size* bytes at *offset* in segment *index* are *text*.
+  def equals?(index : Int32, offset : Int32, size : Int32, text : String) : Bool
+    size == text.bytesize && @path[span_start(index) + offset, size] == text
+  end
+
+  def includes?(index : Int32, offset : Int32, size : Int32, char : Char) : Bool
+    @path[span_start(index) + offset, size].includes?(char)
+  end
+
+  # Where *char* last is in segment *index*.
+  def rindex(index : Int32, char : Char) : Int32?
+    bytes = @path[span_start(index), span_size(index)]
+    i = bytes.bytesize - 1
+    while i >= 0
+      return i if bytes[i] == char.ord
+      i -= 1
+    end
+    nil
+  end
+
+  # The *size* bytes at *offset* in segment *index*, copied out.
+  def text(index : Int32, offset : Int32, size : Int32) : String
+    @path[span_start(index) + offset, size].to_heap
+  end
+
+  # Segments *from* on, joined with `/`, the last *last_size* bytes long.
+  def joined(from : Int32, last_size : Int32) : String
+    String.build do |io|
+      (from...size).each do |index|
+        io << '/' if index > from
+        io << text(index, 0, index == size - 1 ? last_size : span_size(index))
+      end
+    end
+  end
+end

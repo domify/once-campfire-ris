@@ -1,0 +1,158 @@
+# Rails' SQLite datetime encoding.
+#
+# Rails writes `datetime(6)` columns as UTC text, `"%Y-%m-%d %H:%M:%S"`
+# followed by `".%06d"` microseconds only when the microseconds are non-zero
+# (`ActiveRecord::ConnectionAdapters::Quoting#quoted_date`). Values are
+# truncated, not rounded, to microseconds on assignment
+# (`ActiveModel::Type::Helpers::TimeValue`). `insert_all` instead lets
+# SQLite stamp rows with `STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW')`, which has
+# millisecond precision; see `SQLITE_NOW`.
+module rils/record/timestamp
+
+import std/time::{Time, Span}
+import std/text
+
+# The timestamp expression Rails' `insert_all` uses on SQLite for
+# `created_at`/`updated_at`.
+pub SQLITE_NOW = "STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW')"
+
+# A UTC instant with microsecond precision, stored the way Active Record
+# stores it.
+pub struct Timestamp
+  getter microseconds : Int64
+
+  def initialize(@microseconds : Int64)
+  end
+
+  pub def self.from_time(time : Time) : Timestamp
+    Timestamp.new(time.to_unix * 1_000_000 + (time.nanosecond // 1000).to_i64)
+  end
+
+  pub def self.from_second(seconds : Int64) : Timestamp
+    Timestamp.new(seconds * 1_000_000)
+  end
+
+  pub def time : Time
+    Time.unix(as_second, (subsec_microsecond * 1000).to_i32)
+  end
+
+  pub def as_second : Int64
+    Time.floor_div(@microseconds, 1_000_000)
+  end
+
+  pub def subsec_microsecond : Int64
+    Time.floor_mod(@microseconds, 1_000_000)
+  end
+
+  # `1.hour.ago`-style arithmetic.
+  pub def ago(span : Span) : Timestamp
+    Timestamp.from_time(time - span)
+  end
+
+  pub def +(span : Span) : Timestamp
+    Timestamp.from_time(time + span)
+  end
+
+  pub def <=>(other : Timestamp) : Int32
+    @microseconds <=> other.microseconds
+  end
+
+  pub def <(other : Timestamp) : Bool
+    @microseconds < other.microseconds
+  end
+
+  pub def >(other : Timestamp) : Bool
+    @microseconds > other.microseconds
+  end
+
+  pub def <=(other : Timestamp) : Bool
+    @microseconds <= other.microseconds
+  end
+
+  pub def >=(other : Timestamp) : Bool
+    @microseconds >= other.microseconds
+  end
+
+  pub def ==(other : Timestamp) : Bool
+    @microseconds == other.microseconds
+  end
+
+  # The exact text Active Record writes to SQLite.
+  pub def to_db : String
+    t = time
+    base = "#{Time.pad4(t.year)}-#{Time.pad2(t.month)}-#{Time.pad2(t.day)} #{Time.pad2(t.hour)}:#{Time.pad2(t.minute)}:#{Time.pad2(t.second)}"
+    micros = subsec_microsecond
+    micros == 0 ? base : "#{base}.#{Time.pad6(micros.to_i32)}"
+  end
+
+  pub def to_s : String
+    to_db
+  end
+
+  # Parses what Rails (or SQLite's `STRFTIME`) wrote:
+  # `YYYY-MM-DD HH:MM:SS[.fraction]`, also tolerating a `T` separator and a
+  # trailing `Z` or ` UTC`.
+  pub def self.parse_db(text : String) : Timestamp?
+    parse_db(text.as_tape)
+  end
+
+  # The same read on the tape, where a driver's column is copied: surrounding
+  # spaces and a trailing `Z` or ` UTC` skipped by index, so nothing more is
+  # copied.
+  pub def self.parse_db(b : Str) : Timestamp?
+    first = 0
+    last = b.bytesize
+    while first < last && space?(b[first])
+      first += 1
+    end
+    while last > first && space?(b[last - 1])
+      last -= 1
+    end
+    if last - first >= 4 && b[last - 4] == ' '.ord && b[last - 3] == 'U'.ord && b[last - 2] == 'T'.ord && b[last - 1] == 'C'.ord
+      last -= 4
+    elsif last > first && b[last - 1] == 'Z'.ord
+      last -= 1
+    end
+    b = b[first, last - first]
+    n = b.bytesize
+    return nil if n < 19
+    return nil unless b[4] == '-'.ord && b[7] == '-'.ord && (b[10] == ' '.ord || b[10] == 'T'.ord) && b[13] == ':'.ord && b[16] == ':'.ord
+    year = number(b, 0, 4)
+    month = number(b, 5, 2)
+    day = number(b, 8, 2)
+    hour = number(b, 11, 2)
+    minute = number(b, 14, 2)
+    second = number(b, 17, 2)
+    return nil unless year && month && day && hour && minute && second
+    return nil if month < 1 || month > 12 || day < 1 || day > Time.days_in_month(year, month)
+    return nil if hour > 23 || minute > 59 || second > 59
+    micros = 0
+    if n > 19
+      return nil unless b[19] == '.'.ord && n > 20
+      scale = 100_000
+      i = 20
+      while i < n
+        return nil unless b[i] >= 48 && b[i] <= 57
+        micros += (b[i] - 48).to_i32 * scale if scale > 0
+        scale //= 10
+        i += 1
+      end
+    end
+    Timestamp.from_time(Time.utc(year, month, day, hour, minute, second, 0, micros * 1000))
+  end
+
+  # What `String#strip` takes off: ASCII whitespace.
+  def self.space?(byte : UInt8) : Bool
+    byte == 32_u8 || (byte >= 9_u8 && byte <= 13_u8)
+  end
+
+  def self.number(b : Str, start : Int32, count : Int32) : Int32?
+    value = 0
+    count.times do |i|
+      byte = b[start + i]
+      return nil unless byte >= 48 && byte <= 57
+      value = value * 10 + (byte - 48).to_i32
+    end
+    value
+  end
+end

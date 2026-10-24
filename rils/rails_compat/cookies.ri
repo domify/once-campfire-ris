@@ -1,0 +1,245 @@
+# `cookies.signed[...]` / `cookies.encrypted[...]` values
+# (`action_dispatch/middleware/cookies.rb`), plus Rack's escaping of cookie
+# values on the wire. Attributes (path, expires, HttpOnly, SameSite) are the
+# HTTP layer's job.
+#
+# How the jars work, per Rails main:
+# - the value is first dumped with `cookies_serializer` (`:json` here, so
+#   `ActiveSupport::JSON`),
+# - then signed (HMAC-**SHA1**, key `generate_key("signed cookie")`) or
+#   encrypted (aes-256-gcm, key
+#   `generate_key("authenticated encrypted cookie", 32)`) with the legacy
+#   metadata envelope carrying `pur: "cookie.<name>"` and `exp` (ISO 8601
+#   with milliseconds, or `null`),
+# - reading tries purpose `cookie.<name>` first, then *no purpose*, so a
+#   value signed without metadata (pre-Rails 5.2) is accepted under any
+#   cookie name.
+module rils/rails_compat/cookies
+
+import std/text
+import std/int
+import std/time::{Time}
+import std/json::{Any}
+import rils/rails_compat/json::{Value, encode, encode_string}
+import rils/rails_compat/clock::{add_years, parse_timestamp}
+import rils/rails_compat/crypto::{Digest, HmacKey, hmac_hex_matches?}
+import rils/rails_compat/encoding::{urlsafe_decode}
+import rils/rails_compat/key_generator::{Secrets, VerifiedCookie}
+import rils/rails_compat/metadata::{Failure, Serializer, LEGACY_PREFIX}
+import rils/rails_compat/message_verifier::{MessageVerifier, Encoding}
+import rils/rails_compat/message_encryptor::{MessageEncryptor}
+
+pub SIGNED_COOKIE_SALT                  = "signed cookie"
+pub AUTHENTICATED_ENCRYPTED_COOKIE_SALT = "authenticated encrypted cookie"
+
+# `cookies.permanent`: expires 20 years from now (calendar years, like
+# `20.years.from_now`).
+pub def permanent_expires_at(now : Time) : Time
+  add_years(now, 20)
+end
+
+# The raw value for `cookies.signed[name] = { value:, expires: expires_at }`.
+pub def sign(secrets : Secrets, name : String, value : String, expires_at : Time? = nil) : String
+  signed_cookie_verifier(secrets).generate(Any.new(encode_string(value)), purpose(name), expires_at)
+end
+
+# Reads `cookies.signed[name]`; nil wherever Rails returns nil. A value that
+# is valid JSON but not a string (Rails would return it) is also nil.
+pub def verify_signed(secrets : Secrets, name : String, raw : String, now : Time) : String?
+  if (seen = secrets.verified_cookies[raw]?) && seen.name == name
+    expires = seen.expires
+    return seen.token if expires.nil? || now < expires
+  end
+  found = nil.as(Tuple(String, Time?)?)
+  tape { found = signed_cookie_on_tape(secrets, name, raw, now) }
+  if found
+    secrets.keep_verified(raw, VerifiedCookie.new(name, found[0], found[1]))
+    return found[0]
+  end
+  value = verify_signed_value(secrets, name, raw, now)
+  value ? value.as_s? : nil
+end
+
+# `verify_signed` for the cookie Rails writes, read on the tape: the legacy
+# envelope `{"_rails":{"message":"…","exp":"…"|null,"pur":"…"}}` as Rails
+# generates it, under the cookie's own purpose, holding a JSON string. Only
+# that string leaves the tape. Nil for anything else (another field order,
+# an escape, extra fields), which the general path then reads, or refuses,
+# as Rails does. Read by hand rather than with `JSON.parse(Str)`,
+# which corrupts the heap once the GC runs beside it (ris, 2026-10-19).
+pub def signed_string_on_tape(secrets : Secrets, name : String, raw : String, now : Time) : String?
+  found = signed_cookie_on_tape(secrets, name, raw, now)
+  found ? found[0] : nil
+end
+
+# `signed_string_on_tape` with the time the value expires, for the cache of
+# values seen verified.
+def signed_cookie_on_tape(secrets : Secrets, name : String, raw : String, now : Time) : Tuple(String, Time?)?
+  signed = Str.view(raw)
+  index = signed.bytesize - 42
+  return nil unless index > 0 && signed[index] == '-'.ord && signed[index + 1] == '-'.ord
+  key = secrets.signed_cookie_hmac ||= begin
+    secret = secrets.signed_cookie_secret ||= secrets.key_generator.generate_key(SIGNED_COOKIE_SALT, 64)
+    HmacKey.new(Digest::Sha1, secret)
+  end
+  return nil unless hmac_hex_matches?(key, raw, index, signed[index + 2, 40])
+  bytes = urlsafe_decode(signed[0, index]) || return nil
+  return nil unless bytes.starts_with?(LEGACY_PREFIX)
+  at = LEGACY_PREFIX.bytesize
+  message_end = json_string_end(bytes, at) || return nil
+  at = message_end + 1
+  return nil unless literal_at?(bytes, at, EXP_FIELD)
+  at += EXP_FIELD.bytesize
+  expires = nil.as(Time?)
+  if literal_at?(bytes, at, "null")
+    at += 4
+  else
+    exp_end = json_string_end(bytes, at) || return nil
+    exp = parse_timestamp(bytes[at + 1, exp_end - at - 1]) || return nil
+    return nil if now >= exp
+    expires = exp
+    at = exp_end + 1
+  end
+  return nil unless literal_at?(bytes, at, PUR_FIELD) && literal_at?(bytes, at + PUR_FIELD.bytesize, name)
+  at += PUR_FIELD.bytesize + name.bytesize
+  return nil unless at + 3 == bytes.bytesize && literal_at?(bytes, at, %("}}))
+  message = bytes[LEGACY_PREFIX.bytesize + 1, message_end - LEGACY_PREFIX.bytesize - 1]
+  dumped = urlsafe_decode(message) || return nil
+  last = json_string_end(dumped, 0) || return nil
+  return nil unless last == dumped.bytesize - 1
+  {dumped[1, dumped.bytesize - 2].to_heap, expires}
+end
+
+EXP_FIELD = %(,"exp":)
+PUR_FIELD = %(,"pur":"cookie.)
+
+# The index of the closing quote of the JSON string opening at *at*, when
+# it holds no escape and no control character; nil otherwise.
+def json_string_end(text : Str, at : Int32) : Int32?
+  return nil unless at < text.bytesize && text[at] == '"'.ord
+  i = at + 1
+  while i < text.bytesize
+    byte = text[i]
+    return i if byte == '"'.ord
+    return nil if byte == '\\'.ord || byte < 32
+    i += 1
+  end
+  nil
+end
+
+def literal_at?(text : Str, at : Int32, literal : String) : Bool
+  return false unless at + literal.bytesize <= text.bytesize
+  literal.bytesize.times { |i| return false unless text[at + i] == literal.as_tape[i] }
+  true
+end
+
+# Reads `cookies.signed[name]` as whatever JSON value it holds.
+pub def verify_signed_value(secrets : Secrets, name : String, raw : String, now : Time) : Value?
+  verifier = signed_cookie_verifier(secrets)
+  dumped = verifier.verify(raw, purpose(name), now)
+  dumped = verifier.verify(raw, nil, now) if dumped.is_a?(Failure)
+  dumped.is_a?(Failure) ? nil : load(dumped)
+end
+
+# The raw value for `cookies.encrypted[name] = { value:, expires: expires_at }`.
+# The session store writes `_campfire_session` this way with a 20-year
+# `expire_after`.
+pub def encrypt(secrets : Secrets, name : String, value : Value, expires_at : Time? = nil) : String
+  encrypted_cookie_encryptor(secrets).encrypt_and_sign(Any.new(encode(value)), purpose(name), expires_at)
+end
+
+# Reads `cookies.encrypted[name]`; nil wherever Rails returns nil.
+pub def decrypt(secrets : Secrets, name : String, raw : String, now : Time) : Value?
+  encryptor = encrypted_cookie_encryptor(secrets)
+  dumped = encryptor.decrypt_and_verify(raw, purpose(name), now)
+  dumped = encryptor.decrypt_and_verify(raw, nil, now) if dumped.is_a?(Failure)
+  dumped.is_a?(Failure) ? nil : load(dumped)
+end
+
+def purpose(name : String) : String
+  "cookie.#{name}"
+end
+
+# `SerializerWithFallback[:json].load`: Marshal payloads aren't allowed for
+# cookies.
+def load(dumped : Value) : Value?
+  text = dumped.as_s?
+  return nil unless text
+  value = Serializer::JsonFallback.load(text)
+  value.is_a?(Failure) ? nil : value
+end
+
+pub def signed_cookie_verifier(secrets : Secrets) : MessageVerifier
+  # `signed_cookie_digest` is unset, so the jar falls back to "SHA1" even
+  # though the key itself is derived with PBKDF2-SHA256.
+  secret = secrets.key_generator.generate_key(SIGNED_COOKIE_SALT, 64)
+  MessageVerifier.new(secret, Digest::Sha1, Encoding::Strict, Serializer::Null)
+end
+
+pub def encrypted_cookie_encryptor(secrets : Secrets) : MessageEncryptor
+  MessageEncryptor.new(secrets.key_generator.generate_key(AUTHENTICATED_ENCRYPTED_COOKIE_SALT, 32), Serializer::Null)
+end
+
+HEX = "0123456789ABCDEF"
+
+# `Rack::Utils.escape` (`URI.encode_www_form_component`), which Rack applies
+# to every cookie value it writes: `*-._` and alphanumerics stay, a space
+# becomes `+`, the rest is `%XX`.
+pub def escape(raw : String) : String
+  String.build(raw.bytesize) do |io|
+    raw.each_byte do |byte|
+      if (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) ||
+         byte == '*'.ord || byte == '-'.ord || byte == '.'.ord || byte == '_'.ord
+        io.write_byte(byte)
+      elsif byte == ' '.ord
+        io << '+'
+      else
+        io << '%'
+        io.write_byte(HEX.as_tape[(byte >> 4).to_i32])
+        io.write_byte(HEX.as_tape[(byte & 15).to_i32])
+      end
+    end
+  end
+end
+
+def hex_digit(byte : UInt8) : Int32
+  return (byte - 48).to_i32 if byte >= 48 && byte <= 57
+  return (byte - 87).to_i32 if byte >= 97 && byte <= 102
+  return (byte - 55).to_i32 if byte >= 65 && byte <= 70
+  -1
+end
+
+# `Rack::Utils.parse_cookies_header`'s `unescape(value) rescue value`: `+` is
+# a space, `%XX` is decoded, and a malformed escape leaves the value
+# untouched.
+pub def unescape(wire : String) : String
+  bytes = wire.as_tape
+  malformed = false
+  decoded = String.build(wire.bytesize) do |io|
+    i = 0
+    while i < wire.bytesize && !malformed
+      byte = bytes[i]
+      if byte == '+'.ord
+        io << ' '
+      elsif byte == '%'.ord
+        high = i + 1 < wire.bytesize ? hex_digit(bytes[i + 1]) : -1
+        low = i + 2 < wire.bytesize ? hex_digit(bytes[i + 2]) : -1
+        if high < 0 || low < 0
+          malformed = true
+        else
+          io.write_byte((high * 16 + low).to_u8)
+          i += 2
+        end
+      else
+        io.write_byte(byte)
+      end
+      i += 1
+    end
+  end
+  malformed ? wire : scrub(decoded)
+end
+
+# `String::from_utf8_lossy`: every ill-formed sequence as U+FFFD.
+pub def scrub(text : String) : String
+  String.build(text.bytesize) { |io| text.each_char { |c| io << c } }
+end

@@ -1,0 +1,39 @@
+# The Rust port's tag builder tests.
+module test/views/helpers/tag_test
+
+import rils/template/html::{Html}
+import views/helpers/tag::*
+import web/web/spec::*
+
+describe "tag helpers" do
+  it "render attributes in order with Rails' value rules" do
+    options = attrs.class("a&b").hidden.required(false).data("turbo_permanent", true)
+      .aria("hidden", "true").tabindex(-1).attr("data-action", Html.new("a->\"b\""))
+    expected = %( class="a&amp;b" hidden="hidden" data-turbo-permanent="true" aria-hidden="true" tabindex="-1" data-action="a->&quot;b&quot;")
+    assert options.to_s == expected
+    assert options.dup.to_s == expected
+  end
+
+  it "keep an assigned key's position" do
+    options = attrs.value("x").class("c")
+    options.set("value", "y")
+    assert options.to_s == %( value="y" class="c")
+    view = options.dup.attr("value", "z").attr("id", "i")
+    assert view.to_s == %( value="z" class="c" id="i")
+  end
+
+  it "put default data where the caller's data starts" do
+    options = attrs.id("x").data("b", "caller").class("c").data("a", "override")
+    defaults = [{"data-a", "default"}, {"data-z", "z"}] of Tuple(String, AttrValue)
+    assert options.with_default_data(defaults).to_s == %( id="x" data-a="override" data-z="z" data-b="caller" class="c")
+  end
+
+  it "build tags" do
+    assert content_tag("textarea", attrs.id("t"), Html.new("x")).to_s == "<textarea id=\"t\">\nx</textarea>"
+    assert content_tag_text("span", attrs, "<b>").to_s == "<span>&lt;b&gt;</span>"
+    assert content_tag("p", attrs) { Html.new("x") }.to_s == "<p>x</p>"
+    assert builder_tag("turbo_frame", attrs.id("f")).to_s == "<turbo-frame id=\"f\"></turbo-frame>"
+    assert builder_tag("meta", attrs.name("n")).to_s == "<meta name=\"n\">"
+    assert legacy_tag("img", attrs.alt("a")).to_s == "<img alt=\"a\" />"
+  end
+end

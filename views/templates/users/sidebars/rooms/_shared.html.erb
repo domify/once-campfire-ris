@@ -1,0 +1,4 @@
+<%# reference/app/views/users/sidebars/rooms/_shared.html.erb -%>
+<%= link_to_room(room.id, attrs.id(dom_id(room.param_key, room.id, "list")).data("sorted_list_name", room.name).style("--column-gap: 0.5em").class(room.class_names)) do %>
+  <span class="overflow-ellipsis"><%= room.name %></span>
+<% end %>

@@ -1,0 +1,67 @@
+# The room forms against the reference's renders (vectors/views_b), region
+# by region.
+module test/views/room_forms_test
+
+import std/text
+import std/json::{Any}
+import rils/routes/paths::{new_rooms_closed_path, edit_rooms_closed_path, new_rooms_open_path, edit_rooms_open_path}
+import views/room_forms::*
+import views/messages/messages::{UserView}
+import test/views/golden_b::*
+import web/web/spec::*
+
+def form_room(input : Any) : FormRoom
+  room = input["room"]
+  FormRoom.new(room["id"].as_i64?, room["name"].as_s?)
+end
+
+def users(json : Any) : Array(UserView)
+  json.as_a.map { |user| user_view(user) }
+end
+
+def open_page(name : String) : String
+  golden = GoldenB.new(name)
+  ctx = golden.context
+  input = golden.input
+  room = form_room(input)
+  can_administer = input["can_administer"].as_bool
+  type_change = (id = room.id) ? edit_rooms_closed_path(id) : new_rooms_closed_path
+  form = OpenForm.new(ctx, room, can_administer, users(input["users"]), type_change).render
+  RoomFormPage.new(ctx, room, can_administer, form).page.to_s
+end
+
+def closed_page(name : String) : String
+  golden = GoldenB.new(name)
+  ctx = golden.context
+  input = golden.input
+  room = form_room(input)
+  can_administer = input["can_administer"].as_bool
+  type_change = (id = room.id) ? edit_rooms_open_path(id) : new_rooms_open_path
+  form = ClosedForm.new(ctx, room, can_administer, input["current_user_id"].as_i64, users(input["selected_users"]), users(input["unselected_users"]), type_change).render
+  RoomFormPage.new(ctx, room, can_administer, form).page.to_s
+end
+
+describe "rooms/opens" do
+  it "renders new, and edit for an administrator and a member" do
+    ["rooms_opens_new", "rooms_opens_edit", "rooms_opens_edit_member"].each { |name| GoldenB.new(name).assert_dom(open_page(name)) }
+  end
+end
+
+describe "rooms/closeds" do
+  it "renders new, and edit for an administrator and a member" do
+    ["rooms_closeds_new", "rooms_closeds_edit", "rooms_closeds_edit_member"].each { |name| GoldenB.new(name).assert_dom(closed_page(name)) }
+  end
+end
+
+describe "rooms/directs" do
+  it "renders new" do
+    golden = GoldenB.new("rooms_directs_new")
+    golden.assert_dom(DirectsNew.new(golden.context).page.to_s)
+  end
+
+  it "renders edit" do
+    golden = GoldenB.new("rooms_directs_edit")
+    input = golden.input
+    golden.assert_dom(DirectsEdit.new(golden.context, input["room_id"].as_i64, input["display_name"].as_s, users(input["users"])).page.to_s)
+  end
+end

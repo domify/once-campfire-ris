@@ -1,0 +1,216 @@
+# The subset of Ruby's `Marshal.dump` (format 4.8) that digests variation
+# transformations: `ActiveStorage::Variation#digest` is
+# `SHA1.base64digest(Marshal.dump(transformations))`.
+#
+# Symbols and strings differ: transformations built in Ruby carry symbols
+# (`format: :webp`), a variation decoded from a signed URL key carries
+# strings (`format: "webp"`), and the two digest differently.
+module rils/storage/marshal
+
+import std/int
+
+pub enum Kind
+  Nil
+  Bool
+  Int
+  Symbol
+  Str
+  List
+  Map
+end
+
+# A Ruby value as it appears in a transformations hash (after
+# `deep_symbolize_keys`). A map has symbol keys, in insertion order.
+pub class Value
+  getter kind : Kind
+  getter flag : Bool
+  getter int : Int64
+  getter text : String
+  getter items : Array(Value)
+  getter entries : Array(Tuple(String, Value))
+
+  def initialize(@kind : Kind, @flag : Bool = false, @int : Int64 = 0_i64, @text : String = "",
+                 @items : Array(Value) = [] of Value, @entries : Array(Tuple(String, Value)) = [] of Tuple(String, Value))
+  end
+
+  pub def self.none : Value
+    Value.new(Kind::Nil)
+  end
+
+  pub def self.bool(b : Bool) : Value
+    Value.new(Kind::Bool, flag: b)
+  end
+
+  pub def self.int(n : Int64) : Value
+    Value.new(Kind::Int, int: n)
+  end
+
+  pub def self.sym(name : String) : Value
+    Value.new(Kind::Symbol, text: name)
+  end
+
+  pub def self.str(s : String) : Value
+    Value.new(Kind::Str, text: s)
+  end
+
+  pub def self.list(items : Array(Value)) : Value
+    Value.new(Kind::List, items: items)
+  end
+
+  pub def self.map(entries : Array(Tuple(String, Value))) : Value
+    Value.new(Kind::Map, entries: entries)
+  end
+
+  pub def ==(other : Value) : Bool
+    return false unless @kind == other.kind
+    case @kind
+    when Kind::Bool        then @flag == other.flag
+    when Kind::Int         then @int == other.int
+    when Kind::Symbol, Kind::Str then @text == other.text
+    when Kind::List
+      return false unless @items.size == other.items.size
+      @items.each_with_index { |item, i| return false unless item == other.items[i] }
+      true
+    when Kind::Map
+      return false unless @entries.size == other.entries.size
+      @entries.each_with_index do |entry, i|
+        theirs = other.entries[i]
+        return false unless entry[0] == theirs[0] && entry[1] == theirs[1]
+      end
+      true
+    else
+      true
+    end
+  end
+
+  # Ruby's `inspect`, for messages.
+  pub def inspect : String
+    case @kind
+    when Kind::Nil    then "nil"
+    when Kind::Bool   then @flag.to_s
+    when Kind::Int    then @int.to_s
+    when Kind::Symbol then ":#{@text}"
+    when Kind::Str    then @text.inspect
+    when Kind::List   then "[#{@items.map(&.inspect).join(", ")}]"
+    else                   "{#{@entries.map { |e| "#{e[0]}: #{e[1].inspect}" }.join(", ")}}"
+    end
+  end
+end
+
+pub def dump(value : Value) : String
+  writer = Writer.new
+  writer.value(value)
+  writer.io.to_s
+end
+
+class Writer
+  getter io : String::Builder
+  @symbols : Array(String)
+
+  def initialize
+    @io = String::Builder.new
+    @io.write_byte(4_u8)
+    @io.write_byte(8_u8)
+    @symbols = [] of String
+  end
+
+  def byte(c : Char) : Nil
+    @io.write_byte(c.ord.to_u8)
+  end
+
+  def value(value : Value) : Nil
+    case value.kind
+    when Kind::Nil    then byte('0')
+    when Kind::Bool   then byte(value.flag ? 'T' : 'F')
+    when Kind::Int    then integer(value.int)
+    when Kind::Symbol then symbol(value.text)
+    when Kind::Str
+      # A string with an encoding is wrapped in an ivar list holding
+      # `E: true` (UTF-8).
+      byte('I')
+      byte('"')
+      bytes(value.text)
+      long(1_i64)
+      symbol("E")
+      byte('T')
+    when Kind::List
+      byte('[')
+      long(value.items.size.to_i64)
+      value.items.each { |item| self.value(item) }
+    else
+      byte('{')
+      long(value.entries.size.to_i64)
+      value.entries.each do |entry|
+        symbol(entry[0])
+        self.value(entry[1])
+      end
+    end
+  end
+
+  # Integers whose tagged VALUE fits in 31-bit signed are written inline
+  # (`i`), larger ones as bignums (`l`).
+  def integer(n : Int64) : Nil
+    if n >= -(1_i64 << 30) && n < (1_i64 << 30)
+      byte('i')
+      long(n)
+    else
+      byte('l')
+      byte(n < 0 ? '-' : '+')
+      magnitude = n < 0 ? (-(n + 1)).to_u64 + 1 : n.to_u64
+      digits = [] of UInt8
+      while magnitude > 0
+        digits << (magnitude & 0xff).to_u8
+        magnitude >>= 8
+      end
+      digits << 0_u8 if digits.size.odd?
+      long((digits.size // 2).to_i64)
+      digits.each { |d| @io.write_byte(d) }
+    end
+  end
+
+  def symbol(name : String) : Nil
+    if index = @symbols.index(name)
+      byte(';')
+      long(index.to_i64)
+    else
+      @symbols << name
+      byte(':')
+      bytes(name)
+    end
+  end
+
+  def bytes(s : String) : Nil
+    long(s.bytesize.to_i64)
+    @io << s
+  end
+
+  # `w_long` in marshal.c.
+  def long(n : Int64) : Nil
+    if n == 0
+      @io.write_byte(0_u8)
+    elsif 0 < n && n < 123
+      @io.write_byte((n + 5).to_u8)
+    elsif -124 < n && n < 0
+      @io.write_byte(((n - 5) & 0xff).to_u8)
+    else
+      buf = [] of UInt8
+      x = n
+      i = 1
+      while i <= 8
+        buf << (x & 0xff).to_u8
+        x >>= 8
+        if x == 0
+          @io.write_byte(i.to_u8)
+          buf.each { |b| @io.write_byte(b) }
+          return
+        end
+        if x == -1
+          @io.write_byte((256 - i).to_u8)
+          buf.each { |b| @io.write_byte(b) }
+          return
+        end
+        i += 1
+      end
+    end
+  end
+end

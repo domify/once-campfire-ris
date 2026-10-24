@@ -1,0 +1,30 @@
+# The autocompletable views for the goldens they were rendered for, byte for
+# byte (vectors/views).
+module test/views/autocompletable_test
+
+import views/autocompletable::{UsersIndex, users_index_json}
+import views/users::{MentionUser}
+import test/views/golden::{golden_case, golden_context, golden_page, golden_file}
+import test/views/testing::{assert_same}
+import web/web/spec::*
+
+describe "autocompletable views" do
+  it "render the users index as the reference does" do
+    name = "autocompletable_users"
+    users = golden_case(name)["users"].as_a.map do |u|
+      MentionUser.new(u["id"].as_i64, u["name"].as_s, u["bio"].as_s?, u["attachable_sgid"].as_s, u["avatar_path"].as_s)
+    end
+    html = UsersIndex.new(golden_context(name), users).render
+    assert_same(name, golden_page(name), html.to_s)
+  end
+
+  it "render the users index as JSON as the reference does" do
+    name = "autocompletable_users_json"
+    c = golden_case(name)
+    users = c["autocompletable"].as_a.map do |shown|
+      u = c["users"][shown.as_s]
+      MentionUser.new(u["id"].as_i64, u["name"].as_s, u["bio"].as_s?, u["attachable_sgid"].as_s, u["avatar_path"].as_s)
+    end
+    assert_same(name, golden_file(name, "json"), users_index_json(golden_context(name), users))
+  end
+end

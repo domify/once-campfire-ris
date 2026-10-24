@@ -1,0 +1,27 @@
+# The Rust port's `is_word` test (integrations/search.rs), against the table
+# Ruby's `/[[:word:]]/` wrote.
+module test/integrations/search/word_ranges_test
+
+import integrations/search/word_ranges::{word?, WORD_RANGES}
+import web/web/spec::*
+
+describe "word?" do
+  it "matches Onigmo's [[:word:]]" do
+    # Letters (including titlecase, modifier, letter numbers and enclosed
+    # letters), marks, decimal digits, connector punctuation and join
+    # controls.
+    ['a', 'Z', '0', '_', 'é', 'ß', '日', '‿', '́', '٣', 'ǅ', 'ʰ', 'Ⅻ', 'Ⓐ', '‍'].each do |c|
+      assert word?(c), "#{c.inspect} is a word character"
+    end
+    [' ', '-', '*', '"', ' ', '❤', '€', '½', '²'].each do |c|
+      assert !word?(c), "#{c.inspect} is not a word character"
+    end
+  end
+
+  it "covers the table's ends" do
+    assert WORD_RANGES.size == 771 * 2
+    assert word?('\u{e01ef}')
+    assert !word?('\u{e01f0}')
+    assert !word?('\u{2f}')
+  end
+end

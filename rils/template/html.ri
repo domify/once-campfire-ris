@@ -1,0 +1,58 @@
+# `ERB::Util.html_escape` and `ActiveSupport::SafeBuffer`. Helpers return
+# `Html`, which templates print as is; any other value a template prints is
+# escaped like ERB's `&amp; &lt; &gt; &quot; &#39;`. Build helper output
+# with `escape` for untrusted text and `raw` for markup.
+module rils/template/html
+
+import rils/ruby/erb::{html_escape}
+
+# An html_safe string.
+pub struct Html
+  @html : String
+
+  def initialize(@html : String)
+  end
+
+  def to_s : String
+    @html
+  end
+
+  def empty? : Bool
+    @html.empty?
+  end
+
+  def bytesize : Int32
+    @html.bytesize
+  end
+
+  def +(other : Html) : Html
+    Html.new(@html + other.to_s)
+  end
+
+  def ==(other : Html) : Bool
+    @html == other.to_s
+  end
+end
+
+pub def escape(text : String) : String
+  html_escape(text)
+end
+
+# `raw` / `String#html_safe`.
+pub def raw(html : String) : Html
+  Html.new(html)
+end
+
+# `h(text)` as an html_safe value.
+pub def text(text : String) : Html
+  Html.new(html_escape(text))
+end
+
+pub def empty_html : Html
+  Html.new("")
+end
+
+# Safe parts joined, as `safe_join` does without a separator.
+pub def join(parts : Array(Html)) : Html
+  Html.new(parts.map(&.to_s).join(""))
+end

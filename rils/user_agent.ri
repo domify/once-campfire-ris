@@ -1,0 +1,1087 @@
+# The useragent gem (0.16.11), which Rails' `allow_browser` and
+# platform_agent read the User-Agent header with, as the Rust port has it
+# (crates/campfire/src/concerns/user_agent.rs): `UserAgent.parse` splits the
+# header into products, and the first of `UserAgent::Browsers::ALL` whose
+# `extend?` accepts them decides how `browser`, `version`, `platform`, `os`,
+# `bot?` and `mobile?` answer.
+#
+# Where the gem raises (a NoMethodError on nil, say), the `try_` methods
+# answer `Raised`. Ruby's `\d` and `\s` are ASCII-only, and so are the
+# matchers here, which scan bytes: every delimiter they name is ASCII.
+module rils/user_agent
+
+import std/text
+import rils/ruby/text::{strip}
+
+DEFAULT_USER_AGENT = "Mozilla/4.0 (compatible)"
+
+# The gem raised instead of answering.
+pub class Raised
+end
+
+RAISED = Raised.new
+
+# `UserAgent.parse`: a blank header parses as "Mozilla/4.0 (compatible)".
+pub def parse(user_agent : String) : Agent
+  rest = strip(user_agent).empty? ? DEFAULT_USER_AGENT : user_agent
+  products = [] of Product
+  while matched = match_product(rest)
+    length, product = matched
+    products << product
+    rest = strip(rest[length, rest.bytesize - length])
+  end
+  kind = ALL_KINDS.find { |k| extends?(k, products) } || "base"
+  Agent.new(kind, products)
+end
+
+# --- UserAgent::Version ---
+
+# A run of digits (leading zeros stripped, compared as an unbounded
+# integer), or a string.
+pub class Segment
+  getter int : Bool
+  getter text : String
+
+  def initialize(@int : Bool, @text : String)
+  end
+
+  def self.digits(digits : String) : Segment
+    trimmed = digits.lstrip('0')
+    Segment.new(true, trimmed.empty? ? "0" : trimmed)
+  end
+
+  def ==(other : Segment) : Bool
+    @int == other.int && @text == other.text
+  end
+
+  def as_u64 : UInt64?
+    @int && @text.bytesize <= 19 ? @text.to_u64? : nil
+  end
+end
+
+# `UserAgent::Version`. Equality is string equality; ordering is the
+# gem's `<=>`, which isn't a total order.
+pub class Version
+  getter string : String
+  getter blank : Bool
+  getter comparable : Bool
+
+  def initialize(@string : String = "")
+    @blank = true
+    @string.each_char { |c| @blank = false unless ruby_space?(c) }
+    digits = 0
+    while digits < @string.bytesize && digit?(byte_at(@string, digits))
+      digits += 1
+    end
+    @comparable = !@blank && digits > 0 && (digits == @string.bytesize || byte_at(@string, digits) == '.'.ord)
+  end
+
+  # `Version#nil?`: the string is empty or whitespace.
+  pub def ruby_nil? : Bool
+    @blank
+  end
+
+  # `version.to_s.present?`.
+  pub def present? : Bool
+    present?(@string)
+  end
+
+  pub def to_s : String
+    @string
+  end
+
+  pub def ==(other : Version) : Bool
+    @string == other.string
+  end
+
+  pub def to_a : Array(Segment)
+    if @blank
+      [] of Segment
+    elsif @comparable
+      scan_sequences(@string)
+    else
+      [Segment.new(false, @string)]
+    end
+  end
+
+  # `Version#<=>`: only the first six segments count. -1, 0 or 1.
+  pub def compare(other : Version) : Int32
+    if @comparable
+      ours = to_a
+      theirs = other.to_a
+      zero = Segment.new(true, "0")
+      6.times do |i|
+        a = i < ours.size ? ours[i] : zero
+        b = i < theirs.size ? theirs[i] : zero
+        return -1 if !a.int && b.int
+        return 1 if a.int && !b.int
+        next if a == b
+        if a.int
+          return a.text.bytesize < b.text.bytesize ? -1 : 1 unless a.text.bytesize == b.text.bytesize
+          return a.text < b.text ? -1 : 1
+        end
+        return a.text < b.text ? -1 : 1
+      end
+      0
+    else
+      @string == other.string ? 0 : -1
+    end
+  end
+
+  pub def <(other : Version) : Bool
+    compare(other) < 0
+  end
+end
+
+# `str.scan(/\d+|[A-Za-z][0-9A-Za-z-]*$/)`.
+def scan_sequences(string : String) : Array(Segment)
+  sequences = [] of Segment
+  size = string.bytesize
+  i = 0
+  while i < size
+    b = byte_at(string, i)
+    if digit?(b)
+      start = i
+      while i < size && digit?(byte_at(string, i))
+        i += 1
+      end
+      sequences << Segment.digits(string[start, i - start])
+    elsif alpha?(b)
+      stop = i + 1
+      while stop < size && (alnum?(byte_at(string, stop)) || byte_at(string, stop) == '-'.ord)
+        stop += 1
+      end
+      if stop == size
+        sequences << Segment.new(false, string[i, size - i])
+        i = stop
+      else
+        i += 1
+      end
+    else
+      i += 1
+    end
+  end
+  sequences
+end
+
+# --- Products and parsing ---
+
+class Product
+  getter product : String
+  getter version : Version
+  getter comment : Array(String)?
+
+  def initialize(@product : String, @version : Version, @comment : Array(String)?)
+  end
+
+  def comment_at(index : Int32) : String?
+    found = @comment
+    found && index < found.size ? found[index] : nil
+  end
+
+  def joined_comment : String?
+    found = @comment
+    found ? found.join("; ") : nil
+  end
+
+  def comments : Array(String)
+    @comment || [] of String
+  end
+end
+
+pub def first_of(items : Array(T)) : T? forall T
+  items.empty? ? nil : items[0]
+end
+
+pub def last_of(items : Array(T)) : T? forall T
+  items.empty? ? nil : items[items.size - 1]
+end
+
+def byte_at(s : String, i : Int32) : UInt8
+  s.as_tape[i]
+end
+
+def digit?(b : UInt8) : Bool
+  b >= '0'.ord && b <= '9'.ord
+end
+
+# *count* ASCII digits in *s* from byte *from*.
+def digits_at?(s : String, from : Int32, count : Int32) : Bool
+  k = 0
+  while k < count
+    return false unless digit?(byte_at(s, from + k))
+    k += 1
+  end
+  true
+end
+
+def alpha?(b : UInt8) : Bool
+  (b >= 'a'.ord && b <= 'z'.ord) || (b >= 'A'.ord && b <= 'Z'.ord)
+end
+
+def alnum?(b : UInt8) : Bool
+  digit?(b) || alpha?(b)
+end
+
+# `\s` in a Ruby regexp.
+def ruby_space?(c : Char) : Bool
+  c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r'
+end
+
+def space_byte?(b : UInt8) : Bool
+  b == ' '.ord || b == '\t'.ord || b == '\n'.ord || b == 0x0b || b == 0x0c || b == '\r'.ord
+end
+
+# ActiveSupport's `present?` for strings: a character that isn't
+# whitespace (`strip` takes the same characters off).
+pub def present?(string : String) : Bool
+  string.each_char { |c| return true unless c.whitespace? }
+  false
+end
+
+# Ruby's `downcase` as far as a lowercase ASCII needle can tell: ASCII
+# folds, and of the rest only U+212A KELVIN SIGN lowercases to ASCII ("k").
+# U+0130 gives "i" and a combining dot, which no needle here ends or starts
+# its match on; anything else stays non-ASCII. The prelude's `downcase` is
+# ASCII only.
+pub def downcase_for_ascii(s : String) : String
+  s.downcase.gsub("\u212A", "k")
+end
+
+# `a.downcase == b.downcase`, *b* lowercase ASCII.
+def same_ignoring_case?(a : String, b : String) : Bool
+  folded_match(a, 0, b) == a.bytesize
+end
+
+# `haystack.downcase.include?(needle)`, *needle* lowercase ASCII.
+def contains_ignoring_case?(haystack : String, needle : String) : Bool
+  at = 0
+  while at < haystack.bytesize
+    return true if folded_match(haystack, at, needle)
+    at += 1
+  end
+  needle.empty?
+end
+
+# Where *needle* ends in *haystack* from byte *at*, read as
+# `downcase_for_ascii` would have it, without making the downcased copy;
+# nil when it doesn't match there.
+def folded_match(haystack : String, at : Int32, needle : String) : Int32?
+  i = at
+  needle.each_byte do |want|
+    return nil unless i < haystack.bytesize
+    byte = byte_at(haystack, i)
+    if byte == 0xe2 && want == 'k'.ord && i + 2 < haystack.bytesize &&
+       byte_at(haystack, i + 1) == 0x84 && byte_at(haystack, i + 2) == 0xaa
+      i += 3
+    elsif ('A'.ord <= byte <= 'Z'.ord ? byte + 32 : byte) == want
+      i += 1
+    else
+      return nil
+    end
+  end
+  i
+end
+
+# `UserAgent::MATCHER` at the start of *s*:
+# `^['"]*([^/\s]+)/?([^\s,]*)(\s\(([^\)]*)\)|,gzip\(gfe\))?`. The match's
+# length in bytes, and the product.
+def match_product(s : String) : Tuple(Int32, Product)?
+  size = s.bytesize
+  product_byte = ->(b : UInt8) { b != '/'.ord && !space_byte?(b) }
+  quotes = 0
+  while quotes < size && (byte_at(s, quotes) == '\''.ord || byte_at(s, quotes) == '"'.ord)
+    quotes += 1
+  end
+  start = if quotes < size && product_byte.call(byte_at(s, quotes))
+            quotes
+          elsif quotes > 0
+            quotes - 1 # backtrack: the last quote is the product
+          else
+            return nil
+          end
+  i = start + 1
+  while i < size && product_byte.call(byte_at(s, i))
+    i += 1
+  end
+  product = s[start, i - start]
+  i += 1 if i < size && byte_at(s, i) == '/'.ord
+  version_start = i
+  while i < size && !space_byte?(byte_at(s, i)) && byte_at(s, i) != ','.ord
+    i += 1
+  end
+  version = s[version_start, i - version_start]
+  comment = nil.as(String?)
+  if i + 1 < size && space_byte?(byte_at(s, i)) && byte_at(s, i + 1) == '('.ord
+    if close = s.byte_index(")", i + 2)
+      comment = s[i + 2, close - i - 2]
+      i = close + 1
+    end
+  elsif s.byte_index(",gzip(gfe)", i) == i
+    i += 10
+  end
+  {i, Product.new(product, Version.new(version), comment ? ruby_split(comment, "; ") : nil)}
+end
+
+# `String#split(separator)`: trailing empty fields are dropped.
+def ruby_split(string : String, separator : String) : Array(String)
+  parts = string.split(separator)
+  while !parts.empty? && parts.last.empty?
+    parts.pop
+  end
+  parts
+end
+
+# --- Browsers ---
+
+# `UserAgent::Browsers::ALL`, in detection order.
+ALL_KINDS = ["edge", "internet_explorer", "opera", "wechat", "vivaldi", "chrome", "itunes", "playstation",
+             "podcast_addict", "webkit", "gecko", "windows_media_player", "apple_core_media", "libavformat"]
+
+# Each browser class's `self.extend?(agent)`.
+def extends?(kind : String, products : Array(Product)) : Bool
+  first = first_of(products)
+  first_version = first ? first.version.to_s : nil
+  any = ->(name : String) { products.any? { |p| p.product == name } }
+  case kind
+  when "edge"
+    last = last_of(products)
+    !last.nil? && last.product == "Edge"
+  when "internet_explorer"
+    return false unless first && first.comment
+    msie = first.comment_at(1)
+    joined = first.joined_comment
+    (!msie.nil? && msie.includes?("MSIE")) || (!joined.nil? && trident_rv?(joined))
+  when "opera"
+    last = last_of(products)
+    (!first.nil? && first.product == "Opera") || (!last.nil? && last.product == "OPR")
+  when "wechat"
+    products.any? { |p| contains_ignoring_case?(p.product, "micromessenger") }
+  when "vivaldi"
+    any.call("Vivaldi")
+  when "chrome"
+    any.call("Chrome") || any.call("CriOS")
+  when "itunes"
+    any.call("iTunes")
+  when "playstation"
+    return false unless first
+    comment = first.comment_at(0)
+    !comment.nil? && (comment.includes?("PLAYSTATION 3") || comment.includes?("PlayStation Vita") || comment.includes?("PlayStation 4"))
+  when "podcast_addict"
+    products.size >= 3 && products[0].product == "Podcast" && products[1].product == "Addict" && products[2].product == "-"
+  when "webkit"
+    products.any? { |p| same_ignoring_case?(p.product, "applewebkit") || p.comments.any? { |c| !webkit_comment_version(c).nil? } }
+  when "gecko"
+    !first.nil? && first.product == "Mozilla"
+  when "windows_media_player"
+    products.any? { |p| ["NSPlayer", "Windows-Media-Player", "WMFSDK"].includes?(p.product) } &&
+      !["4.1.0.3856", "7.10.0.3059", "7.0.0.1956"].includes?(first_version || "")
+  when "apple_core_media"
+    any.call("AppleCoreMedia")
+  when "libavformat"
+    products.any? { |p| p.product == "Lavf" || (p.product == "NSPlayer" && first_version == "4.1.0.3856") }
+  else
+    true
+  end
+end
+
+# A parsed User-Agent: `UserAgent::Browsers::Base` extended with the
+# detected browser class.
+pub class Agent
+  getter kind : String
+  getter products : Array(Product)
+
+  def initialize(@kind : String, @products : Array(Product))
+  end
+
+  # `bot?`.
+  pub def bot? : Bool
+    application = application() || return true
+    @products.any? { |p| p.comments.any? { |c| contains_ignoring_case?(c, "bot") } } ||
+      !detect_product("Chrome-Lighthouse").nil? || application.product.includes?("bot")
+  end
+
+  def last : Product?
+    last_of(@products)
+  end
+
+  # `detect_product`: a case-insensitive lookup by product name.
+  def detect_product(name : String) : Product?
+    @products.find { |p| same_ignoring_case?(p.product, name.downcase) }
+  end
+
+  # `application`: the first product, or for the WebKit-based classes the
+  # first with a non-empty comment.
+  def application : Product?
+    case @kind
+    when "chrome", "vivaldi", "webkit", "itunes", "apple_core_media"
+      @products.find { |p| !p.comments.empty? }
+    else
+      first_of(@products)
+    end
+  end
+
+  def application_comment : Array(String)?
+    found = application
+    found ? found.comment : nil
+  end
+
+  def base_version : Version?
+    found = application
+    found ? found.version : nil
+  end
+
+  # --- browser ---
+
+  pub def try_browser : String? | Raised
+    case @kind
+    when "base"                 then (found = application) ? found.product : nil
+    when "edge"                 then "Edge"
+    when "internet_explorer"    then "Internet Explorer"
+    when "opera"                then "Opera"
+    when "wechat"               then "Wechat Browser"
+    when "vivaldi"              then "Vivaldi"
+    when "chrome"               then detect_product("Iron") ? "Iron" : "Chrome"
+    when "itunes"               then "iTunes"
+    when "playstation"          then playstation_browser
+    when "podcast_addict"       then "Podcast Addict"
+    when "webkit"               then webkit_browser
+    when "gecko"                then gecko_browser
+    when "windows_media_player" then "Windows Media Player"
+    when "apple_core_media"     then "AppleCoreMedia"
+    else                             "libavformat"
+    end
+  end
+
+  def playstation_browser : String?
+    comment = application_comment || return nil
+    first_comment = first_of(comment) || return nil
+    last = last()
+    if first_comment.includes?("PLAYSTATION 3")
+      "PS3 Internet Browser"
+    elsif last && last.product == "Silk"
+      "Silk"
+    elsif first_comment.includes?("PlayStation 4")
+      "PS4 Internet Browser"
+    else
+      nil
+    end
+  end
+
+  def webkit_browser : String
+    os = webkit_os
+    if os && os.includes?("Android")
+      "Android"
+    elsif webkit_platform == "BlackBerry"
+      "BlackBerry"
+    else
+      "Safari"
+    end
+  end
+
+  def gecko_browser : String
+    ["PaleMoon", "Firefox", "Camino", "Iceweasel", "Seamonkey"].each { |name| return name if detect_product(name) }
+    (found = first_of(@products)) ? found.product : ""
+  end
+
+  # --- version ---
+
+  pub def try_version : Version? | Raised
+    case @kind
+    when "base", "windows_media_player", "apple_core_media"
+      base_version
+    when "edge", "vivaldi"
+      (found = last) ? found.version : nil
+    when "internet_explorer"
+      found = application
+      joined = found ? found.joined_comment || "" : ""
+      Version.new(ie_version(joined) || "")
+    when "opera"
+      opera_version
+    when "wechat"
+      (found = detect_product("MicroMessenger")) ? found.version : RAISED
+    when "chrome"
+      found = detect_product("CriOs") || detect_product("chrome")
+      found ? found.version : RAISED
+    when "itunes"
+      (found = detect_product("iTunes")) ? found.version : RAISED
+    when "playstation"
+      playstation_version
+    when "podcast_addict"
+      nil
+    when "webkit"
+      webkit_version
+    when "gecko"
+      found = detect_product(gecko_browser) || return RAISED
+      found.version.ruby_nil? ? base_version : found.version
+    else
+      detect_product("NSPlayer") ? nil : base_version
+    end
+  end
+
+  def opera_mini? : Bool
+    found = first_of(@products)
+    joined = found ? found.joined_comment : nil
+    !joined.nil? && joined.includes?("Opera Mini")
+  end
+
+  def opera_version : Version?
+    if opera_mini?
+      comment = (application_comment || [] of String).find { |c| c.includes?("Opera Mini") }
+      version = comment ? capture_after(comment, "Opera Mini/") { |b| digit?(b) || b == '.'.ord } : nil
+      Version.new(version || "")
+    elsif found = detect_product("Version")
+      found.version
+    elsif found = detect_product("OPR")
+      found.version
+    else
+      base_version
+    end
+  end
+
+  def playstation_version : Version?
+    os = playstation_os || return nil
+    after = ->(marker : String) { Version.new(ruby_split(os, marker).last? || "") }
+    if playstation_browser == "Silk"
+      (found = last) ? found.version : nil
+    else
+      case playstation_platform
+      when "PlayStation 3"    then after.call("PLAYSTATION 3 ")
+      when "PlayStation 4"    then after.call("PlayStation 4 ")
+      when "PlayStation Vita" then after.call("PlayStation Vita ")
+      else                         nil
+      end
+    end
+  end
+
+  def webkit_version : Version
+    if found = detect_product("Version")
+      return found.version
+    end
+    os = webkit_os
+    ios = os ? capture_after(os, "iOS ") { |b| digit?(b) || b == '.'.ord } : nil
+    return Version.new(ios.gsub("_", ".")) if ios && webkit_browser == "Safari"
+    webkit = webkit()
+    Version.new(webkit_build_version(webkit ? webkit.to_s : "") || "")
+  end
+
+  # `Webkit#webkit.version`: the AppleWebKit product's version, or one from
+  # a comment.
+  def webkit : Version?
+    if found = @products.find { |p| same_ignoring_case?(p.product, "applewebkit") }
+      return found.version
+    end
+    @products.each do |p|
+      p.comments.each do |c|
+        if version = webkit_comment_version(c)
+          return Version.new(version)
+        end
+      end
+    end
+    nil
+  end
+
+  # --- platform ---
+
+  # `browser`, `version` and `platform` as the push subscriptions page
+  # shows them: what raised is blank.
+  pub def browser : String
+    found = try_browser
+    found.is_a?(String) ? found : ""
+  end
+
+  pub def version : Version
+    found = try_version
+    found.is_a?(Version) ? found : Version.new
+  end
+
+  pub def platform : String?
+    found = try_platform
+    found.is_a?(String) ? found : nil
+  end
+
+  pub def try_platform : String? | Raised
+    comment = application_comment
+    first = comment ? first_of(comment) : nil
+    any = ->(needle : String) { !comment.nil? && comment.any? { |c| c.includes?(needle) } }
+    case @kind
+    when "base", "libavformat"
+      nil
+    when "edge", "internet_explorer", "windows_media_player"
+      "Windows"
+    when "opera", "apple_core_media"
+      return nil if comment.nil?
+      first && first.includes?("Windows") ? "Windows" : first
+    when "wechat"
+      return nil if comment.nil?
+      if first && first.includes?("iPhone")
+        "iPhone"
+      elsif any.call("Android")
+        "Android"
+      else
+        first
+      end
+    when "chrome", "vivaldi"
+      return nil if comment.nil?
+      if first && first.includes?("Windows")
+        "Windows"
+      elsif any.call("CrOS")
+        "ChromeOS"
+      elsif any.call("Android")
+        "Android"
+      else
+        first
+      end
+    when "webkit", "itunes"
+      webkit_platform
+    when "playstation"
+      playstation_platform
+    when "podcast_addict"
+      os = podcast_addict_os
+      return os if os.is_a?(Raised)
+      return RAISED if os.nil?
+      os.includes?("Android") ? "Android" : nil
+    else
+      return nil if comment.nil?
+      if first == "compatible" || first == "Mobile"
+        nil
+      elsif first && first.starts_with?("Windows ")
+        "Windows"
+      else
+        first
+      end
+    end
+  end
+
+  def webkit_platform : String?
+    comment = application_comment || return nil
+    first = first_of(comment)
+    if first && first.includes?("Windows")
+      "Windows"
+    elsif first == "BB10"
+      "BlackBerry"
+    elsif comment.any? { |c| c.includes?("Android") }
+      "Android"
+    else
+      first
+    end
+  end
+
+  def playstation_platform : String?
+    os = playstation_os || return nil
+    if os.includes?("PLAYSTATION 3")
+      "PlayStation 3"
+    elsif os.includes?("PlayStation 4")
+      "PlayStation 4"
+    elsif os.includes?("PlayStation Vita")
+      "PlayStation Vita"
+    else
+      nil
+    end
+  end
+
+  # --- os ---
+
+  pub def try_os : String? | Raised
+    case @kind
+    when "base", "libavformat"
+      nil
+    when "edge"
+      matched = nil.as(String?)
+      @products.each do |p|
+        p.comments.each do |c|
+          matched ||= windows_os(c)
+        end
+      end
+      normalize_os(matched || "")
+    when "internet_explorer"
+      found = application
+      joined = found ? found.joined_comment || "" : ""
+      normalize_os(windows_os(joined) || "")
+    when "opera"
+      comment = application_comment || return nil
+      first = first_of(comment)
+      if first && first.includes?("Windows")
+        normalize_os(first)
+      else
+        comment.size > 1 ? comment[1] : nil
+      end
+    when "wechat", "chrome", "vivaldi", "apple_core_media"
+      (comment = application_comment) ? chrome_os(comment) : nil
+    when "webkit"
+      webkit_os
+    when "itunes"
+      itunes_os
+    when "playstation"
+      playstation_os
+    when "podcast_addict"
+      podcast_addict_os
+    when "gecko"
+      gecko_os
+    else
+      windows_media_player_os
+    end
+  end
+
+  def webkit_os : String?
+    comment = application_comment || return nil
+    at = ->(i : Int32) { i < comment.size ? comment[i] : nil }
+    first = at.call(0)
+    second = at.call(1)
+    if first && first.includes?("Windows NT")
+      normalize_os(first)
+    elsif at.call(2).nil? || (second && second.includes?("Android"))
+      second ? normalize_os(second) : nil
+    elsif ios = comment.find { |c| !ios_version(c).nil? }
+      normalize_os(ios)
+    else
+      (third = at.call(2)) ? normalize_os(third) : nil
+    end
+  end
+
+  def itunes_os : String?
+    comment = application_comment
+    first = comment ? first_of(comment) : nil
+    return webkit_os unless first && first.includes?("Windows")
+    full_os = itunes_full_os || ""
+    ["Windows 8.1", "Windows 8", "Windows 7", "Windows Vista", "Windows XP"].each { |name| return name if full_os.includes?(name) }
+    "Windows"
+  end
+
+  # `ITunes#full_os`: the comment was cut at the first ")", so
+  # "(Build 7601" gets it back.
+  def itunes_full_os : String?
+    comment = application_comment || return nil
+    return nil unless comment.size > 1
+    full_os = comment[1]
+    # The last eleven characters are ASCII when they match, so bytes do.
+    n = full_os.bytesize
+    reopened = n >= 11 && full_os[n - 11, 7] == "(Build " && digits_at?(full_os, n - 4, 4)
+    reopened ? "#{full_os})" : full_os
+  end
+
+  def playstation_os : String?
+    (comment = application_comment) ? comment.join(" ") : nil
+  end
+
+  # `PodcastAddict#os`; raises for a comment-less Dalvik or Mozilla.
+  def podcast_addict_os : String? | Raised
+    return nil unless @products.size > 3
+    device = @products[3]
+    return nil unless device.product == "Dalvik" || device.product == "Mozilla"
+    comment = device.comment || return RAISED
+    if comment.size > 3
+      comment[2]
+    elsif comment.size == 3
+      "Android"
+    else
+      nil
+    end
+  end
+
+  def gecko_os : String?
+    comment = application_comment || return nil
+    first = first_of(comment)
+    index = if comment.size > 1 && comment[1] == "U"
+              2
+            elsif first && (first.starts_with?("Windows ") || first.starts_with?("Android"))
+              0
+            elsif first == "Mobile"
+              return nil
+            else
+              1
+            end
+    index < comment.size ? normalize_os(comment[index]) : nil
+  end
+
+  def windows_media_player_os : String | Raised
+    version = base_version || return RAISED
+    segments = version.to_a
+    first = first_of(segments) || return RAISED
+    return RAISED unless first.int
+    major = first.as_u64 || 18446744073709551615_u64
+    part = ->(i : Int32) { i < segments.size ? segments[i].as_u64 : nil }
+    if major <= 4
+      case part.call(3)
+      when 3564, 3925 then "Windows 98"
+      when 3857       then "Windows 9x"
+      when 3936       then "Windows XP"
+      when 3938       then "Windows 2000"
+      else                 "Windows"
+      end
+    elsif major == 7
+      part.call(3) == 3055 ? "Windows 98" : "Windows"
+    elsif major == 8
+      "Windows XP"
+    elsif major == 9 || major == 10
+      case part.call(3)
+      when 2980             then "Windows 98/2000"
+      when 3268, 3367, 3270 then "Windows 2000"
+      when 3802, 4503       then "Windows XP"
+      else                       "Windows"
+      end
+    elsif major == 11 || major == 12
+      p2 = part.call(2)
+      case p2
+      when 9841, 9858, 9860, 9879 then "Windows 10"
+      when 9651                   then "Windows Phone 8.1"
+      when 9600                   then "Windows 8.1"
+      when 9200                   then "Windows 8"
+      when 7600, 7601             then "Windows 7"
+      when 5721                   then "Windows XP"
+      else
+        p2 && p2 >= 6000 && p2 <= 6002 ? "Windows Vista" : "Windows"
+      end
+    else
+      "Windows"
+    end
+  end
+
+  # `mobile?`.
+  pub def try_mobile : Bool | Raised
+    case @kind
+    when "opera"          then opera_mini?
+    when "playstation"    then playstation_platform == "PlayStation Vita"
+    when "podcast_addict" then true
+    when "windows_media_player"
+      os = windows_media_player_os
+      return os if os.is_a?(Raised)
+      os == "Windows Phone 8" || os == "Windows Phone 8.1"
+    else
+      return true if detect_product("Mobile")
+      return true if @products.any? { |p| p.comments.any? { |c| c == "Mobile" } }
+      os = try_os
+      return os if os.is_a?(Raised)
+      return true if os && os.includes?("Android")
+      comment = application_comment
+      !comment.nil? && comment.any? { |c| c.starts_with?("IEMobile") }
+    end
+  end
+end
+
+# `os` shared by Chrome, Vivaldi, WechatBrowser and AppleCoreMedia.
+def chrome_os(comment : Array(String)) : String?
+  at = ->(i : Int32) { i < comment.size ? comment[i] : nil }
+  first = at.call(0)
+  second = at.call(1)
+  pick = if first && first.includes?("Windows NT")
+           first
+         elsif at.call(2).nil? || (second && second.includes?("Android"))
+           second
+         else
+           at.call(2)
+         end
+  pick ? normalize_os(pick) : nil
+end
+
+# --- OperatingSystems and hand-written regexps ---
+
+# `UserAgent::OperatingSystems.normalize_os`.
+def normalize_os(os : String) : String
+  windows = case os
+            when "Windows NT 10.0" then "Windows 10"
+            when "Windows NT 6.3"  then "Windows 8.1"
+            when "Windows NT 6.2"  then "Windows 8"
+            when "Windows NT 6.1"  then "Windows 7"
+            when "Windows NT 6.0"  then "Windows Vista"
+            when "Windows NT 5.2"  then "Windows XP x64 Edition"
+            when "Windows NT 5.1"  then "Windows XP"
+            when "Windows NT 5.01" then "Windows 2000, Service Pack 1 (SP1)"
+            when "Windows NT 5.0"  then "Windows 2000"
+            when "Windows NT 4.0"  then "Windows NT 4.0"
+            when "Windows 98"      then "Windows 98"
+            when "Windows 95"      then "Windows 95"
+            when "Windows CE"      then "Windows CE"
+            else                        nil
+            end
+  return windows if windows
+  if mac = mac_os_x_version(os)
+    version = mac[0]
+    return version ? "OS X #{version.gsub("_", ".")}" : "OS X"
+  end
+  if ios = ios_version(os)
+    return "iOS #{ios.gsub("_", ".")}"
+  end
+  if chrome = chrome_os_version(os)
+    return "ChromeOS #{chrome}"
+  end
+  os
+end
+
+def version_byte?(b : UInt8) : Bool
+  digit?(b) || b == '.'.ord
+end
+
+# The length of the run of bytes from *start* that *f* accepts.
+def run_of(s : String, start : Int32, & : UInt8 -> Bool) : Int32
+  i = start
+  while i < s.bytesize && yield byte_at(s, i)
+    i += 1
+  end
+  i - start
+end
+
+def starts_at?(s : String, at : Int32, prefix : String) : Bool
+  s.byte_index(prefix, at) == at
+end
+
+# `/(?:Intel|PPC) Mac OS X\s*([0-9_\.]+)?/`: when it matches, its capture.
+def mac_os_x_version(os : String) : Tuple(String?)?
+  os.bytesize.times do |i|
+    after = if starts_at?(os, i, "Intel Mac OS X")
+              i + 14
+            elsif starts_at?(os, i, "PPC Mac OS X")
+              i + 12
+            else
+              next
+            end
+    after += run_of(os, after) { |b| space_byte?(b) }
+    digits = run_of(os, after) { |b| digit?(b) || b == '_'.ord || b == '.'.ord }
+    return {digits > 0 ? os[after, digits] : nil}
+  end
+  nil
+end
+
+# `IOS_VERSION_REGEX = /CPU (?:iPhone |iPod )?OS ([\d_]+) like Mac OS X/`.
+def ios_version(os : String) : String?
+  os.bytesize.times do |i|
+    next unless starts_at?(os, i, "CPU ")
+    rest = i + 4
+    [rest + 7, rest + 5, rest].each_with_index do |at, n|
+      next if n == 0 && !starts_at?(os, rest, "iPhone ")
+      next if n == 1 && !starts_at?(os, rest, "iPod ")
+      next unless starts_at?(os, at, "OS ")
+      digits_at = at + 3
+      digits = run_of(os, digits_at) { |b| digit?(b) || b == '_'.ord }
+      return os[digits_at, digits] if digits > 0 && starts_at?(os, digits_at + digits, " like Mac OS X")
+    end
+  end
+  nil
+end
+
+# `/CrOS\s([^\s]+)\s(\d+(\.\d+)*)/`: the second capture.
+def chrome_os_version(os : String) : String?
+  size = os.bytesize
+  os.bytesize.times do |i|
+    next unless starts_at?(os, i, "CrOS")
+    at = i + 4
+    next unless at < size && space_byte?(byte_at(os, at))
+    word = run_of(os, at + 1) { |b| !space_byte?(b) }
+    next if word == 0
+    at = at + 1 + word
+    next unless at < size && space_byte?(byte_at(os, at))
+    start = at + 1
+    stop = start + run_of(os, start) { |b| digit?(b) }
+    next if stop == start
+    while stop + 1 < size && byte_at(os, stop) == '.'.ord && digit?(byte_at(os, stop + 1))
+      stop += 1 + run_of(os, stop + 1) { |b| digit?(b) }
+    end
+    return os[start, stop - start]
+  end
+  nil
+end
+
+# `/Windows NT [\d\.]+|Windows Phone (OS )?[\d\.]+/`: the matched text.
+def windows_os(s : String) : String?
+  s.bytesize.times do |i|
+    tail = if starts_at?(s, i, "Windows NT ")
+             i + 11
+           elsif starts_at?(s, i, "Windows Phone ")
+             after = i + 14
+             starts_at?(s, after, "OS ") && run_of(s, after + 3) { |b| version_byte?(b) } > 0 ? after + 3 : after
+           else
+             next
+           end
+    digits = run_of(s, tail) { |b| version_byte?(b) }
+    return s[i, tail + digits - i] if digits > 0
+  end
+  nil
+end
+
+# `joined_comment =~ /Trident.+rv:/`.
+def trident_rv?(s : String) : Bool
+  at = 0
+  while found = s.byte_index("Trident", at)
+    rest = s[found + 7, s.bytesize - found - 7]
+    line = rest.split('\n')[0]? || ""
+    rv = line.byte_index("rv:", 1)
+    return true if rv
+    at = found + 1
+  end
+  false
+end
+
+# `joined_comment[/(MSIE\s|rv:)([\d\.]+)/, 2]`.
+def ie_version(s : String) : String?
+  s.bytesize.times do |i|
+    tail = if starts_at?(s, i, "MSIE") && i + 4 < s.bytesize && space_byte?(byte_at(s, i + 4))
+             i + 5
+           elsif starts_at?(s, i, "rv:")
+             i + 3
+           else
+             next
+           end
+    digits = run_of(s, tail) { |b| version_byte?(b) }
+    return s[tail, digits] if digits > 0
+  end
+  nil
+end
+
+# The capture of `/<prefix>([class]+)/` at its leftmost match.
+def capture_after(s : String, prefix : String, & : UInt8 -> Bool) : String?
+  at = 0
+  while found = s.byte_index(prefix, at)
+    tail = found + prefix.bytesize
+    i = tail
+    while i < s.bytesize && yield byte_at(s, i)
+      i += 1
+    end
+    return s[tail, i - tail] if i > tail
+    at = found + 1
+  end
+  nil
+end
+
+# `WEBKIT_VERSION_REGEXP = /\A(?<webkit>AppleWebKit)\/(?<version>[\d\.]+)/i`:
+# the version.
+def webkit_comment_version(comment : String) : String?
+  # The first eleven characters, which can lowercase to "applewebkit"
+  # without being ASCII (U+212A KELVIN SIGN is a "k").
+  count = 0
+  name = String.build do |io|
+    comment.each_char do |c|
+      break if count == 11
+      io << c
+      count += 1
+    end
+  end
+  return nil if count < 11
+  return nil unless same_ignoring_case?(name, "applewebkit")
+  at = name.bytesize
+  return nil unless at < comment.bytesize && byte_at(comment, at) == '/'.ord
+  digits = run_of(comment, at + 1) { |b| version_byte?(b) }
+  digits > 0 ? comment[at + 1, digits] : nil
+end
+
+# `Webkit::BuildVersions`: Safari before 3 reported only the WebKit build.
+def webkit_build_version(build : String) : String?
+  case build
+  when "85.7"                             then "1.0"
+  when "85.8.5", "85.8.2"                 then "1.0.3"
+  when "124"                              then "1.2"
+  when "125.2"                            then "1.2.2"
+  when "125.4"                            then "1.2.3"
+  when "125.5.5", "125.5.6", "125.5.7"    then "1.2.4"
+  when "312.1.1", "312.1"                 then "1.3"
+  when "312.5", "312.5.1", "312.5.2"      then "1.3.1"
+  when "312.8", "312.8.1"                 then "1.3.2"
+  when "412", "412.6", "412.6.2"          then "2.0"
+  when "412.7"                            then "2.0.1"
+  when "416.11", "416.12"                 then "2.0.2"
+  when "417.9", "418"                     then "2.0.3"
+  when "418.8", "418.9", "418.9.1", "419" then "2.0.4"
+  when "425.13"                           then "2.2"
+  when "534.52.7"                         then "5.1.2"
+  else                                         nil
+  end
+end

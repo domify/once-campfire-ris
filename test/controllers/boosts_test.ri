@@ -1,0 +1,62 @@
+# `test/controllers/messages/boosts_controller_test.rb`, plus the index and
+# new pages.
+module test/controllers/boosts_test
+
+import std/text
+import test/models/testing::{id}
+import models/boost::{Boost}
+import models/message::{Message}
+import models/room::{Room}
+import channels/broadcasts::{room_gid_param}
+import test/testing::*
+import web/web/spec::*
+
+def first_message(client : Client) : Message
+  client.t.read { |conn| Message.find_by_id(conn, id("first")) } || raise "no first message"
+end
+
+def room_stream(client : Client, message : Message) : String
+  room = client.t.read { |conn| Room.find_by_id(conn, message.room_id) } || raise "no room"
+  "#{room_gid_param(room)}:messages"
+end
+
+def boost_count(client : Client, message : Message) : Int32
+  client.t.read { |conn| Boost.for_message(conn, message.id).size }
+end
+
+describe "messages/boosts" do
+  it "creates a boost, broadcasts it and goes back to the boosts" do
+    client = Client.new
+    message = first_message(client)
+    before = boost_count(client, message)
+    response = client.submit("POST", "/messages/#{message.id}/boosts.turbo_stream", "boost[content]=Morning!", client.cookie("david@37signals.com"))
+    assert response.status == 302
+    assert response["location"] == "http://once.campfire.test/messages/#{message.id}/boosts"
+    assert boost_count(client, message) == before + 1
+    sent = client.broadcasts.select { |stream, _| stream == room_stream(client, message) }
+    assert sent.size == 1
+    assert sent[0][1].includes?("Morning!")
+  end
+
+  it "destroys the user's boost and broadcasts its removal" do
+    client = Client.new
+    message = first_message(client)
+    before = boost_count(client, message)
+    response = client.submit("DELETE", "/messages/#{message.id}/boosts/#{id("first")}.turbo_stream", "", client.cookie("david@37signals.com"))
+    assert response.status == 204
+    assert boost_count(client, message) == before - 1
+    assert client.broadcasts.count { |stream, _| stream == room_stream(client, message) } == 1
+  end
+
+  it "shows the boosts and the boost form" do
+    client = Client.new
+    message = first_message(client)
+    cookie = client.cookie("david@37signals.com")
+    index = client.get("/messages/#{message.id}/boosts", cookie: cookie)
+    assert index.status == 200
+    assert body(index).includes?("boosting_message_#{message.client_message_id}")
+    form = client.get("/messages/#{message.id}/boosts/new", cookie: cookie)
+    assert form.status == 200
+    assert body(form).includes?("boost[content]")
+  end
+end

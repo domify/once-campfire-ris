@@ -1,0 +1,229 @@
+# Routes drawn as resources, the way `config/routes.rb` draws them:
+# `resources`, `resource`, `namespace`, `scope` and the odd `get`. The
+# mapper produces Rails' route table - the same verbs, patterns, endpoints,
+# defaults and order `bin/rails routes` prints - and binds each endpoint to
+# an action with `draw`.
+#
+#   routes = Mapper.draw do |r|
+#     r.resources "rooms" do |room|
+#       room.resources "messages"
+#       room.scope(module: "rooms") { |s| s.resource "refresh", only: ["show"] }
+#     end
+#   end
+module rils/kit/resources
+
+import std/text
+import rils/kit/router::{Router}
+
+# The seven actions `resources` declares, in Rails' order.
+pub RESOURCES_ACTIONS = ["index", "create", "new", "edit", "show", "update", "destroy"]
+# The six `resource` (singular) declares, in Rails' order.
+pub RESOURCE_ACTIONS = ["new", "edit", "show", "update", "destroy", "create"]
+
+# One row of the table.
+pub class Drawn
+  getter verb : String
+  getter pattern : String
+  getter endpoint : String
+  getter defaults : Array(Tuple(String, String))
+
+  def initialize(@verb : String, @pattern : String, @endpoint : String, @defaults : Array(Tuple(String, String)))
+  end
+
+  # The controller part of the endpoint: `rooms/opens` of `rooms/opens#show`.
+  pub def controller : String
+    @endpoint.split('#').first
+  end
+
+  pub def action : String
+    @endpoint.split('#').last
+  end
+end
+
+pub class Mapper
+  getter drawn : Array(Drawn)
+  # The current scope: path prefix, controller module, defaults.
+  @path : String
+  @module : String
+  @defaults : Array(Tuple(String, String))
+  # The resource whose block is running, for `collection` routes.
+  @controller : String?
+  @collection_path : String
+
+  def initialize
+    @drawn = [] of Drawn
+    @path = ""
+    @module = ""
+    @defaults = [] of Tuple(String, String)
+    @controller = nil
+    @collection_path = ""
+  end
+
+  pub def self.draw(& : Mapper -> Nil) : Mapper
+    mapper = Mapper.new
+    yield mapper
+    mapper
+  end
+
+  # `root "welcome#show"`: `/`, without a format.
+  pub def root(to : String) : Nil
+    add("GET", "/", qualified(to))
+  end
+
+  # `resources :rooms`: the collection and its members. The block's routes
+  # nest under `/rooms/:room_id`.
+  pub def resources(name : String, only : Array(String)? = nil, except : Array(String)? = nil, controller : String? = nil, & : Mapper -> Nil) : Nil
+    base = "#{@path}/#{name}"
+    ctrl = controller_path(controller || name)
+    nest("#{base}/:#{singularize(name)}_id", ctrl, base) { yield self }
+    actions(RESOURCES_ACTIONS, only, except).each do |action|
+      case action
+      when "index"   then add("GET", base, "#{ctrl}#index")
+      when "create"  then add("POST", base, "#{ctrl}#create")
+      when "new"     then add("GET", "#{base}/new", "#{ctrl}#new")
+      when "edit"    then add("GET", "#{base}/:id/edit", "#{ctrl}#edit")
+      when "show"    then add("GET", "#{base}/:id", "#{ctrl}#show")
+      when "update"
+        add("PATCH", "#{base}/:id", "#{ctrl}#update")
+        add("PUT", "#{base}/:id", "#{ctrl}#update")
+      when "destroy" then add("DELETE", "#{base}/:id", "#{ctrl}#destroy")
+      end
+    end
+  end
+
+  pub def resources(name : String, only : Array(String)? = nil, except : Array(String)? = nil, controller : String? = nil) : Nil
+    resources(name, only, except, controller) { }
+  end
+
+  # `resource :session`: one resource without an id, its controller plural.
+  pub def resource(name : String, only : Array(String)? = nil, except : Array(String)? = nil, controller : String? = nil, & : Mapper -> Nil) : Nil
+    base = "#{@path}/#{name}"
+    ctrl = controller_path(controller || pluralize(name))
+    nest(base, ctrl, base) { yield self }
+    actions(RESOURCE_ACTIONS, only, except).each do |action|
+      case action
+      when "new"     then add("GET", "#{base}/new", "#{ctrl}#new")
+      when "edit"    then add("GET", "#{base}/edit", "#{ctrl}#edit")
+      when "show"    then add("GET", base, "#{ctrl}#show")
+      when "update"
+        add("PATCH", base, "#{ctrl}#update")
+        add("PUT", base, "#{ctrl}#update")
+      when "destroy" then add("DELETE", base, "#{ctrl}#destroy")
+      when "create"  then add("POST", base, "#{ctrl}#create")
+      end
+    end
+  end
+
+  pub def resource(name : String, only : Array(String)? = nil, except : Array(String)? = nil, controller : String? = nil) : Nil
+    resource(name, only, except, controller) { }
+  end
+
+  # `namespace :rooms`: both the path and the controller module.
+  pub def namespace(name : String, & : Mapper -> Nil) : Nil
+    scope(module: name, path: name) { yield self }
+  end
+
+  # `scope module:, path:, defaults:`.
+  pub def scope(module mod : String? = nil, path : String? = nil, defaults : Array(Tuple(String, String))? = nil, & : Mapper -> Nil) : Nil
+    saved = {@path, @module, @defaults}
+    @path = "#{@path}/#{path}" if path
+    @module = mod ? controller_path(mod) : @module
+    @defaults = @defaults + defaults if defaults
+    yield self
+    @path, @module, @defaults = saved
+  end
+
+  # `collection do delete :clear end`: routes on the resource's collection
+  # path, to its controller.
+  pub def collection(& : Mapper -> Nil) : Nil
+    saved = @path
+    @path = @collection_path
+    yield self
+    @path = saved
+  end
+
+  pub def get(path : String, to : String? = nil) : Nil
+    verb("GET", path, to)
+  end
+
+  pub def post(path : String, to : String? = nil) : Nil
+    verb("POST", path, to)
+  end
+
+  pub def patch(path : String, to : String? = nil) : Nil
+    verb("PATCH", path, to)
+  end
+
+  pub def put(path : String, to : String? = nil) : Nil
+    verb("PUT", path, to)
+  end
+
+  pub def delete(path : String, to : String? = nil) : Nil
+    verb("DELETE", path, to)
+  end
+
+  # Each row into *router*, with the action *bind* gives its endpoint.
+  pub def draw_into(router : Router(A), & : Drawn -> A) : Nil forall A
+    @drawn.each do |row|
+      router.add(row.verb, row.pattern, yield(row), row.endpoint, row.defaults)
+    end
+  end
+
+  # A verb route without `to:` is an action of the current resource:
+  # `delete "clear"` inside `collection` is `searches#clear`.
+  def verb(method : String, path : String, to : String?) : Nil
+    endpoint = if to
+                 qualified(to)
+               elsif ctrl = @controller
+                 "#{ctrl}##{path.split('/').last}"
+               else
+                 raise "#{method} #{path}: no `to:` outside a resource"
+               end
+    add(method, "#{@path}/#{path}", endpoint)
+  end
+
+  def nest(path : String, ctrl : String, collection_path : String, & : -> Nil) : Nil
+    saved = {@path, @controller, @collection_path}
+    @path = path
+    @controller = ctrl
+    @collection_path = collection_path
+    yield
+    @path, @controller, @collection_path = saved
+  end
+
+  def add(method : String, pattern : String, endpoint : String) : Nil
+    pattern = "#{pattern}(.:format)" unless pattern == "/"
+    @drawn << Drawn.new(method, pattern, endpoint, @defaults)
+  end
+
+  def actions(all : Array(String), only : Array(String)?, except : Array(String)?) : Array(String)
+    list = only ? all.select { |a| only.includes?(a) } : all
+    except ? list.reject { |a| except.includes?(a) } : list
+  end
+
+  def controller_path(name : String) : String
+    @module.empty? ? name : "#{@module}/#{name}"
+  end
+
+  # `to: "rooms#show"` takes the module of the scope it is in.
+  def qualified(to : String) : String
+    controller_path(to)
+  end
+end
+
+# The inflections the route names need: `refresh` => `refreshes`,
+# `key` => `keys`, `custom_styles` stays.
+pub def pluralize(word : String) : String
+  return word if word.ends_with?("s")
+  return "#{word}es" if word.ends_with?("sh") || word.ends_with?("ch") || word.ends_with?("x")
+  return "#{word[0, word.bytesize - 1]}ies" if word.ends_with?("y") && !"aeiou".includes?(word[word.bytesize - 2, 1])
+  "#{word}s"
+end
+
+# `rooms` => `room` for the nested `:room_id`.
+pub def singularize(word : String) : String
+  return "#{word[0, word.bytesize - 3]}y" if word.ends_with?("ies")
+  return word[0, word.bytesize - 2] if word.ends_with?("ches") || word.ends_with?("shes") || word.ends_with?("xes")
+  return word[0, word.bytesize - 1] if word.ends_with?("s")
+  word
+end

@@ -1,0 +1,515 @@
+# `reference/app/models/user.rb` and `user/*.rb` (Role, Bot, Bannable,
+# Mentionable; Avatar and Transferable are signed ids, which live in
+# `rails_compat`). Memberships and messages sit above users, so
+# `user.memberships` is `Membership.for_user` and
+# `remove_banned_content` lives with messages.
+module models/user
+
+import std/text
+import std/unicode::{Unicode}
+import rils/rails_compat/password::{password_digest, password_matches?}
+import rils/record/sqlite::{Connection, Row, SqlValue, placeholders}
+import rils/record/timestamp::{Timestamp, SQLITE_NOW}
+import rils/record/database::{Tx}
+import rils/record/errors::{RecordNotFound, RecordInvalid}
+import rils/record/events::{DisconnectUser, RemoveBannedContent, DeliverWebhook}
+import rils/record/random::{alphanumeric, uuid}
+import models/ban::{Ban}
+import models/session::{Session}
+import models/webhook::{Webhook}
+
+# `enum :role, %i[ member administrator bot ]`
+pub enum Role
+  Member        = 0
+  Administrator = 1
+  Bot           = 2
+
+  def name : String
+    case self
+    when Role::Administrator then "administrator"
+    when Role::Bot           then "bot"
+    else                          "member"
+    end
+  end
+
+  def self.from_name(name : String) : Role?
+    case name
+    when "member"        then Role::Member
+    when "administrator" then Role::Administrator
+    when "bot"           then Role::Bot
+    else                      nil
+    end
+  end
+end
+
+# `enum :status, %i[ active deactivated banned ], default: :active`
+pub enum Status
+  Active      = 0
+  Deactivated = 1
+  Banned      = 2
+
+  def name : String
+    case self
+    when Status::Deactivated then "deactivated"
+    when Status::Banned      then "banned"
+    else                          "active"
+    end
+  end
+
+  def self.from_name(name : String) : Status?
+    case name
+    when "active"      then Status::Active
+    when "deactivated" then Status::Deactivated
+    when "banned"      then Status::Banned
+    else                    nil
+    end
+  end
+end
+
+pub USER_COLUMNS = %("users"."id", "users"."name", "users"."email_address", "users"."password_digest", "users"."role", "users"."status", "users"."bio", "users"."bot_token", "users"."created_at", "users"."updated_at")
+
+# `SELECT` and the columns `User.from_row` reads, `FROM "users"`: queries
+# built elsewhere start with it, since users are read by position.
+pub USER_SELECT = %(SELECT #{USER_COLUMNS} FROM "users")
+
+# `MENTION_CONTENT_TYPE`
+pub MENTION_CONTENT_TYPE = "application/vnd.campfire.mention"
+
+# A password hashed for `password_digest`. Hashing takes about 250 ms at
+# cost 12, so it's done before the write that saves it.
+pub struct PasswordDigest
+  getter digest : String
+
+  def initialize(@digest : String)
+  end
+
+  # `BCrypt::Password.create(password, cost:)`.
+  pub def self.create(password : String, cost : Int32) : PasswordDigest
+    PasswordDigest.new(password_digest(password, cost) || raise "bcrypt refused cost #{cost}")
+  end
+end
+
+# Attributes for `User.create!`.
+pub class NewUser
+  property name : String
+  property email_address : String?
+  # `has_secure_password`'s `password=`, already hashed.
+  property password_digest : PasswordDigest?
+  property role : Role
+  property bio : String?
+  property bot_token : String?
+
+  def initialize(@name : String, @email_address : String? = nil, @password_digest : PasswordDigest? = nil, @role : Role = Role::Member, @bio : String? = nil, @bot_token : String? = nil)
+  end
+end
+
+# Attributes for `user.update`. nil leaves an attribute alone; the
+# one-element tuples set a nullable attribute, `{nil}` clearing it.
+pub class UserChanges
+  property name : String?
+  property email_address : Tuple(String?)?
+  property password_digest : PasswordDigest?
+  property role : Role?
+  property status : Status?
+  property bio : Tuple(String?)?
+  property bot_token : Tuple(String?)?
+
+  def initialize(@name : String? = nil, @email_address : Tuple(String?)? = nil, @password_digest : PasswordDigest? = nil, @role : Role? = nil, @status : Status? = nil, @bio : Tuple(String?)? = nil, @bot_token : Tuple(String?)? = nil)
+  end
+end
+
+INSERT_USER = %(INSERT INTO "users" ("bio", "bot_token", "created_at", "email_address", "name", "password_digest", "role", "status", "updated_at") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING "id")
+
+DUMMY_DIGEST = "$2a$12$FiKmSp4UhLvSB4Sd/ZUjQunyKP6.NjDRHdr5LnKUVk.BUn4Mq12WS"
+
+# Rows per `INSERT` of memberships, well under SQLite's bound-variable
+# limit.
+pub MEMBERSHIP_INSERT_BATCH = 1000
+
+pub class User
+  getter id : Int64
+  getter name : String
+  getter email_address : String?
+  getter password_digest : String?
+  getter role : Role
+  getter status : Status
+  getter bio : String?
+  getter bot_token : String?
+  getter created_at : Timestamp
+  getter updated_at : Timestamp
+
+  def initialize(@id : Int64, @name : String, @email_address : String?, @password_digest : String?, @role : Role, @status : Status, @bio : String?, @bot_token : String?, @created_at : Timestamp, @updated_at : Timestamp)
+  end
+
+  pub def self.from_row(row : Row, offset : Int32 = 0) : User
+    User.new(row.int(offset), row.text(offset + 1), row.text?(offset + 2), row.text?(offset + 3), Role.from_value?(row.int32(offset + 4)) || raise("unknown role"), Status.from_value?(row.int32(offset + 5)) || raise("unknown status"), row.text?(offset + 6), row.text?(offset + 7), row.time(offset + 8), row.time(offset + 9))
+  end
+
+  # `User.find_by_sql`: the users a query starting with `USER_SELECT`
+  # returns.
+  pub def self.find_by_sql(conn : Connection, sql : String, args : Array(SqlValue)) : Array(User)
+    conn.query_all(sql, args) { |row| User.from_row(row) }
+  end
+
+  def self.one(conn : Connection, where : String, args : Array(SqlValue)) : User?
+    conn.query_one(%(#{USER_SELECT} WHERE #{where} LIMIT 1), args) { |row| User.from_row(row) }
+  end
+
+  def self.many(conn : Connection, where : String, args : Array(SqlValue) = [] of SqlValue) : Array(User)
+    conn.query_all(%(#{USER_SELECT} #{where}), args) { |row| User.from_row(row) }
+  end
+
+  pub def self.find(conn : Connection, id : Int64) : User | RecordNotFound
+    find_by_id(conn, id) || RecordNotFound.new("User")
+  end
+
+  pub def self.find_by_id(conn : Connection, id : Int64) : User?
+    one(conn, %("users"."id" = ?), [id] of SqlValue)
+  end
+
+  # `User.active.find(id)`
+  pub def self.find_active(conn : Connection, id : Int64) : User | RecordNotFound
+    one(conn, %("users"."status" = 0 AND "users"."id" = ?), [id] of SqlValue) || RecordNotFound.new("User")
+  end
+
+  pub def self.find_by_email_address(conn : Connection, email_address : String) : User?
+    one(conn, %("users"."email_address" = ?), [email_address] of SqlValue)
+  end
+
+  pub def self.all(conn : Connection) : Array(User)
+    many(conn, "")
+  end
+
+  pub def self.count(conn : Connection) : Int64
+    conn.count(%(SELECT COUNT(*) FROM "users"))
+  end
+
+  # `User.where(id: ids)`
+  pub def self.where_ids(conn : Connection, ids : Array(Int64)) : Array(User)
+    return [] of User if ids.empty?
+    args = [] of SqlValue
+    ids.each { |id| args << id }
+    many(conn, %(WHERE "users"."id" IN (#{placeholders(ids.size)})), args)
+  end
+
+  # `User.active.ordered`
+  pub def self.active_ordered(conn : Connection) : Array(User)
+    many(conn, %(WHERE "users"."status" = 0 ORDER BY LOWER(name)))
+  end
+
+  # `User.active`
+  pub def self.active(conn : Connection) : Array(User)
+    many(conn, %(WHERE "users"."status" = 0))
+  end
+
+  # `User.active.filtered_by(query).ordered`
+  pub def self.active_filtered_by_ordered(conn : Connection, query : String) : Array(User)
+    many(conn, %(WHERE "users"."status" = 0 AND (name like ?) ORDER BY LOWER(name)), ["%#{query}%"] of SqlValue)
+  end
+
+  # `User.active.ordered.without_bots`
+  pub def self.active_ordered_without_bots(conn : Connection) : Array(User)
+    many(conn, %(WHERE "users"."status" = 0 AND "users"."role" != 2 ORDER BY LOWER(name)))
+  end
+
+  # `User.active_bots.ordered`
+  pub def self.active_bots_ordered(conn : Connection) : Array(User)
+    many(conn, %(WHERE "users"."status" = 0 AND "users"."role" = 2 ORDER BY LOWER(name)))
+  end
+
+  # `User.active_bots.find(id)`
+  pub def self.find_active_bot(conn : Connection, id : Int64) : User | RecordNotFound
+    one(conn, %("users"."status" = 0 AND "users"."role" = 2 AND "users"."id" = ?), [id] of SqlValue) || RecordNotFound.new("User")
+  end
+
+  # `User.active.find_by(email_address:)`: the lookup half of
+  # `authenticate_by`.
+  pub def self.find_active_by_email_address(conn : Connection, email_address : String) : User?
+    one(conn, %("users"."status" = 0 AND "users"."email_address" = ?), [email_address] of SqlValue)
+  end
+
+  # The password half of
+  # `User.active.authenticate_by(email_address:, password:)`, given what
+  # `find_active_by_email_address` found. A blank password returns nil
+  # before the lookup in Rails; callers skip the lookup for one too.
+  pub def self.authenticated(candidate : User?, password : String) : User?
+    return nil if password.empty?
+    if candidate
+      candidate.authenticate?(password) ? candidate : nil
+    else
+      # authenticate_by hashes anyway so a missing account takes as long as
+      # a wrong password.
+      password_matches?(password, DUMMY_DIGEST)
+      nil
+    end
+  end
+
+  # `User.authenticate_bot(bot_key)`: `"#{id}-#{bot_token}"`
+  pub def self.authenticate_bot(conn : Connection, bot_key : String) : User?
+    # Ruby's `split("-")` drops trailing empty fields; a key without a token
+    # finds nothing.
+    parts = bot_key.split('-')
+    return nil if parts.size < 2 || parts[1].empty?
+    one(conn, %("users"."status" = 0 AND "users"."role" = 2 AND "users"."id" = ? AND "users"."bot_token" = ?), [parts[0], parts[1]] of SqlValue)
+  end
+
+  # `User.create!`: inserts, then grants memberships to every open room
+  # after commit.
+  pub def self.create(tx : Tx, attributes : NewUser) : User
+    now = tx.now
+    digest = attributes.password_digest
+    id = tx.conn.query_one(INSERT_USER, [attributes.bio, attributes.bot_token, now, attributes.email_address, attributes.name, digest ? digest.digest : nil, attributes.role.value.to_i64, Status::Active.value.to_i64, now] of SqlValue) { |row| row.int(0) }
+    raise "insert into users returned no id" unless id
+    tx.after_commit { |after| grant_membership_to_open_rooms(after, id) }
+    User.new(id, attributes.name, attributes.email_address, digest ? digest.digest : nil, attributes.role, Status::Active, attributes.bio, attributes.bot_token, now, now)
+  end
+
+  # `User.create_bot!`
+  pub def self.create_bot(tx : Tx, name : String, webhook_url : String?) : User
+    user = create(tx, NewUser.new(name, bot_token: generate_bot_token, role: Role::Bot))
+    Webhook.create(tx, user.id, webhook_url) if webhook_url
+    user
+  end
+
+  # `user.update(attributes)`: writes only what changed, and nothing at all
+  # (not even `updated_at`) when nothing did.
+  pub def update(tx : Tx, changes : UserChanges) : Nil
+    columns = [] of String
+    values = [] of SqlValue
+    if (name = changes.name) && name != @name
+      @name = name
+      columns << "name"
+      values << name
+    end
+    if (email = changes.email_address) && email[0] != @email_address
+      @email_address = email[0]
+      columns << "email_address"
+      values << email[0]
+    end
+    if digest = changes.password_digest
+      @password_digest = digest.digest
+      columns << "password_digest"
+      values << digest.digest
+    end
+    if (role = changes.role) && role != @role
+      @role = role
+      columns << "role"
+      values << role.value.to_i64
+    end
+    if (status = changes.status) && status != @status
+      @status = status
+      columns << "status"
+      values << status.value.to_i64
+    end
+    if (bio = changes.bio) && bio[0] != @bio
+      @bio = bio[0]
+      columns << "bio"
+      values << bio[0]
+    end
+    if (token = changes.bot_token) && token[0] != @bot_token
+      @bot_token = token[0]
+      columns << "bot_token"
+      values << token[0]
+    end
+    return if columns.empty?
+    @updated_at = tx.now
+    columns << "updated_at"
+    values << @updated_at
+    values << @id
+    assignments = columns.map { |column| %("#{column}" = ?) }.join(", ")
+    tx.conn.execute(%(UPDATE "users" SET #{assignments} WHERE "users"."id" = ?), values)
+  end
+
+  # `update_bot!`: the webhook first, then the user, in one transaction.
+  pub def update_bot(tx : Tx, changes : UserChanges, webhook_url : String?) : Nil
+    webhook = Webhook.find_by_user(tx.conn, @id)
+    url = webhook_url && !webhook_url.blank? ? webhook_url : nil
+    if url && webhook
+      webhook.update_url(tx, url)
+    elsif url
+      Webhook.create(tx, @id, url)
+    elsif webhook
+      webhook.destroy(tx)
+    end
+    update(tx, changes)
+  end
+
+  pub def reset_bot_key(tx : Tx) : Nil
+    update(tx, UserChanges.new(bot_token: {generate_bot_token.as(String?)}))
+  end
+
+  # `deactivate`: disconnects sockets first (mid-transaction, as Rails
+  # does), then removes non-direct memberships, push subscriptions, searches
+  # and sessions, and scrambles the email address.
+  pub def deactivate(tx : Tx) : Nil
+    close_remote_connections(tx, false)
+    tx.conn.execute(%(DELETE FROM "memberships" WHERE ("memberships"."id") IN (SELECT "memberships"."id" FROM "memberships" INNER JOIN "rooms" AS "room" ON "room"."id" = "memberships"."room_id" WHERE "memberships"."user_id" = ? AND "room"."type" != ?)), [@id, "Rooms::Direct"] of SqlValue)
+    tx.conn.execute(%(DELETE FROM "push_subscriptions" WHERE "push_subscriptions"."user_id" = ?), [@id] of SqlValue)
+    tx.conn.execute(%(DELETE FROM "searches" WHERE "searches"."user_id" = ?), [@id] of SqlValue)
+    tx.conn.execute(%(DELETE FROM "sessions" WHERE "sessions"."user_id" = ?), [@id] of SqlValue)
+    update(tx, UserChanges.new(status: Status::Deactivated, email_address: {deactivated_email_address}))
+  end
+
+  def deactivated_email_address : String?
+    email = @email_address
+    email ? email.gsub("@", "-deactivated-#{uuid}@") : nil
+  end
+
+  # `User::Bannable#ban`
+  pub def ban(tx : Tx) : RecordInvalid?
+    # create_bans_from_sessions: `sessions.pluck(:ip_address).compact_blank.uniq`
+    ips = tx.conn.query_all(%(SELECT "sessions"."ip_address" FROM "sessions" WHERE "sessions"."user_id" = ?), [@id] of SqlValue) { |row| row.text?(0) }
+    seen = [] of String
+    ips.each do |ip|
+      next if ip.nil? || ip.blank? || seen.includes?(ip)
+      created = Ban.create(tx, @id, ip)
+      if created.is_a?(RecordInvalid)
+        tx.roll_back
+        return created
+      end
+      seen << ip
+    end
+    # apply_ban
+    close_remote_connections(tx, false)
+    tx.conn.execute(%(DELETE FROM "sessions" WHERE "sessions"."user_id" = ?), [@id] of SqlValue)
+    tx.emit_after_commit(RemoveBannedContent.new(@id))
+    update(tx, UserChanges.new(status: Status::Banned))
+    nil
+  end
+
+  pub def unban(tx : Tx) : Nil
+    tx.conn.execute(%(DELETE FROM "bans" WHERE "bans"."user_id" = ?), [@id] of SqlValue)
+    update(tx, UserChanges.new(status: Status::Active))
+  end
+
+  # `reset_remote_connections`: disconnect this user's sockets and let them
+  # reconnect.
+  pub def reset_remote_connections(tx : Tx) : Nil
+    close_remote_connections(tx, true)
+  end
+
+  # After commit: a connection authenticating meanwhile then either finds
+  # the sessions gone or is already listening for this.
+  def close_remote_connections(tx : Tx, reconnect : Bool) : Nil
+    tx.emit_after_commit(DisconnectUser.new(@id, reconnect))
+  end
+
+  # `deliver_webhook_later(message)`: only bots with a webhook.
+  pub def deliver_webhook_later(tx : Tx, message_id : Int64) : Nil
+    tx.emit_after_commit(DeliverWebhook.new(@id, message_id)) if Webhook.find_by_user(tx.conn, @id)
+  end
+
+  pub def sessions(conn : Connection) : Array(Session)
+    Session.for_user(conn, @id)
+  end
+
+  pub def webhook(conn : Connection) : Webhook?
+    Webhook.find_by_user(conn, @id)
+  end
+
+  pub def webhook_url(conn : Connection) : String?
+    hook = webhook(conn)
+    hook ? hook.url : nil
+  end
+
+  # `name.scan(/\b\w/).join`. Ruby's `\w` is ASCII-only, but `\b` treats any
+  # Unicode letter or digit as a word character, so "Émile" contributes
+  # nothing.
+  pub def initials : String
+    String.build do |io|
+      previous = nil.as(Char?)
+      @name.each_char do |c|
+        ascii_word = c.ascii_alphanumeric? || c == '_'
+        boundary = previous.nil? || !(Unicode.letter?(previous) || Unicode.number?(previous) || previous == '_')
+        io << c if ascii_word && boundary
+        previous = c
+      end
+    end
+  end
+
+  # `[ name, bio ].compact_blank.join(" – ")`
+  pub def title : String
+    parts = [@name]
+    bio = @bio
+    parts << bio if bio
+    parts.reject(&.blank?).join(" – ")
+  end
+
+  pub def bot_key : String
+    "#{@id}-#{@bot_token || ""}"
+  end
+
+  # `can_administer?(record)`: administrators, the record's creator, or a new
+  # record.
+  pub def can_administer?(record_creator_id : Int64?, record_is_new : Bool = false) : Bool
+    administrator? || record_creator_id == @id || record_is_new
+  end
+
+  # `has_secure_password`'s `authenticate`.
+  pub def authenticate?(password : String) : Bool
+    digest = @password_digest
+    return false if digest.nil? || digest.empty?
+    password_matches?(password, digest)
+  end
+
+  pub def member? : Bool
+    @role.member?
+  end
+
+  pub def administrator? : Bool
+    @role.administrator?
+  end
+
+  pub def bot? : Bool
+    @role.bot?
+  end
+
+  pub def active? : Bool
+    @status.active?
+  end
+
+  pub def deactivated? : Bool
+    @status.deactivated?
+  end
+
+  pub def banned? : Bool
+    @status.banned?
+  end
+
+  # `attachable_plain_text_representation`
+  pub def attachable_plain_text_representation : String
+    "@#{@name}"
+  end
+end
+
+# `User.generate_bot_token`
+pub def generate_bot_token : String
+  alphanumeric(12)
+end
+
+# `after_create_commit :grant_membership_to_open_rooms`
+def grant_membership_to_open_rooms(tx : Tx, user_id : Int64) : Nil
+  room_ids = tx.conn.query_all(%(SELECT "rooms"."id" FROM "rooms" WHERE "rooms"."type" = ?), ["Rooms::Open"] of SqlValue) { |row| row.int(0) }
+  each_slice(room_ids, MEMBERSHIP_INSERT_BATCH) do |batch|
+    rows = batch.map { |_| "(#{SQLITE_NOW}, ?, #{SQLITE_NOW}, ?)" }.join(", ")
+    values = [] of SqlValue
+    batch.each do |room_id|
+      values << room_id
+      values << user_id
+    end
+    tx.conn.query_all(%(INSERT INTO "memberships" ("created_at","room_id","updated_at","user_id") VALUES #{rows} ON CONFLICT  DO NOTHING RETURNING "id"), values) { |row| row.int(0) }
+  end
+end
+
+# Calls the block with consecutive slices of at most *size* items.
+pub def each_slice(items : Array(Int64), size : Int32, & : Array(Int64) -> Nil) : Nil
+  index = 0
+  while index < items.size
+    slice = [] of Int64
+    while slice.size < size && index < items.size
+      slice << items[index]
+      index += 1
+    end
+    yield slice
+  end
+end

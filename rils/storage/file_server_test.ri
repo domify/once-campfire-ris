@@ -1,0 +1,34 @@
+# `Rack::Files#serving` as `DiskController#show` reaches it (rack 3.2).
+module rils/storage/file_server_test
+
+import std/file
+import rils/storage/file_server::*
+import web/web/spec::*
+
+describe "serve_file" do
+  it "serves whole files, ranges and 416s" do
+    path = File.tempfile("served")
+    File.write(path, "0123456789")
+    whole = serve_file("GET", nil, nil, path, "image/png", "inline")
+    assert whole.status == 200
+    assert whole.headers.map(&.[0]) == ["last-modified", "content-type", "content-length", "content-disposition"]
+    assert whole.headers[1][1] == "image/png" && whole.headers[2][1] == "10"
+
+    part = serve_file("GET", "bytes=2-4", nil, path, nil, nil)
+    assert part.status == 206
+    assert part.headers.includes?({"content-range", "bytes 2-4/10"})
+    assert part.headers.includes?({"content-type", "application/octet-stream"})
+
+    many = serve_file("GET", "bytes=0-0,5-6", nil, path, nil, nil)
+    assert many.status == 206 && many.body.size == 5
+
+    unsatisfiable = serve_file("GET", "bytes=20-30", nil, path, nil, nil)
+    assert unsatisfiable.status == 416
+    assert unsatisfiable.headers.none? { |h| h[0] == "x-cascade" }
+
+    fresh = serve_file("GET", nil, whole.headers[0][1], path, nil, nil)
+    assert fresh.status == 304
+    assert serve_file("HEAD", nil, nil, path, nil, nil).body.empty?
+    File.delete(path)
+  end
+end

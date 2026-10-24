@@ -1,0 +1,98 @@
+# `reference/app/models/sound.rb`
+module models/sound
+
+pub struct SoundImage
+  # `"sounds/#{name}"`
+  getter name : String
+  getter width : Int32
+  getter height : Int32
+
+  def initialize(@name : String, @width : Int32, @height : Int32)
+  end
+
+  pub def asset_path : String
+    "sounds/#{@name}"
+  end
+end
+
+pub struct Sound
+  getter name : String
+  getter text : String?
+  getter image : SoundImage?
+
+  def initialize(@name : String, @text : String?, @image : SoundImage?)
+  end
+
+  # `"#{name}.mp3"`
+  pub def asset_path : String
+    "#{@name}.mp3"
+  end
+
+  pub def self.find_by_name(name : String) : Sound?
+    BUILTIN_SOUNDS.find { |sound| sound.name == name }
+  end
+
+  # `Sound.names`: sorted.
+  pub def self.names : Array(String)
+    BUILTIN_SOUNDS.map(&.name).sorted
+  end
+end
+
+pub BUILTIN_SOUNDS = [
+  Sound.new("56k", nil, SoundImage.new("56k.webp", 79, 33)),
+  Sound.new("bell", "🔔", nil),
+  Sound.new("bezos", "😆💭", nil),
+  Sound.new("bueller", "anyone?", nil),
+  Sound.new("butts", "👐 🚬", nil),
+  Sound.new("clowntown", nil, SoundImage.new("clowntown.webp", 210, 150)),
+  Sound.new("cottoneyejoe", "🎶🙉🎶 ", nil),
+  Sound.new("crickets", "hears crickets chirping", nil),
+  Sound.new("curb", nil, SoundImage.new("curb.webp", 150, 101)),
+  Sound.new("dadgummit", "dad gummit!! 🎣", nil),
+  Sound.new("dangerzone", nil, SoundImage.new("dangerzone.webp", 157, 32)),
+  Sound.new("danielsan", "🎆 🏆 🎆", nil),
+  Sound.new("deeper", nil, SoundImage.new("top.webp", 188, 80)),
+  Sound.new("ballmer", "developers!", nil),
+  Sound.new("donotwant", nil, SoundImage.new("donotwant.webp", 150, 150)),
+  Sound.new("drama", nil, SoundImage.new("drama.webp", 300, 16)),
+  Sound.new("flawless", "#flawless", nil),
+  Sound.new("glados", "🤖💢", nil),
+  Sound.new("gogogo", "Go, go, go!", nil),
+  Sound.new("greatjob", nil, SoundImage.new("greatjob.webp", 79, 16)),
+  Sound.new("greyjoy", "😖🎺", nil),
+  Sound.new("guarantee", "guarantees it 👌", nil),
+  Sound.new("heygirl", "✨💁✨", nil),
+  Sound.new("honk", "HONK", nil),
+  Sound.new("horn", "🐶 ✂️ 🐱", nil),
+  Sound.new("horror", "💀 💀 💀 💀 💀 💀 💀", nil),
+  Sound.new("inconceivable", "doesn't think it means what you think it means…", nil),
+  Sound.new("letitgo", "❄️👩❄️⛄️❄️", nil),
+  Sound.new("live", "is DOING IT LIVE", nil),
+  Sound.new("loggins", nil, SoundImage.new("loggins.webp", 200, 151)),
+  Sound.new("makeitso", "make it so 👉", nil),
+  Sound.new("noooo", "👸💀😒", nil),
+  Sound.new("nyan", nil, SoundImage.new("nyan.webp", 36, 15)),
+  Sound.new("ohmy", "raises an eyebrow 😏", nil),
+  Sound.new("ohyeah", "isn't playing by the rules", nil),
+  Sound.new("pushit", nil, SoundImage.new("pushit.webp", 104, 15)),
+  Sound.new("rimshot", "plays a rimshot", nil),
+  Sound.new("rollout", "is rolling out 🚗", nil),
+  Sound.new("rumble", nil, SoundImage.new("rumble.webp", 220, 150)),
+  Sound.new("sax", "🌇🎷🎶", nil),
+  Sound.new("secret", "found a secret area 🔑", nil),
+  Sound.new("sexyback", "🔞", nil),
+  Sound.new("story", "and now you know…", nil),
+  Sound.new("tada", "plays a fanfare 🎏", nil),
+  Sound.new("tmyk", "✨ ⭐️ The More You Know ✨ ⭐️", nil),
+  Sound.new("totes", "😁👍", nil),
+  Sound.new("trololo", "трололо", nil),
+  Sound.new("trombone", "plays a sad trombone", nil),
+  Sound.new("unix", "knows this 💻", nil),
+  Sound.new("vuvuzela", "======<() ~ ♪ ~♫", nil),
+  Sound.new("what", nil, SoundImage.new("what.webp", 100, 131)),
+  Sound.new("whoomp", "👏‼️😎", nil),
+  Sound.new("wups", "wups!", nil),
+  Sound.new("yay", nil, SoundImage.new("yay.webp", 103, 50)),
+  Sound.new("yeah", nil, SoundImage.new("yeah.webp", 104, 15)),
+  Sound.new("yodel", "📣🗻🙉", nil),
+]

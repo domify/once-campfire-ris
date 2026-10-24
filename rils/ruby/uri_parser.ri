@@ -1,0 +1,371 @@
+# The slice of Ruby's `URI.parse` (uri 1.1, RFC 3986 parser) the opengraph
+# URL checks and the tweet URL rewrite rely on, including which inputs raise
+# which error. From the Rust port's `richtext/src/uri.rs`.
+module rils/ruby/uri_parser
+
+import std/text
+import std/int
+import rils/ruby/ipaddr::{parse_ipaddr}
+
+# What `URI.parse` raised: `URI::InvalidURIError`, which callers rescue, or
+# `URI::InvalidComponentError` (from `URI::MailTo`), which nothing does.
+pub class UriError
+  getter component : Bool
+
+  def initialize(@component : Bool = false)
+  end
+end
+
+pub class Uri
+  property scheme : String?
+  property userinfo : String?
+  property host : String?
+  property port : Int64?
+  property path : String?
+  property opaque : String?
+  property query : String?
+  property fragment : String?
+
+  def initialize(@scheme : String? = nil, @userinfo : String? = nil, @host : String? = nil, @port : Int64? = nil, @path : String? = nil,
+                 @opaque : String? = nil, @query : String? = nil, @fragment : String? = nil)
+  end
+
+  # `uri.is_a?(URI::HTTP)`, which includes `URI::HTTPS`.
+  pub def http? : Bool
+    scheme = @scheme
+    !scheme.nil? && (scheme.downcase == "http" || scheme.downcase == "https")
+  end
+
+  pub def https? : Bool
+    (@scheme || "").downcase == "https"
+  end
+
+  def default_port : Int64?
+    case (@scheme || "").upcase
+    when "HTTP", "WS"   then 80_i64
+    when "HTTPS", "WSS" then 443_i64
+    when "FTP"          then 21_i64
+    when "LDAP"         then 389_i64
+    when "LDAPS"        then 636_i64
+    else                     nil
+    end
+  end
+
+  # `URI::Generic#to_s`.
+  pub def to_s : String
+    String.build do |io|
+      if scheme = @scheme
+        io << scheme << ':'
+      end
+      if opaque = @opaque
+        io << opaque
+      else
+        io << "//" if @host || @scheme == "file" || @scheme == "postgres"
+        if userinfo = @userinfo
+          io << userinfo << '@'
+        end
+        if host = @host
+          io << host
+        end
+        if (port = @port) && port != default_port
+          io << ':' << port
+        end
+        io << (@path || "")
+        if query = @query
+          io << '?' << query
+        end
+      end
+      if fragment = @fragment
+        io << '#' << fragment
+      end
+    end
+  end
+
+  # `request_uri`: the path (or "/") and the query.
+  pub def request_uri : String
+    path = @path || ""
+    path = "/" if path.empty?
+    (query = @query) ? "#{path}?#{query}" : path
+  end
+end
+
+def bytes_of(text : String) : Array(UInt8)
+  bytes = [] of UInt8
+  text.each_byte { |byte| bytes << byte }
+  bytes
+end
+
+def slice(text : Array(UInt8), from : Int32, to : Int32) : String
+  String.build(to - from) { |io| (from...to).each { |i| io.write_byte(text[i]) } }
+end
+
+def hex?(b : UInt8) : Bool
+  (b >= 48 && b <= 57) || (b >= 65 && b <= 70) || (b >= 97 && b <= 102)
+end
+
+def alpha?(b : UInt8) : Bool
+  (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+end
+
+def digit?(b : UInt8) : Bool
+  b >= 48 && b <= 57
+end
+
+# `URI.parse(value)`.
+pub def parse_uri(value : String) : Uri | UriError
+  bytes = bytes_of(value)
+  return UriError.new if bytes.any? { |b| b >= 128 }
+  uri = split_absolute(bytes) || split_relative(bytes) || return UriError.new
+  # `URI::Generic#initialize` assigns the query through `query=`, which
+  # rejects bad escapes.
+  if query = uri.query
+    escaped = escape_query(bytes_of(query)) || return UriError.new
+    uri.query = escaped
+  end
+  uri.port ||= uri.default_port
+  failed = check_scheme_class(uri)
+  failed ? failed : uri
+end
+
+# The initializers of the scheme classes `URI.for` picks that can raise.
+def check_scheme_class(uri : Uri) : UriError?
+  case (uri.scheme || "").upcase
+  when "MAILTO"
+    opaque = uri.opaque || ((query = uri.query) ? "?#{query}" : nil)
+    return UriError.new(true) unless opaque
+    to = opaque.partition('?')[0]
+    mailto_to_valid?(bytes_of(to)) ? nil : UriError.new(true)
+  when "LDAP", "LDAPS"
+    uri.fragment || uri.path.nil? ? UriError.new : nil
+  when "FTP"
+    uri.path.nil? ? UriError.new : nil
+  else
+    nil
+  end
+end
+
+# `/\A(?:[^@,;]+@[^@,;]+(?:\z|[,;]))*\z/`
+def mailto_to_valid?(bytes : Array(UInt8)) : Bool
+  special = ->(b : UInt8) { b == '@'.ord || b == ','.ord || b == ';'.ord }
+  i = 0
+  while i < bytes.size
+    start = i
+    while i < bytes.size && !special.call(bytes[i])
+      i += 1
+    end
+    return false if i == start || i >= bytes.size || bytes[i] != '@'.ord
+    i += 1
+    domain = i
+    while i < bytes.size && !special.call(bytes[i])
+      i += 1
+    end
+    return false if i == domain
+    if i < bytes.size
+      return false if bytes[i] == '@'.ord
+      i += 1
+    end
+  end
+  true
+end
+
+HEX_DIGITS = "0123456789ABCDEF"
+
+# `URI::Generic#query=`: rejects `%` followed by two non-hex characters and
+# escapes the rest.
+def escape_query(query : Array(UInt8)) : String?
+  cleaned = query.reject { |b| b == 9 || b == 13 || b == 10 }
+  (0...cleaned.size - 2).each do |i|
+    return nil if cleaned[i] == '%'.ord && !hex?(cleaned[i + 1]) && !hex?(cleaned[i + 2])
+  end
+  String.build do |io|
+    cleaned.each_with_index do |b, i|
+      escape = i + 2 < cleaned.size && b == '%'.ord && hex?(cleaned[i + 1]) && hex?(cleaned[i + 2])
+      if escape || b == '!'.ord || (b >= '$'.ord && b <= '&'.ord) || (b >= '('.ord && b <= ';'.ord) || b == '='.ord || (b >= '?'.ord && b <= '_'.ord) || (b >= 'a'.ord && b <= '~'.ord)
+        io.write_byte(b)
+      else
+        io << '%' << HEX_DIGITS[(b >> 4).to_i32] << HEX_DIGITS[(b & 15).to_i32]
+      end
+    end
+  end
+end
+
+# `[!$&-.0-9;=A-Z_a-z~]`: `&-.` covers & ' ( ) * + , - .
+def unreserved_or_sub?(b : UInt8) : Bool
+  b == '!'.ord || b == '$'.ord || (b >= '&'.ord && b <= '.'.ord) || digit?(b) || b == ';'.ord || b == '='.ord || alpha?(b) || b == '_'.ord || b == '~'.ord
+end
+
+def pct_at?(s : Array(UInt8), i : Int32) : Bool
+  i + 2 < s.size && s[i] == '%'.ord && hex?(s[i + 1]) && hex?(s[i + 2])
+end
+
+enum CharClass
+  Seg
+  SegNc
+  Fragment
+  Userinfo
+  Host
+
+  def includes?(b : UInt8) : Bool
+    return true if unreserved_or_sub?(b)
+    case self
+    when CharClass::Seg      then b == ':'.ord || b == '@'.ord || b == '/'.ord
+    when CharClass::SegNc    then b == '@'.ord
+    when CharClass::Fragment then b == ':'.ord || b == '@'.ord || b == '/'.ord || b == '?'.ord
+    when CharClass::Userinfo then b == ':'.ord
+    else                          false
+    end
+  end
+end
+
+# Consumes `(?:%\h\h|[class])*` possessively; returns the end index.
+def take_while_class(s : Array(UInt8), start : Int32, char_class : CharClass) : Int32
+  i = start
+  loop do
+    if pct_at?(s, i)
+      i += 3
+    elsif i < s.size && char_class.includes?(s[i])
+      i += 1
+    else
+      return i
+    end
+  end
+end
+
+# The IP-literal alternative of HOST (a bracketed address); its end.
+def ip_literal_end(s : Array(UInt8), i : Int32) : Int32?
+  return nil unless i < s.size && s[i] == '['.ord
+  close = nil.as(Int32?)
+  (i...s.size).each do |j|
+    if s[j] == ']'.ord
+      close = j
+      break
+    end
+  end
+  close = close || return nil
+  inner = slice(s, i + 1, close)
+  valid = if inner.starts_with?("v") || inner.starts_with?("V")
+            hex, dot, rest = inner[1, inner.bytesize - 1].partition('.')
+            !dot.empty? && !hex.empty? && bytes_of(hex).all? { |b| hex?(b) } && !rest.empty? && bytes_of(rest).all? { |b| unreserved_or_sub?(b) || b == ':'.ord }
+          else
+            ip = parse_ipaddr(inner)
+            !ip.nil? && ip.v6 && !inner.includes?("%") && !inner.includes?("/")
+          end
+  valid ? close + 1 : nil
+end
+
+def split_absolute(s : Array(UInt8)) : Uri?
+  return nil if s.empty? || !alpha?(s[0])
+  i = 1
+  while i < s.size && (alpha?(s[i]) || digit?(s[i]) || s[i] == '+'.ord || s[i] == '-'.ord || s[i] == '.'.ord)
+    i += 1
+  end
+  return nil unless i < s.size && s[i] == ':'.ord
+  # `URI::Generic#set_scheme` downcases it.
+  uri = Uri.new(scheme: slice(s, 0, i).downcase)
+  rest = i + 1
+  tail = query_fragment(s, rest) || return nil
+  hier_end, query, fragment = tail
+  uri.query = query ? slice(s, query[0], query[1]) : nil
+  uri.fragment = fragment ? slice(s, fragment[0], fragment[1]) : nil
+  if hier_end - rest >= 2 && s[rest] == '/'.ord && s[rest + 1] == '/'.ord
+    authority = parse_authority(s, rest + 2, hier_end) || return nil
+    userinfo, host, port, ends = authority
+    uri.userinfo = userinfo
+    uri.host = host
+    uri.port = port
+    uri.path = slice(s, ends, hier_end)
+    # path-abempty: (?:/seg*)?
+    return nil if ends < hier_end && (s[ends] != '/'.ord || take_while_class(s, ends, CharClass::Seg) != hier_end)
+  elsif hier_end > rest && s[rest] == '/'.ord
+    return nil unless take_while_class(s, rest, CharClass::Seg) == hier_end
+    uri.path = slice(s, rest, hier_end)
+  elsif hier_end > rest
+    # path-rootless becomes the opaque part, the query folded back in.
+    return nil unless take_while_class(s, rest, CharClass::Seg) == hier_end
+    opaque = slice(s, rest, hier_end)
+    if q = uri.query
+      opaque += "?#{q}"
+      uri.query = nil
+    end
+    uri.opaque = opaque
+  else
+    uri.path = ""
+  end
+  uri
+end
+
+# Splits `(?:\?(?<query>[^#]*+))?(?:\#(?<fragment>FRAGMENT))?\z` off the
+# end of the hier-part: its end, and the query's and fragment's spans.
+def query_fragment(s : Array(UInt8), start : Int32) : Tuple(Int32, Tuple(Int32, Int32)?, Tuple(Int32, Int32)?)?
+  hier_end = s.size
+  (start...s.size).each do |i|
+    if s[i] == '?'.ord || s[i] == '#'.ord
+      hier_end = i
+      break
+    end
+  end
+  i = hier_end
+  query = nil.as(Tuple(Int32, Int32)?)
+  if i < s.size && s[i] == '?'.ord
+    q_end = s.size
+    (i + 1...s.size).each do |j|
+      if s[j] == '#'.ord
+        q_end = j
+        break
+      end
+    end
+    query = {i + 1, q_end}
+    i = q_end
+  end
+  fragment = nil.as(Tuple(Int32, Int32)?)
+  if i < s.size && s[i] == '#'.ord
+    return nil unless take_while_class(s, i + 1, CharClass::Fragment) == s.size
+    fragment = {i + 1, s.size}
+    i = s.size
+  end
+  i == s.size ? {hier_end, query, fragment} : nil
+end
+
+def parse_authority(all : Array(UInt8), start : Int32, limit : Int32) : Tuple(String?, String, Int64?, Int32)?
+  s = all.first(limit)
+  i = start
+  userinfo = nil.as(String?)
+  ui_end = take_while_class(s, i, CharClass::Userinfo)
+  if ui_end < s.size && s[ui_end] == '@'.ord
+    userinfo = slice(s, i, ui_end)
+    i = ui_end + 1
+  end
+  host_end = ip_literal_end(s, i) || take_while_class(s, i, CharClass::Host)
+  host = slice(s, i, host_end)
+  ends = host_end
+  port = nil.as(Int64?)
+  if ends < s.size && s[ends] == ':'.ord
+    digits_end = ends + 1
+    while digits_end < s.size && digit?(s[digits_end])
+      digits_end += 1
+    end
+    digits = slice(s, ends + 1, digits_end)
+    port = digits.empty? ? nil : (digits.to_i64? || 9223372036854775807_i64)
+    ends = digits_end
+  end
+  return nil if ends < s.size && s[ends] != '/'.ord
+  {userinfo, host, port, ends}
+end
+
+# RFC3986_relative_ref: only validity matters, since a relative reference
+# is never HTTP.
+def split_relative(s : Array(UInt8)) : Uri?
+  tail = query_fragment(s, 0) || return nil
+  hier_end, query, fragment = tail
+  valid = if hier_end >= 2 && s[0] == '/'.ord && s[1] == '/'.ord
+            authority = parse_authority(s, 2, hier_end)
+            authority ? take_while_class(s, authority[3], CharClass::Seg) == hier_end : false
+          elsif hier_end == 0 || s[0] == '/'.ord
+            take_while_class(s, 0, CharClass::Seg) == hier_end
+          else
+            first = take_while_class(s, 0, CharClass::SegNc)
+            first > 0 && (first == hier_end || (s[first] == '/'.ord && take_while_class(s, first, CharClass::Seg) == hier_end))
+          end
+  return nil unless valid
+  Uri.new(path: slice(s, 0, hier_end), query: query ? slice(s, query[0], query[1]) : nil, fragment: fragment ? slice(s, fragment[0], fragment[1]) : nil)
+end

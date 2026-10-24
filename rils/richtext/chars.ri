@@ -1,0 +1,308 @@
+# Characters of tape text, and the Ruby and Active Support string
+# behaviours the pipeline depends on (the Rust port's richtext/src/ruby.rs
+# and the `char` methods it calls).
+module rils/richtext/chars
+
+import std/int
+
+# The code point at *at* in valid UTF-8 and how many bytes it takes.
+pub def char_at(text : Str, at : Int32) : Tuple(UInt32, Int32)
+  byte = text[at]
+  return {byte.to_u32, 1} if byte < 0x80_u8
+  if byte < 0xe0_u8 && at + 1 < text.bytesize
+    return {((byte.to_u32 & 0x1f_u32) << 6) | (text[at + 1].to_u32 & 0x3f_u32), 2}
+  end
+  if byte < 0xf0_u8 && at + 2 < text.bytesize
+    return {((byte.to_u32 & 0x0f_u32) << 12) | ((text[at + 1].to_u32 & 0x3f_u32) << 6) |
+      (text[at + 2].to_u32 & 0x3f_u32), 3}
+  end
+  if at + 3 < text.bytesize
+    return {((byte.to_u32 & 0x07_u32) << 18) | ((text[at + 1].to_u32 & 0x3f_u32) << 12) |
+      ((text[at + 2].to_u32 & 0x3f_u32) << 6) | (text[at + 3].to_u32 & 0x3f_u32), 4}
+  end
+  {0xfffd_u32, 1}
+end
+
+# The start of the character that ends just before *at*.
+pub def char_start_before(text : Str, at : Int32) : Int32
+  i = at - 1
+  while i > 0 && (text[i] & 0xc0_u8) == 0x80_u8
+    i = i - 1
+  end
+  i
+end
+
+pub def push_char(writer : Str::Builder, code : UInt32) : Nil
+  if code < 0x80_u32
+    writer.push(code.to_u8)
+  elsif code < 0x800_u32
+    writer.push((0xc0_u32 | (code >> 6)).to_u8)
+    writer.push((0x80_u32 | (code & 0x3f_u32)).to_u8)
+  elsif code < 0x10000_u32
+    writer.push((0xe0_u32 | (code >> 12)).to_u8)
+    writer.push((0x80_u32 | ((code >> 6) & 0x3f_u32)).to_u8)
+    writer.push((0x80_u32 | (code & 0x3f_u32)).to_u8)
+  else
+    writer.push((0xf0_u32 | (code >> 18)).to_u8)
+    writer.push((0x80_u32 | ((code >> 12) & 0x3f_u32)).to_u8)
+    writer.push((0x80_u32 | ((code >> 6) & 0x3f_u32)).to_u8)
+    writer.push((0x80_u32 | (code & 0x3f_u32)).to_u8)
+  end
+end
+
+# Rust's `char::is_whitespace`: Unicode's White_Space.
+pub def unicode_space?(code : UInt32) : Bool
+  return code == 0x20_u32 || (code >= 0x09_u32 && code <= 0x0d_u32) if code < 0x80_u32
+  code == 0x85_u32 || code == 0xa0_u32 || code == 0x1680_u32 || (code >= 0x2000_u32 && code <= 0x200a_u32) ||
+    code == 0x2028_u32 || code == 0x2029_u32 || code == 0x202f_u32 || code == 0x205f_u32 || code == 0x3000_u32
+end
+
+# Active Support's `String#blank?`: empty or only Unicode whitespace.
+pub def blank?(text : Str) : Bool
+  at = 0
+  while at < text.bytesize
+    code, width = char_at(text, at)
+    return false unless unicode_space?(code)
+    at = at + width
+  end
+  true
+end
+
+# Rust's `str::trim`: Unicode whitespace off both ends.
+pub def trim(text : Str) : Str
+  first = 0
+  while first < text.bytesize
+    code, width = char_at(text, first)
+    break unless unicode_space?(code)
+    first = first + width
+  end
+  last = text.bytesize
+  while last > first
+    start = char_start_before(text, last)
+    code, _ = char_at(text, start)
+    break unless unicode_space?(code)
+    last = start
+  end
+  text[first, last - first]
+end
+
+# Ruby's `ISSPACE`.
+pub def ruby_space?(byte : UInt8) : Bool
+  byte == 0x20_u8 || (byte >= 0x09_u8 && byte <= 0x0d_u8)
+end
+
+# Ruby's `String#strip`: NUL and ASCII whitespace off both ends.
+pub def strip(text : Str) : Str
+  first = 0
+  last = text.bytesize
+  while first < last && (text[first] == 0_u8 || ruby_space?(text[first]))
+    first = first + 1
+  end
+  while last > first && (text[last - 1] == 0_u8 || ruby_space?(text[last - 1]))
+    last = last - 1
+  end
+  text[first, last - first]
+end
+
+# `String#chomp("")`: every trailing `\n` or `\r\n`, not a lone `\r`.
+pub def chomp_newlines(text : Str) : Str
+  last = text.bytesize
+  while true
+    if last >= 2 && text[last - 2] == 0x0d_u8 && text[last - 1] == 0x0a_u8
+      last = last - 2
+    elsif last >= 1 && text[last - 1] == 0x0a_u8
+      last = last - 1
+    else
+      break
+    end
+  end
+  text[0, last]
+end
+
+# `String#chomp`: one trailing `\r\n`, `\n` or `\r`.
+pub def chomp(text : Str) : Str
+  size = text.bytesize
+  return text[0, size - 2] if size >= 2 && text[size - 2] == 0x0d_u8 && text[size - 1] == 0x0a_u8
+  return text[0, size - 1] if size >= 1 && (text[size - 1] == 0x0a_u8 || text[size - 1] == 0x0d_u8)
+  text
+end
+
+# Whether *text* has *needle* anywhere in it.
+pub def includes?(text : Str, needle : ::String) : Bool
+  index(text, needle, 0) >= 0
+end
+
+# Where *needle* first is in *text* from *from*, or -1.
+pub def index(text : Str, needle : ::String, from : Int32) : Int32
+  wanted = needle.as_tape
+  size = wanted.bytesize
+  at = from
+  while at + size <= text.bytesize
+    return at if text[at, size] == wanted
+    at = at + 1
+  end
+  -1
+end
+
+pub def starts_with?(text : Str, prefix : ::String) : Bool
+  prefix.bytesize <= text.bytesize && text[0, prefix.bytesize] == prefix
+end
+
+pub def ascii_lower(byte : UInt8) : UInt8
+  byte >= 0x41_u8 && byte <= 0x5a_u8 ? byte + 0x20_u8 : byte
+end
+
+pub def ascii_alpha?(byte : UInt8) : Bool
+  (byte >= 0x61_u8 && byte <= 0x7a_u8) || (byte >= 0x41_u8 && byte <= 0x5a_u8)
+end
+
+pub def ascii_digit?(byte : UInt8) : Bool
+  byte >= 0x30_u8 && byte <= 0x39_u8
+end
+
+pub def ascii_alphanumeric?(byte : UInt8) : Bool
+  ascii_alpha?(byte) || ascii_digit?(byte)
+end
+
+pub def hex_digit?(byte : UInt8) : Bool
+  ascii_digit?(byte) || (byte >= 0x61_u8 && byte <= 0x66_u8) || (byte >= 0x41_u8 && byte <= 0x46_u8)
+end
+
+# *text* with ASCII capitals lowered.
+pub def ascii_downcase(text : Str) : Str
+  writer = Str::Builder.new(text.bytesize)
+  text.each_byte { |byte| writer.push(ascii_lower(byte)) }
+  writer.finish
+end
+
+# Whether *a* and *b* are the same but for ASCII case.
+pub def eq_ignore_ascii_case(a : Str, b : ::String) : Bool
+  other = b.as_tape
+  return false unless a.bytesize == other.bytesize
+  i = 0
+  while i < a.bytesize
+    return false unless ascii_lower(a[i]) == ascii_lower(other[i])
+    i = i + 1
+  end
+  true
+end
+
+# `ERB::Util.html_escape`: `& < > " '` as `&amp; &lt; &gt; &quot; &#39;`.
+pub def html_escape(text : Str, writer : Str::Builder) : Nil
+  start = 0
+  i = 0
+  while i < text.bytesize
+    replacement = case text[i]
+                  when 0x26_u8 then "&amp;"
+                  when 0x3c_u8 then "&lt;"
+                  when 0x3e_u8 then "&gt;"
+                  when 0x22_u8 then "&quot;"
+                  when 0x27_u8 then "&#39;"
+                  else              ""
+                  end
+    unless replacement.empty?
+      writer << text[start, i - start] if i > start
+      writer << replacement
+      start = i + 1
+    end
+    i = i + 1
+  end
+  writer << text[start, text.bytesize - start] if text.bytesize > start
+end
+
+pub def html_escape(text : Str) : Str
+  writer = Str::Builder.new(text.bytesize + 16)
+  html_escape(text, writer)
+  writer.finish
+end
+
+# Action View's `truncate(text, length:, omission:)`, before escaping.
+pub def truncate(text : Str, length : Int32, omission : ::String) : Str
+  chars = 0
+  at = 0
+  while at < text.bytesize
+    _, width = char_at(text, at)
+    chars = chars + 1
+    at = at + width
+  end
+  return text if chars <= length
+  keep = length - omission.size
+  keep = 0 if keep < 0
+  at = 0
+  kept = 0
+  while kept < keep
+    _, width = char_at(text, at)
+    at = at + width
+    kept = kept + 1
+  end
+  writer = Str::Builder.new(at + omission.bytesize)
+  writer << text[0, at] << omission
+  writer.finish
+end
+
+# A heap string with every invalid UTF-8 sequence as U+FFFD, as Rust's
+# `String::from_utf8_lossy` reads one: a maximal prefix of a valid
+# sequence counts as one.
+pub def lossy(text : ::String) : ::String
+  return text if valid_utf8?(text)
+  bytes = text.as_tape
+  String.build(text.bytesize + 8) do |io|
+    i = 0
+    while i < bytes.bytesize
+      width = valid_width(bytes, i)
+      if width > 0
+        j = 0
+        while j < width
+          io.write_byte(bytes[i + j])
+          j = j + 1
+        end
+        i = i + width
+      else
+        io << '\u{fffd}'
+        i = i + invalid_width(bytes, i)
+      end
+    end
+  end
+end
+
+pub def valid_utf8?(text : ::String) : Bool
+  bytes = text.as_tape
+  i = 0
+  while i < bytes.bytesize
+    width = valid_width(bytes, i)
+    return false if width == 0
+    i = i + width
+  end
+  true
+end
+
+private def valid_width(bytes : Str, at : Int32) : Int32
+  b = bytes[at]
+  return 1 if b < 0x80_u8
+  width = invalid_width(bytes, at)
+  needed = b >= 0xf0_u8 ? 4 : (b >= 0xe0_u8 ? 3 : 2)
+  width == needed && b >= 0xc2_u8 && b <= 0xf4_u8 ? needed : 0
+end
+
+# How many bytes from *at* form the longest prefix of a well-formed
+# sequence (at least one).
+private def invalid_width(bytes : Str, at : Int32) : Int32
+  b = bytes[at]
+  return 1 if b < 0xc2_u8 || b > 0xf4_u8
+  needed = b >= 0xf0_u8 ? 4 : (b >= 0xe0_u8 ? 3 : 2)
+  i = 1
+  while i < needed && at + i < bytes.bytesize
+    c = bytes[at + i]
+    low = 0x80_u8
+    high = 0xbf_u8
+    if i == 1
+      low = 0xa0_u8 if b == 0xe0_u8
+      high = 0x9f_u8 if b == 0xed_u8
+      low = 0x90_u8 if b == 0xf0_u8
+      high = 0x8f_u8 if b == 0xf4_u8
+    end
+    break unless c >= low && c <= high
+    i = i + 1
+  end
+  i
+end

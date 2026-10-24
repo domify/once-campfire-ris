@@ -1,0 +1,56 @@
+<%# reference/app/views/users/sidebars/show.html.erb -%>
+<%= sidebar_turbo_frame_tag do %>
+  <%= turbo_stream_from(rooms_stream) %>
+  <%= turbo_stream_from(user_rooms_stream) %>
+
+  <div class="sidebar__container overflow-y overflow-hide-scrollbar"
+      data-controller="badge-dot"
+      data-badge-dot-unread-class="unread"
+      data-action="rooms-list:unread@window->badge-dot#update rooms-list:read@window->badge-dot#update turbo:submit-start->turbo-frame#unpermanize">
+    <turbo-frame id="direct_rooms_control" target="_top">
+      <div class="directs gap overflow-x overflow-hide-scrollbar">
+        <%= link_to(new_rooms_direct_path, attrs.class("direct direct__new").data("turbo_frame", "_self")) do %>
+          <span class="avatar avatar--icon">
+            <%= image_tag(ctx, "messages-add.svg", attrs.size(20).aria_hidden.class("colorize--black")) %>
+          </span>
+
+          <span class="direct__author flex max-width min-width border-radius pad-inline-half">
+            <span class="for-screen-reader">New</span>
+            <span class="txt-small overflow-clip">Ping</span>
+          </span>
+<% end %>
+        <div id="direct_rooms" contents data-controller="sorted-list" data-action="rooms-list:unread@window->sorted-list#updateItem">
+          <% direct_memberships.each do |membership| %><% include "users/sidebars/rooms/_direct.html.erb" %><% end %>
+        </div>
+
+        <div contents>
+          <% direct_placeholder_users.each do |user| %><% include "users/sidebars/rooms/_direct_placeholder.html.erb" %><% end %>
+        </div>
+      </div>
+    </turbo-frame>
+
+    <div class="rooms position-relative flex flex-column gap">
+      <div id="shared_rooms" contents data-controller="sorted-list">
+<% other_memberships.each do |room| %>          <% include "users/sidebars/rooms/_shared.html.erb" %>
+<% end %>      </div>
+
+<% if can_create_rooms %>        <%= link_to(new_rooms_open_path, attrs.class("rooms__new-btn btn room align-center gap txt-reversed").aria("label", "New Chat Room")) do %>
+          <%= image_tag(ctx, "add.svg", attrs.size(20).aria_hidden.style("view-transition-name: new-room")) %>
+<% end %><% end %>    </div>
+
+    <button class="btn sidebar__toggle" data-action="toggle-class#toggle">
+      <%= image_tag(ctx, "menu.svg", attrs.size(20).aria_hidden) %>
+      <span class="for-screen-reader">Open menu</span>
+    </button>
+  </div>
+
+  <div class="flex align-end sidebar__tools gap justify-end">
+    <%= link_to(user_profile_path, attrs.class("btn avatar flex-item-no-shrink sidebar__tool")) do %>
+      <%= image_tag(ctx, current_user.avatar_path, attrs.size(48).aria_hidden.style("view-transition-name: avatar-#{current_user.id}")) %>
+      <span class="for-screen-reader">My Settings</span>
+<% end %>
+    <%= link_to(edit_account_path, attrs.class("btn align-center gap txt-reversed sidebar__tool")) do %>
+      <%= image_tag(ctx, "settings.svg", attrs.size(20).aria_hidden.style("view-transition-name: account-settings")) %>
+      <span class="for-screen-reader">Account Settings</span>
+<% end %>  </div>
+<% end %>

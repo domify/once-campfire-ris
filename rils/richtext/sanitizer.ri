@@ -1,0 +1,633 @@
+# `Rails::HTML5::SafeListSanitizer` with a `Rails::HTML::PermitScrubber`,
+# over Loofah's HTML5 scrubbing helpers (rails-html-sanitizer 1.7.1,
+# loofah 2.25.2): the Rust port's richtext/src/sanitizer.rs. Every
+# sanitization layer in the pipeline is this one scrubber with another
+# pair of allowlists.
+module rils/richtext/sanitizer
+
+import std/int
+import std/regex::{Regex}
+import htmlparse/htmlparse/tokenizer::{Attr}
+import rils/richtext/nodes::{Html, Failure}
+import rils/richtext/chars::{char_at, push_char, unicode_space?, trim, ascii_lower, ascii_digit?, hex_digit?, ascii_alphanumeric?}
+
+# `Rails::HTML::Concern::Scrubber::SafeList::DEFAULT_ALLOWED_TAGS`
+DEFAULT_ALLOWED_TAGS = ["a", "abbr", "acronym", "address", "b", "big", "blockquote", "br", "cite", "code", "dd", "del",
+                        "dfn", "div", "dl", "dt", "em", "h1", "h2", "h3", "h4", "h5", "h6", "hr", "i", "img", "ins",
+                        "kbd", "li", "mark", "ol", "p", "pre", "samp", "small", "span", "strong", "sub", "sup", "time",
+                        "tt", "ul", "var"]
+
+# `DEFAULT_ALLOWED_ATTRIBUTES` without `name`, which let a message
+# clobber the page's DOM globals (`<img name="body">`).
+DEFAULT_ALLOWED_ATTRIBUTES = ["abbr", "alt", "cite", "class", "datetime", "height", "href", "lang", "src", "title",
+                              "width", "xml:lang"]
+
+# `ContentFilters::EDITOR_FORMATTING_TAGS` and `_ATTRIBUTES`
+EDITOR_FORMATTING_TAGS       = ["s", "u", "mark", "table", "thead", "tbody", "tfoot", "tr", "th", "td"]
+EDITOR_FORMATTING_ATTRIBUTES = ["data-language"]
+
+# `ActionText::Attachment::ATTRIBUTES`
+pub ATTACHMENT_ATTRIBUTES = ["sgid", "content-type", "url", "href", "filename", "filesize", "width", "height",
+                             "previewable", "presentation", "caption", "content"]
+
+# A tag and attribute allowlist, as `sanitize(html, tags:, attributes:)`
+# takes them.
+pub class SafeList
+  getter tags : Array(String)
+  getter attributes : Array(String)
+
+  def initialize(@tags : Array(String), @attributes : Array(String))
+  end
+
+  def allows_tag?(name : Str) : Bool
+    @tags.any? { |tag| name == tag }
+  end
+
+  def allows_attribute?(name : Str) : Bool
+    @attributes.any? { |attribute| name == attribute }
+  end
+end
+
+private def union(base : Array(String), more : Array(String)) : Array(String)
+  out = base.dup
+  more.each { |item| out << item unless out.includes?(item) }
+  out
+end
+
+# Action View's `sanitize(html)`: the class-level defaults.
+DEFAULTS = SafeList.new(DEFAULT_ALLOWED_TAGS, DEFAULT_ALLOWED_ATTRIBUTES)
+
+# `ActionText::ContentHelper.allowed_tags`/`allowed_attributes` at boot:
+# Action Text's defaults, then Lexxy's additions, then Campfire's.
+ACTION_TEXT = SafeList.new(
+  union(DEFAULT_ALLOWED_TAGS + ["action-text-attachment", "figure", "figcaption", "video", "audio", "source", "embed",
+                                "table", "tbody", "tr", "th", "td"], EDITOR_FORMATTING_TAGS),
+  union(DEFAULT_ALLOWED_ATTRIBUTES + ATTACHMENT_ATTRIBUTES + ["controls", "poster", "data-language", "style", "value",
+                                                              "start"], EDITOR_FORMATTING_ATTRIBUTES))
+
+# `ContentFilters::SanitizeTags::ALLOWED_TAGS`
+pub SANITIZE_TAGS_ALLOWED_TAGS = ["a", "abbr", "acronym", "address", "b", "big", "blockquote", "br", "cite", "code",
+                                  "dd", "del", "dfn", "div", "dl", "dt", "em", "h1", "h2", "h3", "h4", "h5", "h6", "hr",
+                                  "i", "ins", "kbd", "li", "ol", "p", "pre", "samp", "small", "span", "strong", "sub",
+                                  "sup", "time", "tt", "ul", "var"] + EDITOR_FORMATTING_TAGS +
+                                 ["action-text-attachment", "figure", "figcaption"]
+
+# `ContentFilters::SanitizeAttributes`: SanitizeTags' tags, Action Text's
+# attributes plus `class`.
+CONTENT_FILTER = SafeList.new(SANITIZE_TAGS_ALLOWED_TAGS, union(ACTION_TEXT.attributes, ["class"]))
+
+# `MessagesHelper::AUTO_LINK_ALLOWED_TAGS`/`_ATTRIBUTES`
+AUTO_LINK = SafeList.new(union(DEFAULT_ALLOWED_TAGS, EDITOR_FORMATTING_TAGS),
+  DEFAULT_ALLOWED_ATTRIBUTES + EDITOR_FORMATTING_ATTRIBUTES)
+
+pub def defaults : SafeList
+  DEFAULTS
+end
+
+pub def action_text : SafeList
+  ACTION_TEXT
+end
+
+pub def content_filter : SafeList
+  CONTENT_FILTER
+end
+
+pub def auto_link_list : SafeList
+  AUTO_LINK
+end
+
+# `SafeListSanitizer#sanitize(html, tags:, attributes:)`. *brackets*
+# escapes `<` and `>` in attribute values too, so that auto_link's
+# regular expressions can't mistake an attribute for text; Rails writes
+# them raw, and the two are the same tree.
+pub def sanitize(
+  html : Str,
+  list : SafeList,
+  brackets : Bool = false,
+) : Str | Failure
+  return html if html.empty?
+  tree = Html.new
+  fragment = tree.parse_fragment(html)!
+  tree.children(fragment).each { |child| scrub_bottom_up(tree, child, list) }
+  tree.to_html(fragment, brackets)
+end
+
+# `Loofah::Scrubber#traverse_conditionally_bottom_up`: the children (as
+# they were before any was scrubbed), then the node.
+private def scrub_bottom_up(tree : Html, node : Int32, list : SafeList) : Nil
+  tree.children(node).each { |child| scrub_bottom_up(tree, child, list) }
+  scrub(tree, node, list)
+end
+
+# `Rails::HTML::PermitScrubber#scrub`: an HTML element (or a comment)
+# outside the list is unwrapped, a foreign one dropped with its content.
+private def scrub(tree : Html, node : Int32, list : SafeList) : Nil
+  return if tree.text?(node)
+  keep = tree.element?(node) && list.allows_tag?(tree.local_name(node))
+  unless keep
+    foreign = tree.element?(node) && !tree.html_element?(node)
+    unless foreign
+      tree.children(node).each { |child| tree.insert_before(node, child) }
+    end
+    tree.detach(node)
+    return
+  end
+  scrub_attributes(tree, node, list)
+end
+
+# An attribute's name as Nokogiri has it (`xlink:href`, `:xmlns`).
+private def qualified(attr : Attr) : Str
+  return attr.name if attr.prefix.empty? && attr.namespace != 6_u8
+  writer = Str::Builder.new(attr.prefix.bytesize + attr.name.bytesize + 1)
+  writer << attr.prefix << ':' << attr.name
+  writer.finish
+end
+
+# `PermitScrubber#scrub_attributes`. Attributes go in order, and each one
+# kept re-escapes every URL attribute on the node as it goes, so a later
+# URL is checked in its re-escaped form (" javascript:" has become
+# "%20javascript:" and passes).
+private def scrub_attributes(tree : Html, node : Int32, list : SafeList) : Nil
+  attrs = Ary(Attr).new
+  i = 0
+  while i < tree.attrs_count(node)
+    attrs << tree.attr_at(node, i)
+    i = i + 1
+  end
+  is_a = tree.local_name(node) == "a"
+  i = 0
+  while i < attrs.size
+    attr = attrs[i]
+    name = qualified(attr)
+    scrubbed = !list.allows_attribute?(name) || (uri_attribute?(name) && !allowed_uri(attr.value))
+    if scrubbed
+      remove_at(attrs, i)
+      next
+    end
+    if name == "src" && all_space?(attr.value)
+      remove_at(attrs, i)
+    else
+      i = i + 1
+    end
+    force_correct_attribute_escaping(attrs, is_a)
+  end
+  dom = tree.dom
+  start = dom.attrs.size
+  attrs.each { |attr| dom.attrs << attr }
+  dom.set_attrs(node, start, attrs.size)
+  scrub_style(tree, node)
+end
+
+private def remove_at(attrs : Ary(Attr), index : Int32) : Nil
+  i = index
+  while i < attrs.size - 1
+    attrs[i] = attrs[i + 1]
+    i = i + 1
+  end
+  attrs.pop
+end
+
+private def all_space?(text : Str) : Bool
+  at = 0
+  while at < text.bytesize
+    code, width = char_at(text, at)
+    return false unless unicode_space?(code)
+    at = at + width
+  end
+  true
+end
+
+# `Loofah::HTML5::SafeList::ATTR_VAL_IS_URI`
+ATTR_VAL_IS_URI = ["action", "cite", "href", "longdesc", "poster", "preload", "src", "xlink:href", "xml:base"]
+
+private def uri_attribute?(name : Str) : Bool
+  ATTR_VAL_IS_URI.any? { |uri| name == uri }
+end
+
+# `Loofah::HTML5::Scrub.force_correct_attribute_escaping!` (libxml2
+# builds): spaces and double quotes in `href`, `action`, `src` and an
+# `a`'s `name` become `%20` and `%22`, and the C0 controls XML 1.0 doesn't
+# allow go, as libxml2 drops them in `Attr#value=`.
+private def force_correct_attribute_escaping(
+  attrs : Ary(Attr),
+  is_a : Bool,
+) : Nil
+  i = 0
+  while i < attrs.size
+    attr = attrs[i]
+    name = qualified(attr)
+    qualifies = name == "href" || name == "action" || name == "src" || (name == "name" && is_a)
+    if qualifies && needs_escape?(attr.value)
+      attrs[i] = Attr.new(attr.name, escape_attribute_value(attr.value), attr.prefix, attr.namespace)
+    end
+    i = i + 1
+  end
+end
+
+private def escaped_byte?(byte : UInt8) : Bool
+  byte == 0x20_u8 || byte == 0x22_u8 || (byte < 0x20_u8 && byte != 0x09_u8 && byte != 0x0a_u8 && byte != 0x0d_u8)
+end
+
+private def needs_escape?(value : Str) : Bool
+  value.each_byte { |byte| return true if escaped_byte?(byte) }
+  false
+end
+
+private def escape_attribute_value(value : Str) : Str
+  writer = Str::Builder.new(value.bytesize + 8)
+  value.each_byte do |byte|
+    if byte == 0x20_u8
+      writer << "%20"
+    elsif byte == 0x22_u8
+      writer << "%22"
+    elsif byte < 0x20_u8 && byte != 0x09_u8 && byte != 0x0a_u8 && byte != 0x0d_u8
+    else
+      writer.push(byte)
+    end
+  end
+  writer.finish
+end
+
+# Lexxy's `ALLOWED_STYLE_PROPERTIES`.
+ALLOWED_STYLE_PROPERTIES = ["color", "background-color"]
+
+# A color keyword, a hex color, a custom property, or an `rgb()`/`hsl()`
+# color: nothing that loads a URL, escapes, or runs an expression. `\s`
+# is spelled out as Unicode's White_Space, as the Rust regex has it.
+SPACE       = "[\\t\\n\\x0B\\f\\r \\x{85}\\x{A0}\\x{1680}\\x{2000}-\\x{200A}\\x{2028}\\x{2029}\\x{202F}\\x{205F}\\x{3000}]"
+PLAIN_COLOR = Regex.new("(?i)\\A(?:[a-z]+|#[0-9a-f]{3,8}|var\\(#{SPACE}*--[a-z0-9_-]+#{SPACE}*\\)|" \
+                        "(?:rgb|rgba|hsl|hsla)\\((?:[0-9a-z.,%/+-]|#{SPACE})*\\))\\z")
+
+private def plain_color?(value : Str) : Bool
+  !PLAIN_COLOR.match(value.to_heap).nil?
+end
+
+# Where Loofah runs `style` through its CSS scrubber, this keeps only what
+# Lexxy writes: `color` and `background-color` with plain colors.
+private def scrub_style(tree : Html, node : Int32) : Nil
+  return unless tree.has_attr?(node, "style")
+  style = tree.attr(node, "style")
+  properties = Ary(Str).new
+  values = Ary(Str).new
+  start = 0
+  i = 0
+  while i <= style.bytesize
+    if i == style.bytesize || style[i] == 0x3b_u8
+      declaration = style[start, i - start]
+      unless trim(declaration).empty?
+        colon = -1
+        j = 0
+        while j < declaration.bytesize
+          if declaration[j] == 0x3a_u8
+            colon = j
+            break
+          end
+          j = j + 1
+        end
+        if colon >= 0
+          properties << lower(trim(declaration[0, colon]))
+          values << trim(declaration[colon + 1, declaration.bytesize - colon - 1])
+        else
+          properties << lower(trim(declaration))
+          values << declaration[0, 0]
+        end
+      end
+      start = i + 1
+    end
+    i = i + 1
+  end
+  all_allowed = properties.size > 0
+  k = 0
+  while k < properties.size
+    all_allowed = false unless allowed_style?(properties[k], values[k])
+    k = k + 1
+  end
+  return if all_allowed
+  writer = Str::Builder.new(style.bytesize)
+  k = 0
+  while k < properties.size
+    if allowed_style?(properties[k], values[k])
+      writer << properties[k] << ": " << values[k] << ';'
+    end
+    k = k + 1
+  end
+  if writer.length == 0
+    tree.remove_attr(node, "style")
+  else
+    tree.set_attr(node, "style", writer.finish)
+  end
+end
+
+private def lower(text : Str) : Str
+  writer = Str::Builder.new(text.bytesize)
+  text.each_byte { |byte| writer.push(ascii_lower(byte)) }
+  writer.finish
+end
+
+private def allowed_style?(property : Str, value : Str) : Bool
+  ALLOWED_STYLE_PROPERTIES.any? { |allowed| property == allowed } && plain_color?(value)
+end
+
+ALLOWED_PROTOCOLS = ["afs", "aim", "callto", "data", "ed2k", "fax", "ftp", "gopher", "http", "https", "irc", "line",
+                     "mailto", "modem", "news", "nntp", "rsync", "rtsp", "sftp", "sms", "ssh", "tag", "tel", "telnet",
+                     "urn", "webcal", "xmpp"]
+
+ALLOWED_URI_DATA_MEDIATYPES = ["image/gif", "image/jpeg", "image/png", "text/css", "text/plain"]
+
+# `Loofah::HTML5::Scrub::CONTROL_CHARACTERS`: /[`\u0000- \u007f\u0080-ā]/
+private def control_character?(code : UInt32) : Bool
+  code == 0x60_u32 || code <= 0x20_u32 || code == 0x7f_u32 || (code >= 0x80_u32 && code <= 0x101_u32)
+end
+
+private def without_controls(text : Str) : Str
+  writer = Str::Builder.new(text.bytesize)
+  at = 0
+  while at < text.bytesize
+    code, width = char_at(text, at)
+    writer << text[at, width] unless control_character?(code)
+    at = at + width
+  end
+  writer.finish
+end
+
+private def replace_all(text : Str, from : ::String, to : ::String) : Str
+  wanted = from.as_tape
+  writer = Str::Builder.new(text.bytesize)
+  at = 0
+  while at < text.bytesize
+    if at + wanted.bytesize <= text.bytesize && text[at, wanted.bytesize] == wanted
+      writer << to
+      at = at + wanted.bytesize
+    else
+      writer.push(text[at])
+      at = at + 1
+    end
+  end
+  writer.finish
+end
+
+# Rust's `str::to_lowercase` as far as the protocol check can see: ASCII,
+# and the two characters whose lowercase is ASCII (the Kelvin sign's `k`,
+# and `İ`'s `i` with a combining dot). Other characters stay what they
+# are: no other lowercase is ASCII, so none can make a scheme.
+private def protocol_lowercase(text : Str) : Str
+  writer = Str::Builder.new(text.bytesize)
+  at = 0
+  while at < text.bytesize
+    code, width = char_at(text, at)
+    if code < 0x80_u32
+      writer.push(ascii_lower(code.to_u8))
+    elsif code == 0x212a_u32
+      writer.push(0x6b_u8)
+    elsif code == 0x130_u32
+      writer.push(0x69_u8)
+      push_char(writer, 0x307_u32)
+    else
+      writer << text[at, width]
+    end
+    at = at + width
+  end
+  writer.finish
+end
+
+# `Loofah::HTML5::Scrub.allowed_uri?`
+pub def allowed_uri(uri : Str) : Bool
+  decoded = decode_numeric_character_references(cgi_unescape_html(without_controls(uri)))
+  s = without_controls(decoded)
+  s = replace_all(s, "&Tab;", "")
+  s = replace_all(s, "&NewLine;", "")
+  s = replace_all(s, "&colon;", ":")
+  s = protocol_lowercase(s)
+  return true if s.empty? || !(s[0] >= 0x61_u8 && s[0] <= 0x7a_u8)
+  stop = 1
+  while stop < s.bytesize
+    b = s[stop]
+    break unless (b >= 0x61_u8 && b <= 0x7a_u8) || ascii_digit?(b) || b == 0x2b_u8 || b == 0x2d_u8 || b == 0x2e_u8
+    stop = stop + 1
+  end
+  return true unless separator?(s[stop, s.bytesize - stop])
+  protocol = s[0, stop]
+  return false unless ALLOWED_PROTOCOLS.any? { |allowed| protocol == allowed }
+  return data_uri_allowed?(s) if protocol == "data"
+  true
+end
+
+# `PROTOCOL_SEPARATOR`: `/:|(&#0*58)|(&#x0*3a)|(%|&#37;)3A/i`, at the start.
+private def separator?(rest : Str) : Bool
+  return false if rest.empty?
+  return true if rest[0] == 0x3a_u8
+  lower = protocol_lowercase(rest)
+  if lower.bytesize >= 3 && lower[0, 3] == "&#x"
+    i = 3
+    while i < lower.bytesize && lower[i] == 0x30_u8
+      i = i + 1
+    end
+    return true if i + 2 <= lower.bytesize && lower[i, 2] == "3a"
+  end
+  if lower.bytesize >= 2 && lower[0, 2] == "&#"
+    i = 2
+    while i < lower.bytesize && lower[i] == 0x30_u8
+      i = i + 1
+    end
+    return true if i + 2 <= lower.bytesize && lower[i, 2] == "58"
+  end
+  return true if lower.bytesize >= 3 && lower[0, 3] == "%3a"
+  lower.bytesize >= 7 && lower[0, 7] == "&#37;3a"
+end
+
+private def tchar?(byte : UInt8) : Bool
+  return true if ascii_alphanumeric?(byte)
+  "!#$%&'*+-.^_`|~".as_tape.each_byte { |c| return true if c == byte }
+  false
+end
+
+# `Loofah::HTML5::Scrub.data_uri_mediatype` checked against the allowed.
+private def data_uri_allowed?(s : Str) : Bool
+  rest = s.bytesize >= 5 && s[0, 5] == "data:" ? s[5, s.bytesize - 5] : s
+  comma = -1
+  i = 0
+  while i < rest.bytesize
+    if rest[i] == 0x2c_u8
+      comma = i
+      break
+    end
+    i = i + 1
+  end
+  return false if comma < 0
+  metadata = rest[0, comma]
+  if metadata.bytesize >= 7 && metadata[metadata.bytesize - 7, 7] == ";base64"
+    metadata = metadata[0, metadata.bytesize - 7]
+  end
+  semicolon = metadata.bytesize
+  i = 0
+  while i < metadata.bytesize
+    if metadata[i] == 0x3b_u8
+      semicolon = i
+      break
+    end
+    i = i + 1
+  end
+  mediatype = metadata[0, semicolon]
+  first = 0
+  last = mediatype.bytesize
+  while first < last && trim_byte?(mediatype[first])
+    first = first + 1
+  end
+  while last > first && trim_byte?(mediatype[last - 1])
+    last = last - 1
+  end
+  mediatype = mediatype[first, last - first]
+  slash = -1
+  i = 0
+  while i < mediatype.bytesize
+    if mediatype[i] == 0x2f_u8
+      slash = i
+      break
+    end
+    i = i + 1
+  end
+  valid = slash > 0 && slash < mediatype.bytesize - 1
+  if valid
+    i = 0
+    while i < mediatype.bytesize
+      valid = false unless i == slash || tchar?(mediatype[i])
+      i = i + 1
+    end
+  end
+  return ALLOWED_URI_DATA_MEDIATYPES.includes?("text/plain") unless valid
+  ALLOWED_URI_DATA_MEDIATYPES.any? { |allowed| mediatype == allowed }
+end
+
+private def trim_byte?(byte : UInt8) : Bool
+  byte == 0x20_u8 || byte == 0x09_u8 || byte == 0x0a_u8 || byte == 0x0b_u8 || byte == 0x0c_u8 || byte == 0x0d_u8 ||
+    byte == 0_u8
+end
+
+# `CGI.unescapeHTML`: the five named entities plus terminated numeric
+# references.
+pub def cgi_unescape_html(s : Str) : Str
+  writer = Str::Builder.new(s.bytesize)
+  at = 0
+  while at < s.bytesize
+    if s[at] != 0x26_u8
+      writer.push(s[at])
+      at = at + 1
+      next
+    end
+    consumed = unescape_one(s, at, writer)
+    if consumed > 0
+      at = at + consumed
+    else
+      writer.push(0x26_u8)
+      at = at + 1
+    end
+  end
+  writer.finish
+end
+
+NAMED_ESCAPES = [{"&apos;", "'"}, {"&amp;", "&"}, {"&quot;", "\""}, {"&gt;", ">"}, {"&lt;", "<"}]
+
+private def unescape_one(s : Str, at : Int32, writer : Str::Builder) : Int32
+  rest = s[at, s.bytesize - at]
+  NAMED_ESCAPES.each do |pair|
+    if rest.bytesize >= pair[0].bytesize && rest[0, pair[0].bytesize] == pair[0]
+      writer << pair[1]
+      return pair[0].bytesize
+    end
+  end
+  semicolon = -1
+  i = 0
+  while i < rest.bytesize
+    if rest[i] == 0x3b_u8
+      semicolon = i
+      break
+    end
+    i = i + 1
+  end
+  return 0 if semicolon < 0
+  body = rest[1, semicolon - 1]
+  code = -1_i64
+  if body.bytesize >= 2 && body[0] == 0x23_u8 && (body[1] == 0x78_u8 || body[1] == 0x58_u8)
+    code = numeric_reference(body[2, body.bytesize - 2], 16)
+  elsif body.bytesize >= 1 && body[0] == 0x23_u8
+    code = numeric_reference(body[1, body.bytesize - 1], 10)
+  end
+  return 0 if code < 0 || (code >= 0xd800 && code <= 0xdfff)
+  push_char(writer, code.to_u32)
+  semicolon + 1
+end
+
+# The code point of a numeric reference's digits when `CGI.unescapeHTML`
+# decodes it: any number of leading zeros, and below U+10FFFF; -1 if not.
+private def numeric_reference(digits : Str, radix : Int32) : Int64
+  return -1_i64 if digits.empty?
+  digits.each_byte do |byte|
+    ok = radix == 16 ? hex_digit?(byte) : ascii_digit?(byte)
+    return -1_i64 unless ok
+  end
+  first = 0
+  while first < digits.bytesize && digits[first] == 0x30_u8
+    first = first + 1
+  end
+  return -1_i64 if digits.bytesize - first > (radix == 16 ? 6 : 7)
+  value = 0_i64
+  i = first
+  while i < digits.bytesize
+    value = value * radix + digit(digits[i])
+    i = i + 1
+  end
+  value < 0x10ffff ? value : -1_i64
+end
+
+private def digit(byte : UInt8) : Int64
+  return (byte - 0x30_u8).to_i64 if ascii_digit?(byte)
+  (ascii_lower(byte) - 0x61_u8).to_i64 + 10
+end
+
+# `Loofah::HTML5::Scrub.decode_numeric_character_references`:
+# `&#(x[0-9a-f]+|[0-9]+);?`, skipping too many significant digits and
+# what is not a code point.
+private def decode_numeric_character_references(s : Str) : Str
+  writer = Str::Builder.new(s.bytesize)
+  i = 0
+  copied = 0
+  while i < s.bytesize
+    if s[i] == 0x26_u8 && i + 1 < s.bytesize && s[i + 1] == 0x23_u8
+      start = i + 2
+      hex = start < s.bytesize && (s[start] == 0x78_u8 || s[start] == 0x58_u8)
+      digits_start = hex ? start + 1 : start
+      stop = digits_start
+      while stop < s.bytesize && (hex ? hex_digit?(s[stop]) : ascii_digit?(s[stop]))
+        stop = stop + 1
+      end
+      if stop > digits_start
+        full_end = stop < s.bytesize && s[stop] == 0x3b_u8 ? stop + 1 : stop
+        first = digits_start
+        while first < stop && s[first] == 0x30_u8
+          first = first + 1
+        end
+        code = -1_i64
+        if stop - first <= (hex ? 6 : 7)
+          code = 0_i64
+          j = first
+          while j < stop
+            code = code * (hex ? 16 : 10) + digit(s[j])
+            j = j + 1
+          end
+        end
+        writer << s[copied, i - copied]
+        if code >= 0 && code <= 0x10ffff && !(code >= 0xd800 && code <= 0xdfff)
+          push_char(writer, code.to_u32)
+        else
+          writer << s[i, full_end - i]
+        end
+        i = full_end
+        copied = i
+        next
+      end
+    end
+    i = i + 1
+  end
+  writer << s[copied, s.bytesize - copied]
+  writer.finish
+end

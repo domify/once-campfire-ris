@@ -1,0 +1,386 @@
+# The slice of `Nokogiri::HTML(html)` (libxml2's legacy HTML parser, in
+# recovery mode) that `Opengraph::Document` reads: every `<meta>` element's
+# attributes.
+#
+# The body comes from `Opengraph::Fetch` tagged UTF-8, so libxml2 decodes it
+# as UTF-8 whatever the page declares, taking a byte that isn't valid UTF-8
+# as Latin-1. Then it tokenizes the way its pre-HTML5 parser does:
+# `<script>`/`<style>` hold raw text, comments and `<!…>`/`<?…>` are
+# skipped, names are lowercased, the first of a repeated attribute wins,
+# and attribute values decode HTML 4 entities only when terminated by `;`
+# and numeric references with or without one (an invalid one cuts the value
+# short, as the NUL it produces ends libxml2's C string).
+module integrations/opengraph/html
+
+import std/text
+import integrations/opengraph/entities::{ENTITIES}
+
+pub class Element
+  getter attributes : Array(Tuple(String, String))
+
+  def initialize(@attributes : Array(Tuple(String, String)))
+  end
+
+  pub def attr(name : String) : String?
+    found = @attributes.find { |attribute| attribute[0] == name }
+    found ? found[1] : nil
+  end
+
+  pub def has_attr?(name : String) : Bool
+    @attributes.any? { |attribute| attribute[0] == name }
+  end
+end
+
+# The bytes of *text*.
+def bytes_of(text : String) : Array(UInt8)
+  bytes = [] of UInt8
+  text.each_byte { |byte| bytes << byte }
+  bytes
+end
+
+# How long the UTF-8 sequence at *at* is, or 0 when it isn't valid.
+def utf8_length(bytes : Array(UInt8), at : Int32) : Int32
+  first = bytes[at]
+  return 1 if first < 0x80
+  length, minimum = if first & 0xe0 == 0xc0
+                      {2, 0x80}
+                    elsif first & 0xf0 == 0xe0
+                      {3, 0x800}
+                    elsif first & 0xf8 == 0xf0
+                      {4, 0x10000}
+                    else
+                      return 0
+                    end
+  return 0 if at + length > bytes.size
+  value = (first & (0x7f >> length)).to_i32
+  (1...length).each do |i|
+    byte = bytes[at + i]
+    return 0 unless byte & 0xc0 == 0x80
+    value = (value << 6) | (byte & 0x3f).to_i32
+  end
+  return 0 if value < minimum || value > 0x10ffff || (value >= 0xd800 && value <= 0xdfff)
+  length
+end
+
+# libxml2 reading a UTF-8 buffer: valid sequences decode, any other byte is
+# taken as Latin-1.
+pub def decode(body : String) : String
+  bytes = bytes_of(body)
+  String.build(bytes.size) do |io|
+    at = 0
+    while at < bytes.size
+      length = utf8_length(bytes, at)
+      if length == 0
+        io << bytes[at].to_i32.chr
+        at += 1
+      else
+        length.times { |i| io.write_byte(bytes[at + i]) }
+        at += length
+      end
+    end
+  end
+end
+
+# How many attributes of one tag are kept; the rest are parsed and dropped.
+MAX_ATTRIBUTES = 256
+
+# The `<meta>` elements of the document, in document order.
+pub def meta_elements(html : String) : Array(Element)
+  scanner = Scanner.new(bytes_of(html))
+  metas = [] of Element
+  while c = scanner.peek(0)
+    if c != '<'.ord
+      scanner.pos += 1
+      next
+    end
+    following = scanner.peek(1)
+    if following == '/'.ord
+      scanner.end_tag
+    elsif following == '!'.ord
+      scanner.markup_declaration
+    elsif following == '?'.ord
+      scanner.skip_past('>'.ord.to_u8)
+    elsif following && alpha?(following)
+      name, element, self_closing = scanner.start_tag
+      if name == "meta"
+        metas << element
+      elsif (name == "script" || name == "style") && !self_closing
+        scanner.raw_text(name)
+      end
+    else
+      scanner.pos += 1
+    end
+  end
+  metas
+end
+
+def alpha?(c : UInt8) : Bool
+  (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+end
+
+def digit?(c : UInt8) : Bool
+  c >= 48 && c <= 57
+end
+
+def blank?(c : UInt8) : Bool
+  c == 32 || c == 9 || c == 10 || c == 13
+end
+
+def lower(c : UInt8) : UInt8
+  c >= 65 && c <= 90 ? c + 32 : c
+end
+
+class Scanner
+  getter bytes : Array(UInt8)
+  property pos : Int32
+
+  def initialize(bytes : Array(UInt8))
+    # A NUL ends libxml2's input.
+    nul = bytes.index(0_u8)
+    @bytes = nul ? bytes.first(nul) : bytes
+    @pos = 0
+  end
+
+  def peek(ahead : Int32) : UInt8?
+    at = @pos + ahead
+    at < @bytes.size ? @bytes[at] : nil
+  end
+
+  def starts_with_ignore_case?(text : String) : Bool
+    wanted = bytes_of(text)
+    return false if @pos + wanted.size > @bytes.size
+    wanted.each_with_index { |byte, i| return false unless lower(@bytes[@pos + i]) == lower(byte) }
+    true
+  end
+
+  # The text from *start* to here, which begins and ends at ASCII bytes.
+  def text_from(start : Int32) : String
+    String.build(@pos - start) { |io| (start...@pos).each { |i| io.write_byte(@bytes[i]) } }
+  end
+
+  def skip_blanks : Nil
+    while (c = peek(0)) && blank?(c)
+      @pos += 1
+    end
+  end
+
+  # Moves past the next *c* (or to the end).
+  def skip_past(c : UInt8) : Nil
+    while next_byte = peek(0)
+      @pos += 1
+      break if next_byte == c
+    end
+  end
+
+  # `htmlParseHTMLName`: `[A-Za-z_:.][A-Za-z0-9:_.-]*`, lowercased.
+  def html_name : String?
+    first = peek(0) || return nil
+    return nil unless alpha?(first) || first == '_'.ord || first == ':'.ord || first == '.'.ord
+    start = @pos
+    while (c = peek(0)) && (alpha?(c) || digit?(c) || c == ':'.ord || c == '-'.ord || c == '_'.ord || c == '.'.ord)
+      @pos += 1
+    end
+    String.build { |io| (start...@pos).each { |i| io.write_byte(lower(@bytes[i])) } }
+  end
+
+  def end_tag : Nil
+    @pos += 2
+    skip_past('>'.ord.to_u8) if html_name
+  end
+
+  # `<!--…-->` (with `<!-->` and `<!--->` closing at once, and `--!>`
+  # accepted), `<!DOCTYPE…>`, and any other `<!…>` as a bogus comment.
+  def markup_declaration : Nil
+    if peek(2) == '-'.ord && peek(3) == '-'.ord
+      @pos += 4
+      if peek(0) == '>'.ord
+        @pos += 1
+        return
+      end
+      if peek(0) == '-'.ord && peek(1) == '>'.ord
+        @pos += 2
+        return
+      end
+      while @pos < @bytes.size
+        if starts_with_ignore_case?("-->")
+          @pos += 3
+          return
+        end
+        if starts_with_ignore_case?("--!>")
+          @pos += 4
+          return
+        end
+        @pos += 1
+      end
+    else
+      skip_past('>'.ord.to_u8)
+    end
+  end
+
+  def tag_end? : Bool
+    c = peek(0)
+    c.nil? || c == '>'.ord || (c == '/'.ord && peek(1) == '>'.ord)
+  end
+
+  # `htmlParseStartTag`: the name, the element, and whether it ended `/>`.
+  def start_tag : Tuple(String, Element, Bool)
+    @pos += 1
+    name = html_name || ""
+    attributes = [] of Tuple(String, String)
+    skip_blanks
+    until tag_end?
+      if attribute = html_name
+        skip_blanks
+        value = ""
+        if peek(0) == '='.ord
+          @pos += 1
+          skip_blanks
+          value = attribute_value
+        end
+        if attributes.size < MAX_ATTRIBUTES && !attributes.any? { |existing| existing[0] == attribute }
+          attributes << {attribute, value}
+        end
+      else
+        # The bogus attribute string, up to the next blank or the tag's end.
+        while (c = peek(0)) && !blank?(c) && !tag_end?
+          @pos += 1
+        end
+      end
+      skip_blanks
+    end
+    self_closing = peek(0) == '/'.ord
+    if self_closing
+      @pos += 2
+    elsif peek(0) == '>'.ord
+      @pos += 1
+    end
+    {name, Element.new(attributes), self_closing}
+  end
+
+  # `htmlParseAttValue`
+  def attribute_value : String
+    quote = peek(0)
+    if quote == '"'.ord || quote == '\''.ord
+      @pos += 1
+      value = attribute_text(quote)
+      @pos += 1 if peek(0) == quote
+      value
+    else
+      attribute_text(nil)
+    end
+  end
+
+  def ends_text?(c : UInt8, stop : UInt8?) : Bool
+    c == '&'.ord || c == stop || (stop.nil? && (c == '>'.ord || blank?(c)))
+  end
+
+  # `htmlParseHTMLAttribute`: up to the quote, or (unquoted) a blank or `>`.
+  def attribute_text(stop : UInt8?) : String
+    truncated = false
+    String.build do |io|
+      loop do
+        start = @pos
+        while (c = peek(0)) && !ends_text?(c, stop)
+          @pos += 1
+        end
+        io << text_from(start) unless truncated
+        break unless peek(0) == '&'.ord
+        decoded = peek(1) == '#'.ord ? char_ref : entity_ref
+        if decoded.nil?
+          truncated = true
+        elsif !truncated
+          io << decoded
+        end
+      end
+    end
+  end
+
+  # `htmlParseCharRef`: nil for a value that isn't a valid XML character.
+  def char_ref : String?
+    hex = peek(2) == 'x'.ord || peek(2) == 'X'.ord
+    @pos += hex ? 3 : 2
+    radix = hex ? 16 : 10
+    value = 0
+    while c = peek(0)
+      if c == ';'.ord
+        @pos += 1
+        break
+      end
+      digit = c.to_i32.chr.to_i?(radix) || break
+      value = value * radix + digit if value < 0x110000
+      @pos += 1
+    end
+    valid = value == 0x9 || value == 0xA || value == 0xD || (value >= 0x20 && value <= 0xD7FF) || (value >= 0xE000 && value <= 0xFFFD) || (value >= 0x10000 && value <= 0x10FFFF)
+    valid ? value.chr.to_s : nil
+  end
+
+  # `htmlParseEntityRef`: a known name followed by `;` decodes; anything
+  # else stays as written.
+  def entity_ref : String
+    @pos += 1
+    start = @pos
+    if (c = peek(0)) && (alpha?(c) || c == '_'.ord || c == ':'.ord)
+      while (c = peek(0)) && (alpha?(c) || digit?(c) || c == '_'.ord || c == ':'.ord || c == '.'.ord || c == '-'.ord)
+        @pos += 1
+      end
+    end
+    name = text_from(start)
+    if !name.empty? && peek(0) == ';'.ord
+      if code = ENTITIES[name]?
+        @pos += 1
+        return code.chr.to_s
+      end
+    end
+    "&#{name}"
+  end
+
+  # `htmlParseScript`: everything up to `</name` (any case) is text.
+  def raw_text(name : String) : Nil
+    finish = "</#{name}"
+    while @pos < @bytes.size && !starts_with_ignore_case?(finish)
+      @pos += 1
+    end
+  end
+end
+
+# `Nokogiri::HTML4::Document#meta_encoding`: the first `meta[@charset]`,
+# else the charset in the first `http-equiv="Content-Type"` meta with a
+# `content`.
+pub def meta_encoding(metas : Array(Element)) : String?
+  if meta = metas.find(&.has_attr?("charset"))
+    return meta.attr("charset")
+  end
+  meta = metas.find { |m| m.has_attr?("content") && (m.attr("http-equiv") || "").downcase == "content-type" } || return nil
+  charset_in(meta.attr("content") || "")
+end
+
+CHARSET = [99_u8, 104_u8, 97_u8, 114_u8, 115_u8, 101_u8, 116_u8]
+
+# `content[/charset\s*=\s*([\w-]+)/i, 1]`
+def charset_in(content : String) : String?
+  bytes = bytes_of(content)
+  at = 0
+  while at + 7 <= bytes.size
+    matched = true
+    CHARSET.each_with_index { |byte, i| matched = false unless lower(bytes[at + i]) == byte }
+    if matched
+      i = at + 7
+      while i < bytes.size && (blank?(bytes[i]) || bytes[i] == 11 || bytes[i] == 12)
+        i += 1
+      end
+      if i < bytes.size && bytes[i] == '='.ord
+        i += 1
+        while i < bytes.size && (blank?(bytes[i]) || bytes[i] == 11 || bytes[i] == 12)
+          i += 1
+        end
+        start = i
+        while i < bytes.size && (alpha?(bytes[i]) || digit?(bytes[i]) || bytes[i] == '_'.ord || bytes[i] == '-'.ord)
+          i += 1
+        end
+        return String.build { |io| (start...i).each { |j| io.write_byte(bytes[j]) } } if i > start
+      end
+    end
+    at += 1
+  end
+  nil
+end

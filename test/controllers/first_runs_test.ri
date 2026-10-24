@@ -1,0 +1,114 @@
+# `test/controllers/first_runs_controller_test.rb` and
+# `welcome_controller_test.rb`, through the drawn routes.
+module test/controllers/first_runs_test
+
+import std/text
+import std/file::{File}
+import std/dir::{Dir}
+import rils/record/sqlite::{SqlValue}
+import models/account::{Account}
+import models/user::{User}
+import models/room::{Room}
+import rils/kit/params::{RawPair, UploadedFile}
+import test/testing::*
+import web/web/spec::*
+
+SIGNUP = "user%5Bname%5D=New+Person&user%5Bemail_address%5D=new%40example.com&user%5Bpassword%5D=secret123456"
+
+describe "first_runs" do
+  it "sends a repeat to the root" do
+    client = Client.new
+    assert client.get("/first_run")["location"] == "http://once.campfire.test/"
+    assert client.submit("POST", "/first_run", SIGNUP)["location"] == "http://once.campfire.test/"
+    assert client.t.read { |conn| User.find_by_email_address(conn, "new@example.com") }.nil?
+  end
+
+  it "shows the set-up page before the first run" do
+    client = Client.new
+    empty_database(client)
+    response = client.get("/first_run")
+    assert response.status == 200
+    html = body(response)
+    assert html.includes?("<title>Set up Campfire</title>")
+    assert html.includes?("<body class=\"signup\"")
+    assert html.includes?("<input class=\"input\" autocomplete=\"name\" placeholder=\"Name\" autofocus=\"autofocus\" required=\"required\" data-1p-ignore=\"true\" type=\"text\" name=\"user[name]\" id=\"user_name\" />")
+    assert !response["link"].nil?
+  end
+
+  it "sets up the account, its administrator and the first room, signed in" do
+    client = Client.new
+    empty_database(client)
+    response = client.submit("POST", "/first_run", SIGNUP)
+    assert response.status == 302
+    assert response["location"] == "http://once.campfire.test/"
+    assert set_cookies(response).any?(&.starts_with?("session_token="))
+    client.t.read do |conn|
+      assert (Account.first(conn) || raise "no account").name == "Campfire"
+      user = User.find_by_email_address(conn, "new@example.com") || raise "no user"
+      assert user.name == "New Person"
+      assert user.administrator?
+      assert User.authenticated(user, "secret123456") == user
+      rooms = Room.for_user(conn, user.id)
+      assert rooms.size == 1
+      assert rooms[0].name == "All Talk"
+      assert rooms[0].open?
+    end
+  end
+
+  it "keeps the avatar it's given" do
+    client = Client.new
+    empty_database(client)
+    upload = "#{Dir.tempdir}/first_run_avatar.png"
+    File.write(upload, File.read("#{__DIR__}/../../reference/app/assets/images/campfire-icon.png"))
+    pairs = [RawPair.new("user[name]", "Pic"), RawPair.new("user[email_address]", "pic@example.com"), RawPair.new("user[password]", "secret123456"),
+             RawPair.new("user[avatar]", UploadedFile.new("me.png", "image/png", "", File.size(upload), upload))]
+    assert client.submit_pairs("POST", "/first_run", pairs).status == 302
+    client.t.read do |conn|
+      user = User.find_by_email_address(conn, "pic@example.com") || raise "no user"
+      blob = conn.query_all(%(SELECT "active_storage_blobs"."filename", "active_storage_blobs"."content_type" FROM "active_storage_attachments" JOIN "active_storage_blobs" ON "active_storage_blobs"."id" = "active_storage_attachments"."blob_id" WHERE "record_type" = 'User' AND "record_id" = ? AND "name" = 'avatar'), [user.id] of SqlValue) { |row| {row.text(0), row.text(1)} }
+      assert blob == [{"me.png", "image/png"}]
+    end
+  end
+
+  it "requires the user's parameters" do
+    client = Client.new
+    empty_database(client)
+    assert client.submit("POST", "/first_run", "name=x").status == 400
+  end
+end
+
+describe "welcome#show" do
+  it "sends a signed-out visitor to sign in" do
+    response = Client.new.get("/")
+    assert response.status == 302
+    assert response["location"] == "http://once.campfire.test/session/new"
+  end
+
+  it "goes to the original room, or the last one visited" do
+    client = Client.new
+    cookie = client.cookie("david@37signals.com")
+    original = client.t.read do |conn|
+      user = User.find_by_email_address(conn, "david@37signals.com") || raise "no david"
+      Room.original_for_user(conn, user.id) || raise "no original room"
+    end
+    assert client.get("/", cookie: cookie)["location"] == "http://once.campfire.test/rooms/#{original.id}"
+    other = client.t.read do |conn|
+      user = User.find_by_email_address(conn, "david@37signals.com") || raise "no david"
+      Room.for_user(conn, user.id).find { |room| room.id != original.id } || raise "only one room"
+    end
+    assert client.get("/", cookie: "#{cookie}; last_room=#{other.id}")["location"] == "http://once.campfire.test/rooms/#{other.id}"
+  end
+
+  it "welcomes a user in no room" do
+    client = Client.new
+    cookie = client.cookie("david@37signals.com")
+    user_id = client.t.read { |conn| (User.find_by_email_address(conn, "david@37signals.com") || raise "no david").id }
+    client.t.conn.execute("DELETE FROM memberships WHERE user_id = ?", [user_id] of SqlValue)
+    response = client.get("/", cookie: cookie)
+    assert response.status == 200
+    html = body(response)
+    assert html.includes?("<title>No rooms yet</title>")
+    assert html.includes?("<meta name=\"current-user-id\" content=\"#{user_id}\" />")
+    assert html.includes?("<span class=\"for-screen-reader\">David</span>")
+  end
+end

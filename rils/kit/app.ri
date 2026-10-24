@@ -1,0 +1,70 @@
+# The shared, per-process part of the HTTP layer: configuration, secrets and
+# clock.
+module rils/kit/app
+
+import rils/rails_compat/clock::{Clock}
+import rils/rails_compat/key_generator::{Secrets}
+import rils/kit/request::{ProxyConfig}
+import rils/kit/session::{SessionConfig}
+import rils/kit/exceptions::{ErrorPages}
+
+pub class KitConfig
+  property proxy : ProxyConfig
+  # `config.force_ssl`: redirect plain HTTP to HTTPS, send HSTS, flag
+  # cookies `secure`.
+  property force_ssl : Bool
+  # The HSTS header value sent with `force_ssl`
+  # (`ssl_options = { hsts: { subdomains: true } }`).
+  property hsts : String
+  property session : SessionConfig
+  # `forgery_protection_origin_check` (on since `load_defaults 5.0`).
+  property forgery_protection_origin_check : Bool
+  # `action_dispatch.default_headers` (`load_defaults 7.1`).
+  property default_headers : Array(Tuple(String, String))
+  # `public/404.html`, `422.html`, `500.html`, ...
+  # (`ActionDispatch::PublicExceptions`).
+  property error_pages : ErrorPages
+  # Largest request body accepted; nil is unlimited, like Puma.
+  property max_body_bytes : Int32?
+
+  def initialize
+    @proxy = ProxyConfig.new
+    @force_ssl = false
+    @hsts = "max-age=63072000; includeSubDomains"
+    @session = SessionConfig.new
+    @forgery_protection_origin_check = true
+    @default_headers = rails_default_headers
+    @error_pages = ErrorPages.new
+    @max_body_bytes = nil
+  end
+
+  # Campfire's production settings: `assume_ssl` and `force_ssl` unless
+  # `DISABLE_SSL` is set (`reference/config/environments/production.rb`).
+  pub def self.production(disable_ssl : Bool) : KitConfig
+    config = KitConfig.new
+    config.proxy.assume_ssl = !disable_ssl
+    config.force_ssl = !disable_ssl
+    config
+  end
+end
+
+pub def rails_default_headers : Array(Tuple(String, String))
+  [
+    {"x-frame-options", "SAMEORIGIN"},
+    {"x-xss-protection", "0"},
+    {"x-content-type-options", "nosniff"},
+    {"x-permitted-cross-domain-policies", "none"},
+    {"referrer-policy", "strict-origin-when-cross-origin"},
+  ]
+end
+
+# Everything a request needs that outlives it.
+pub class Stack
+  getter config : KitConfig
+  # What cookies are signed and encrypted with.
+  getter secrets : Secrets
+  getter clock : Clock
+
+  def initialize(@config : KitConfig, @secrets : Secrets, @clock : Clock)
+  end
+end

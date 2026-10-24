@@ -1,0 +1,242 @@
+# What every action reaches for: the kit's stack, the database, the asset
+# digests and the fragment cache. One per kernel thread: nothing in it is
+# shared across threads.
+module config/app
+
+import std/text
+import rils/rails_compat/clock::{Clock}
+import rils/rails_compat/key_generator::{Secrets}
+import rils/record/database::{Database, Config, Env, RichText}
+import rils/record/events::{EventSink}
+import rils/kit/app::{Stack, KitConfig}
+import rils/kit/request::{Request}
+import rils/kit/ctx::{Ctx}
+import rils/kit/format::{HTML}
+import rils/kit/response::{Response, Parts, Rendered}
+import rils/assets/pipeline::{append_preload_links}
+import views/context::{ViewContext, AccountSummary, Assets, CurrentUser}
+import views/layouts::{write_in_layout}
+import rils/template/template::{Buffer}
+import models/account::{Account}
+import models/active_storage::{Attachment}
+import models/room::{Room}
+import rils/record/timestamp::{Timestamp}
+import rils/routes/paths::{fresh_account_logo_path}
+import views/helpers/user_paths::{to_fs_number}
+import rils/template/recorded::{Fragment}
+import views/messages/messages::{MessageFragmentKey}
+import rils/assets/assets::{Digests}
+import rils/kit/public_files::{PublicFiles}
+import rils/kit/exceptions::{ErrorPages}
+import std/file::{File}
+import rils/kit/response_cache::{ResponseCache}
+import models/action_text::{CampfireRichText}
+import rils/kit/rate_limit::{RateLimits}
+import rils/rails_compat/app_verifier::{app_verifier}
+import rils/storage/storage::{Storage}
+import rils/storage/disk::{DiskService}
+import models/application_platform::{ApplicationPlatform}
+import jobs/jobs::{Jobs}
+import channels/broadcasts::{Broadcasts}
+import rils/cable/pubsub::{PubSub}
+import integrations/net::{Http}
+import integrations/vapid::{Vapid}
+
+# `ENV[name].presence`
+def present_env(name : String) : String?
+  value = ENV[name]?
+  value && !value.blank? ? value : nil
+end
+
+# User-Agents `App#platform` keeps parsed.
+PLATFORMS = 256
+
+pub class App
+  getter stack : Stack
+  getter db : Database
+  getter digests : Digests
+  # `Rails.cache` for fragments: key => rendered fragment. Entries are
+  # never dropped; a version bump makes a new key.
+  getter fragments : Hash(MessageFragmentKey, Fragment)
+  # Whole authenticated responses, versioned by the database.
+  getter responses : ResponseCache
+  # `Rails.application.config.app_version` and `git_revision`.
+  getter app_version : String
+  getter git_revision : String?
+  # `rate_limit`'s counters (`Rails.cache`).
+  getter rate_limits : RateLimits
+  # Parsed User-Agents by header: a client sends the same one each time.
+  @platforms : Hash(String, ApplicationPlatform)
+  # Active Job's queue: the models' after-commit events go here.
+  getter jobs : Jobs
+  # Action Cable's pubsub, and the broadcasts made on it.
+  getter pubsub : PubSub
+  getter broadcasts : Broadcasts
+  # Outbound HTTP (webhooks, Web Push, link previews); tests swap it.
+  property http : Http
+  # `Rails.configuration.x.vapid`; nil turns Web Push off.
+  property vapid : Vapid?
+  @assets : Assets?
+  @public_files : PublicFiles?
+  @storage : Storage?
+  # Where Active Storage keeps files; nil is `files/` beside the database.
+  @storage_root : String?
+
+  def initialize(@stack : Stack, @db : Database, @app_version : String = "0", @git_revision : String? = nil, response_cache_bytes : Int64 = 64_i64 * 1024 * 1024, @storage_root : String? = nil)
+    @responses = ResponseCache.new(@db.path, response_cache_bytes)
+    @digests = Digests.new
+    @fragments = {} of MessageFragmentKey => Fragment
+    @rate_limits = RateLimits.new
+    @platforms = {} of String => ApplicationPlatform
+    @jobs = Jobs.new
+    @db.env.sink = @jobs
+    @pubsub = PubSub.new
+    @broadcasts = Broadcasts.new(@pubsub)
+    @http = Http.new
+    @vapid = Vapid.from(ENV["VAPID_PUBLIC_KEY"]?, ENV["VAPID_PRIVATE_KEY"]?)
+    @assets = nil
+    @public_files = nil
+    @storage = nil
+  end
+
+  # *prepare* loads the schema into an empty database (`db:prepare`); do it
+  # once, before the threads open their own.
+  pub def self.open(db_path : String, secret_key_base : String, config : KitConfig = KitConfig.new, prepare : Bool = false) : App
+    config.error_pages = error_pages if config.error_pages.pages.empty?
+    clock = Clock.new
+    secrets = Secrets.new(secret_key_base)
+    env = Env.new(clock, EventSink.new, CampfireRichText.new(secrets, clock))
+    db = Database.open(Config.new(db_path, prepare: prepare), env)
+    raise "can't open #{db_path}: #{db}" if db.is_a?(String)
+    # config/initializers/version.rb
+    git_revision = present_env("GIT_REVISION")
+    App.new(Stack.new(config, secrets, clock), db, present_env("APP_VERSION") || git_revision || "0", git_revision)
+  end
+
+  # `db:prepare` alone: the schema into an empty database, with none of
+  # the app (assets, caches, routes) built around it.
+  pub def self.prepare(db_path : String, secret_key_base : String) : Nil
+    clock = Clock.new
+    secrets = Secrets.new(secret_key_base)
+    env = Env.new(clock, EventSink.new, CampfireRichText.new(secrets, clock))
+    db = Database.open(Config.new(db_path, prepare: true), env)
+    raise "can't open #{db_path}: #{db}" if db.is_a?(String)
+    db.conn.close
+  end
+
+  pub def secrets : Secrets
+    @stack.secrets
+  end
+
+  # Active Storage's `local` Disk service, by default in `files/` beside
+  # the database (Rails keeps both under `storage/`), opened on first use.
+  pub def storage : Storage
+    @storage ||= Storage.new(DiskService.new(@storage_root || "#{File.dirname(@db.path)}/files", "local"), app_verifier(@stack.secrets, "ActiveStorage"))
+  end
+
+  # `public/` and the precompiled assets, written out on first use.
+  pub def public_files : PublicFiles
+    @public_files ||= PublicFiles.reference(@digests.load_path)
+  end
+
+  def assets : Assets
+    @assets ||= begin
+      digests = @digests
+      Assets.new(->(logical_path : String) { digests.path(logical_path) }, digests.importmap_tags, digests.stylesheet_tags)
+    end
+  end
+
+  # A page rendered in the application layout: HTML, and the `Link`
+  # header `stylesheet_link_tag` adds while it renders
+  # (`config.action_view.preload_links_header`). A `layout false` page or
+  # a turbo frame has no stylesheets, so it renders with `c.render`.
+  pub def render_page(c : Ctx, status : Int32, body : String | Parts | Rendered) : Response
+    c.set_header("link", append_preload_links(c.header("link") || "", @digests.stylesheet_preload_links))
+    c.render(status, HTML, body)
+  end
+
+  # A content template in its layout: the application layout, or
+  # turbo-rails' frame layout for a Turbo-Frame request, which has no
+  # stylesheets and so no `Link` header.
+  #
+  # The page is written when the response is sent, into its buffer on the
+  # request's tape (`Rendered`): none of its text goes to the heap.
+  pub def render_layout(c : Ctx, status : Int32, page_title : String?, body_class : String?, ctx : ViewContext, &render : Buffer -> Nil) : Response
+    frame = c.turbo_frame_request?
+    body = layout_body(ctx, page_title, body_class, frame, render)
+    frame ? c.render(status, HTML, body) : render_page(c, status, body)
+  end
+
+  # What *render* prints, as a body written when sent, into the response's
+  # buffer on the request's tape.
+  pub def written(render : Buffer -> Nil) : Rendered
+    Rendered.new(4096, ->(io : Str::Builder) { render.call(Buffer.new(io)) })
+  end
+
+  # The page *render* prints in its layout, as a body written when sent.
+  pub def layout_body(ctx : ViewContext, page_title : String?, body_class : String?, frame : Bool, render : Buffer -> Nil) : Rendered
+    Rendered.new(32768, ->(io : Str::Builder) {
+      write_in_layout(io, ctx, page_title, body_class, frame, render)
+    })
+  end
+
+  # The *user_agent*'s platform, parsed once; the oldest go when there are
+  # `PLATFORMS` of them.
+  pub def platform(user_agent : String) : ApplicationPlatform
+    if found = @platforms[user_agent]?
+      return found
+    end
+    @platforms.delete(@platforms.first_key) if @platforms.size >= PLATFORMS
+    @platforms[user_agent] = ApplicationPlatform.new(user_agent)
+  end
+
+  # The view context for a page in the layout: `Current.account` (blank
+  # before the first run), *current_user*, the flash the layout shows, and
+  # `platform`: the one `allow_browser` parsed, else the User-Agent's.
+  pub def layout_context(c : Ctx, current_user : CurrentUser? = nil, platform : ApplicationPlatform? = nil) : ViewContext
+    cookie = c.cookies["last_room"]
+    account, has_logo, last_room = @db.read do |conn|
+      found = Account.first(conn)
+      # `last_room_visited`: the cookie's room when the user is in it, else
+      # `Current.user.rooms.original`.
+      room = nil.as(Room?)
+      if current_user
+        if cookie && (room_id = cookie.to_i64?)
+          room = Room.find_for_user(conn, current_user.id, room_id)
+        end
+        room ||= Room.original_for_user(conn, current_user.id)
+      end
+      {found, found ? !Attachment.find_for(conn, "Account", found.id, "logo").nil? : false, room}
+    end
+    logo_url = fresh_account_logo_path(account ? to_fs_number(account.updated_at) : nil, nil)
+    summary = AccountSummary.new(account ? account.name : "", logo_url, has_logo)
+    request = c.request
+    ViewContext.new(summary, assets, current_user, flash_notice: c.flash.str("notice"), flash_alert: c.flash.str("alert"),
+      custom_styles: account ? account.custom_styles : nil, base_url: request.base_url, request_url: request.url,
+      referrer: request.header("referer"), app_version: @app_version, vapid_public_key: (vapid = @vapid) ? vapid.encoded_public_key : nil,
+      last_room_visited_id: last_room ? last_room.id : nil,
+      platform: (platform || self.platform(request.user_agent || "")).to_view)
+  end
+
+  # The view context of a render outside a request (a job's), as
+  # `ApplicationController.renderer` has it.
+  pub def detached_view_context : ViewContext
+    ViewContext.new(AccountSummary.new(""), assets, app_version: @app_version)
+  end
+
+  # The view context for *request*: no layout reads the account or the
+  # user yet, so neither is looked up.
+  pub def view_context(request : Request) : ViewContext
+    ViewContext.new(AccountSummary.new(""), assets, base_url: request.base_url, request_url: request.url, app_version: @app_version)
+  end
+end
+
+# `ActionDispatch::PublicExceptions`' pages, from reference/public.
+def error_pages : ErrorPages
+  pages = {} of Int32 => String
+  [404, 422, 500, 502].each do |status|
+    path = "#{__DIR__}/../reference/public/#{status}.html"
+    pages[status] = File.read(path) if File.exists?(path)
+  end
+  ErrorPages.new(pages)
+end

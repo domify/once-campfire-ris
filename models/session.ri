@@ -1,0 +1,83 @@
+# `reference/app/models/session.rb`
+module models/session
+
+import std/time::{Span}
+import rils/record/sqlite::{Connection, Row, SqlValue}
+import rils/record/timestamp::{Timestamp}
+import rils/record/database::{Tx}
+import rils/record/errors::{RecordNotFound}
+import rils/record/random::{base58}
+
+# `Session::ACTIVITY_REFRESH_RATE`
+pub ACTIVITY_REFRESH_RATE = Span.hours(1)
+
+pub SESSION_COLUMNS = %("sessions"."id", "sessions"."user_id", "sessions"."token", "sessions"."ip_address", "sessions"."user_agent", "sessions"."last_active_at", "sessions"."created_at", "sessions"."updated_at")
+
+pub class Session
+  getter id : Int64
+  getter user_id : Int64
+  getter token : String
+  getter ip_address : String?
+  getter user_agent : String?
+  getter last_active_at : Timestamp
+  getter created_at : Timestamp
+  getter updated_at : Timestamp
+
+  def initialize(@id : Int64, @user_id : Int64, @token : String, @ip_address : String?, @user_agent : String?, @last_active_at : Timestamp, @created_at : Timestamp, @updated_at : Timestamp)
+  end
+
+  pub def self.from_row(row : Row, offset : Int32 = 0) : Session
+    Session.new(row.int(offset), row.int(offset + 1), row.text(offset + 2), row.text?(offset + 3), row.text?(offset + 4), row.time(offset + 5), row.time(offset + 6), row.time(offset + 7))
+  end
+
+  pub def self.find(conn : Connection, id : Int64) : Session | RecordNotFound
+    conn.query_one(%(SELECT #{SESSION_COLUMNS} FROM "sessions" WHERE "sessions"."id" = ? LIMIT 1), [id] of SqlValue) { |row| Session.from_row(row) } || RecordNotFound.new("Session")
+  end
+
+  # `Session.find_by(token:)`
+  pub def self.find_by_token(conn : Connection, token : String) : Session?
+    conn.query_one(%(SELECT #{SESSION_COLUMNS} FROM "sessions" WHERE "sessions"."token" = ? LIMIT 1), [token] of SqlValue) { |row| Session.from_row(row) }
+  end
+
+  pub def self.for_user(conn : Connection, user_id : Int64) : Array(Session)
+    conn.query_all(%(SELECT #{SESSION_COLUMNS} FROM "sessions" WHERE "sessions"."user_id" = ?), [user_id] of SqlValue) { |row| Session.from_row(row) }
+  end
+
+  pub def self.count_for_user(conn : Connection, user_id : Int64) : Int64
+    conn.count(%(SELECT COUNT(*) FROM "sessions" WHERE "sessions"."user_id" = ?), [user_id] of SqlValue)
+  end
+
+  # `user.sessions.start!(user_agent:, ip_address:)`: a new 24-character
+  # base58 `has_secure_token`, and `last_active_at ||= Time.now` in
+  # `before_create`.
+  pub def self.start(tx : Tx, user_id : Int64, user_agent : String?, ip_address : String?) : Session
+    now = tx.now
+    last_active_at = tx.now
+    token = base58(24)
+    id = tx.conn.query_one(%(INSERT INTO "sessions" ("created_at", "ip_address", "last_active_at", "token", "updated_at", "user_agent", "user_id") VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING "id"), [now, ip_address, last_active_at, token, now, user_agent, user_id] of SqlValue) { |row| row.int(0) }
+    raise "insert into sessions returned no id" unless id
+    Session.new(id, user_id, token, ip_address, user_agent, last_active_at, now, now)
+  end
+
+  # Whether `resume` would refresh the session at *now*: its activity is
+  # over an hour old.
+  pub def needs_resume?(now : Timestamp) : Bool
+    @last_active_at < now.ago(ACTIVITY_REFRESH_RATE)
+  end
+
+  # `resume`: refreshes activity, user agent and IP at most once an hour.
+  pub def resume(tx : Tx, user_agent : String?, ip_address : String?) : Nil
+    now = tx.now
+    return unless needs_resume?(now)
+    @user_agent = user_agent
+    @ip_address = ip_address
+    @last_active_at = now
+    @updated_at = tx.now
+    tx.conn.execute(%(UPDATE "sessions" SET "ip_address" = ?, "last_active_at" = ?, "updated_at" = ?, "user_agent" = ? WHERE "sessions"."id" = ?), [@ip_address, @last_active_at, @updated_at, @user_agent, @id] of SqlValue)
+  end
+
+  # `destroy!`
+  pub def destroy(tx : Tx) : Nil
+    tx.conn.execute(%(DELETE FROM "sessions" WHERE "sessions"."id" = ?), [@id] of SqlValue)
+  end
+end

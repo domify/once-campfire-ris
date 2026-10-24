@@ -1,0 +1,46 @@
+# A request's reads share one transaction; writes, a release and the
+# request's end close it.
+module test/models/database_test
+
+import rils/rails_compat/clock::{Clock}
+import rils/record/database::*
+import rils/record/events::{RecordingSink}
+import rils/record/sqlite::{SqlValue}
+
+db = Database.open(Config.new(":memory:"), Env.new(Clock.new, RecordingSink.new, RichText.new, 4))
+raise db if db.is_a?(String)
+count = ->(db : Database) { db.read { |c| c.query_one(%(SELECT COUNT(*) FROM "users"), [] of SqlValue) { |row| row.int(0) } } }
+
+# Outside a request, each read is its own.
+count.call(db)
+assert db.conn.autocommit?
+
+# The first read in a request begins the transaction; the rest join it.
+db.enter
+assert db.conn.autocommit?
+count.call(db)
+assert !db.conn.autocommit?
+count.call(db)
+assert !db.conn.autocommit?
+
+# A write ends it first, and the next read begins a new one.
+db.write { |tx| tx.conn.execute(%(DELETE FROM "users" WHERE "id" = 0), [] of SqlValue) }
+assert db.conn.autocommit?
+count.call(db)
+assert !db.conn.autocommit?
+
+# Before parking, and when the request ends.
+db.release
+assert db.conn.autocommit?
+count.call(db)
+db.leave
+assert db.conn.autocommit?
+count.call(db)
+assert db.conn.autocommit?
+
+# A request that panicked left its read open: the next one rolls it back.
+db.enter
+count.call(db)
+db.enter
+assert db.conn.autocommit?
+db.leave

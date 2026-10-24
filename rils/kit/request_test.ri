@@ -1,0 +1,60 @@
+# The Rust port's request tests: remote IP, host and protocol.
+module rils/kit/request_test
+
+import rils/kit/request::*
+import rils/kit/response::{HeaderList}
+import rils/kit/errors::{HttpError}
+import rils/ruby/ipaddr::{parse_ipaddr}
+import web/web/spec::*
+
+def request(headers : Array(Tuple(String, String)), peer : String, proxy : ProxyConfig = ProxyConfig.new) : Request
+  list = HeaderList.new
+  headers.each { |pair| list.append(pair[0], pair[1]) }
+  Request.new("GET", "GET", "/rooms/1", "x=1", list, peer, "", proxy)
+end
+
+def remote(r : Request) : String
+  ip = r.remote_ip
+  ip.is_a?(HttpError) ? "spoofed" : ip
+end
+
+describe "requests" do
+  it "skip trusted proxies for the remote IP" do
+    assert remote(request([{"x-forwarded-for", "203.0.113.9, 10.0.0.2"}], "127.0.0.1")) == "203.0.113.9"
+    assert remote(request([] of Tuple(String, String), "198.51.100.7")) == "198.51.100.7"
+    # As in Rails, a forwarded address is believed even from a public peer:
+    # `remote_ip` is only as trustworthy as the proxy in front.
+    assert remote(request([{"x-forwarded-for", "203.0.113.9"}], "198.51.100.7")) == "203.0.113.9"
+    assert remote(request([{"x-forwarded-for", "10.0.0.3"}], "127.0.0.1")) == "10.0.0.3"
+    assert remote(request([{"forwarded", "for=\"[2001:db8::1]:4711\""}], "::1")) == "2001:db8::1"
+  end
+
+  it "check for IP spoofing" do
+    assert remote(request([{"client-ip", "1.1.1.1"}, {"x-forwarded-for", "2.2.2.2"}], "127.0.0.1")) == "spoofed"
+    assert remote(request([{"client-ip", "2.2.2.2"}, {"x-forwarded-for", "2.2.2.2"}], "127.0.0.1")) == "2.2.2.2"
+  end
+
+  it "know their host and protocol" do
+    r = request([{"host", "chat.example.com:3000"}], "127.0.0.1")
+    assert r.host == "chat.example.com"
+    assert r.port == 3000
+    assert r.base_url == "http://chat.example.com:3000"
+    assert r.url == "http://chat.example.com:3000/rooms/1?x=1"
+
+    r = request([{"host", "internal:80"}, {"x-forwarded-host", "a.example, chat.example.com"}, {"x-forwarded-proto", "https"}], "127.0.0.1")
+    assert r.host == "chat.example.com"
+    assert r.ssl?
+    assert r.base_url == "https://chat.example.com"
+
+    r = request([{"host", "chat.example.com"}], "127.0.0.1", ProxyConfig.new(assume_ssl: true))
+    assert r.base_url == "https://chat.example.com"
+  end
+
+  it "match IP networks" do
+    net = IpNet.parse("172.16.0.0/12")
+    assert net.includes?(parse_ipaddr("172.31.255.1") || raise("ip"))
+    assert !net.includes?(parse_ipaddr("172.32.0.1") || raise("ip"))
+    net = IpNet.parse("fc00::/7")
+    assert net.includes?(parse_ipaddr("fd12::1") || raise("ip"))
+  end
+end

@@ -1,0 +1,86 @@
+# The Rust port's unit tests for the JSON writer, Base64 and Marshal, each
+# value checked in the reference.
+module rils/rails_compat/units_test
+
+import std/traits
+import std/json::{JSON, Any}
+import rils/rails_compat/json::{generate, encode, float}
+import rils/rails_compat/encoding::{urlsafe_decode}
+import rils/rails_compat/marshal::{marshal_string}
+import rils/rails_compat/signed_id::{combine_purposes}
+import rils/rails_compat/global_id::{GlobalId}
+import rils/rails_compat/clock::{iso8601_millis, parse_timestamp}
+import rils/rails_compat/crypto::{Digest, HmacKey, hmac, hmac_hex_matches?, hex}
+
+def json(text : String) : Any
+  JSON.parse(text)
+end
+
+# Escapes HTML entities but not separators or slashes.
+assert encode(json(%({"key":"<a href=\\"/x\\">&</a>\u2028"}))) == "{\"key\":\"\\u003ca href=\\\"/x\\\"\\u003e\\u0026\\u003c/a\\u003e\u2028\"}"
+assert generate(Any.new("<&>")) == "\"<&>\""
+assert encode(Any.new("<a href=\"x\">&'\u2028é\n\t\u0001\u007f/</a>")) == "\"\\u003ca href=\\\"x\\\"\\u003e\\u0026'\u2028é\\n\\t\\u0001\u007f/\\u003c/a\\u003e\""
+# Escapes control characters like the json gem.
+assert encode(Any.new("\u001f\n\t\u0008\u000c\u007fé")) == "\"\\u001f\\n\\t\\b\\f\u007fé\""
+
+# Floats as JSON.generate and ActiveSupport::JSON.encode write them in the
+# reference (json 2.21.2).
+[
+  {320.0, "320.0"}, {65.84, "65.84"}, {-2.5, "-2.5"}, {0.0, "0.0"}, {-0.0, "-0.0"},
+  {0.1, "0.1"}, {0.0001, "0.0001"}, {0.00001, "0.00001"}, {1.25e-5, "0.0000125"},
+  {1.5e-7, "0.00000015"}, {-1.5e-7, "-0.00000015"}, {1e-7, "0.0000001"},
+  {1.2e-9, "0.0000000012"}, {1.23456789012e-8, "0.0000000123456789012"},
+  {1e-10, "1e-10"}, {5e-324, "5e-324"}, {1e14, "100000000000000.0"},
+  {-1e14, "-100000000000000.0"}, {123456789012345.6, "123456789012345.6"},
+  {1e15, "1e+15"}, {-1e15, "-1e+15"}, {1.5e15, "1.5e+15"},
+  {1234567890123456.0, "1.234567890123456e+15"}, {9007199254740992.0, "9.007199254740992e+15"},
+  {1e16, "1e+16"}, {12345678901234567.0, "1.2345678901234568e+16"}, {1e21, "1e+21"},
+  {1e100, "1e+100"}, {1.7976931348623157e308, "1.7976931348623157e+308"},
+].each do |pair|
+  value, expected = pair
+  raise "float #{value}: #{float(value)} not #{expected}" unless float(value) == expected
+  raise "encoded [#{value}]" unless encode(Any.new([Any.new(value)])) == "[#{expected}]"
+end
+assert encode(json(%({"a":1e16,"b":[1e-5]}))) == %({"a":1e+16,"b":[0.00001]})
+
+# `urlsafe_decode64` is lenient like Ruby's.
+assert urlsafe_decode("QQ") == "A"
+assert urlsafe_decode("QQ==") == "A"
+assert urlsafe_decode("QQ=").nil?
+assert urlsafe_decode("QR").nil?
+assert urlsafe_decode("a+b/") == urlsafe_decode("a-b_")
+
+# Marshal.dump("gid://campfire/User/1"), a 300-byte string's two-byte
+# length, and an Integer refused.
+assert marshal_string("\x04\x08I\"\x1agid://campfire/User/1\x06:\x06ET") == "gid://campfire/User/1"
+long = marshal_string("\x04\x08I\"\x02\x2c\x01" + "x" * 300)
+assert !long.nil? && long.bytesize == 300
+assert marshal_string("\x04\x08i\x06").nil?
+
+assert combine_purposes("User", "avatar") == "user/avatar"
+assert combine_purposes("User", nil) == "user"
+assert combine_purposes("Rooms::Open", "") == "rooms/open"
+assert combine_purposes("HTTPRequest", "x") == "http_request/x"
+
+gid = GlobalId.parse("gid://campfire/Rooms::Open/1?expires_in")
+assert !gid.nil? && gid == GlobalId.new("Rooms::Open", 1)
+assert !gid.nil? && gid.to_param == "Z2lkOi8vY2FtcGZpcmUvUm9vbXM6Ok9wZW4vMQ"
+assert GlobalId.parse("gid://campfire/User").nil?
+
+# `Time#iso8601(3)` truncates to milliseconds.
+t = parse_timestamp("2026-01-01T12:00:00.123999Z")
+assert !t.nil? && iso8601_millis(t) == "2026-01-01T12:00:00.123Z"
+t = parse_timestamp("2046-01-01T12:00:00Z")
+assert !t.nil? && iso8601_millis(t) == "2046-01-01T12:00:00.000Z"
+
+# HmacKey's pads give OpenSSL's HMAC, short keys and keys past a block,
+# SHA-1 and SHA-256, the whole data and a prefix.
+["k", "a" * 64, "long key " * 20].each do |key|
+  [Digest::Sha1, Digest::Sha256].each do |digest|
+    data = "message--with a tail"
+    expected = hex(hmac(digest, key, data[0, 7]))
+    hmac_key = HmacKey.new(digest, key)
+    assert hmac_hex_matches?(hmac_key, data, 7, expected.as_tape)
+    assert !hmac_hex_matches?(hmac_key, data, 8, expected.as_tape)
+  end
+end

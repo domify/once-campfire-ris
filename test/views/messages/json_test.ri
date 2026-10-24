@@ -1,0 +1,38 @@
+# The Jbuilder views against the reference's responses (vectors/views_b),
+# byte for byte.
+module test/views/messages/json_test
+
+import std/json::{Any}
+import views/messages/json::{UserJson, MessageJson, BoostJson, by_bots_index, by_bots_show, boosts_by_bots_show}
+import test/views/golden_b::*
+import test/views/testing::{assert_same}
+import web/web/spec::*
+
+def user_json(json : Any) : UserJson
+  UserJson.new(json["id"].as_i64, json["name"].as_s, json["role"].as_s, json["avatar_url"].as_s)
+end
+
+def message_json(json : Any) : MessageJson
+  MessageJson.new(json["id"].as_i64, parse_utc(json["created_at"].as_s), json["body"]["plain_text"].as_s, json["body"]["html"].as_s,
+    user_json(json["creator"]), json["room"]["id"].as_i64, json["url"].as_s)
+end
+
+describe "message JSON views" do
+  it "render messages/by_bots/index as the reference does" do
+    golden = GoldenB.new("messages_by_bots_index")
+    assert_same(golden.name, golden.json["raw"].as_s, by_bots_index(golden.input.as_a.map { |m| message_json(m) }))
+  end
+
+  it "render messages/by_bots/show as the reference does" do
+    golden = GoldenB.new("messages_by_bots_show")
+    assert_same(golden.name, golden.json["raw"].as_s, by_bots_show(message_json(golden.input)))
+  end
+
+  it "render messages/boosts/by_bots/show as the reference does" do
+    golden = GoldenB.new("messages_boosts_by_bots_show")
+    b = golden.input
+    boost = BoostJson.new(b["id"].as_i64, b["content"].as_s, parse_utc(b["created_at"].as_s), user_json(b["booster"]),
+      b["message"]["id"].as_i64, b["message"]["url"].as_s)
+    assert_same(golden.name, golden.json["raw"].as_s, boosts_by_bots_show(boost))
+  end
+end

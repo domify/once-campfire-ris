@@ -1,0 +1,10 @@
+<%# a comment -%>
+<% content_for "head" do %><title><%= title %></title><% end -%>
+<p class="<%= klass %>"><%= name %> & <%== "<b>raw</b>" %> <%= bold("x<y") %></p>
+<%- items.each do |item| %>
+  <li><%= item %></li>
+<%- end %>
+<% if items.size > 1 %>many<% else %>few<% end %>
+<%= wrap("div") do %><i><%= name %></i><% end %>
+<% include "engine/_part.html.erb" %>
+<%= fragment %>|<%= capture do %>[<%= fragment %>]<% end %>

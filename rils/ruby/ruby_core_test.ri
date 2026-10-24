@@ -1,0 +1,72 @@
+# Every function against what Ruby, Rack, Active Record and Addressable
+# answer in the reference (`vectors/ruby_core.json`, written by
+# `reference-tools/ruby_core.rb`). Each check lists every input it gets
+# wrong, not just the first.
+module rils/ruby/ruby_core_test
+
+import std/file::{File}
+import std/json::{JSON}
+import std/text
+import rils/ruby/erb::{html_escape}
+import rils/ruby/floats::{to_f, float_to_s}
+import rils/ruby/integers::{to_i, to_i_checked, integer_cast}
+import rils/ruby/rack::{byte_ranges}
+import rils/ruby/text::{strip}
+import rils/ruby/uri::{cgi_escape, url_encode}
+
+VECTORS = JSON.parse(File.read("#{__DIR__}/../../vectors/ruby_core.json"))
+
+class Mismatches
+  getter lines : Array(String)
+
+  def initialize
+    @lines = [] of String
+  end
+
+  def check(function : String, input : String, ours : String, ruby : String) : Nil
+    @lines << "#{function}(#{input}) is #{ours}, Ruby's #{ruby}" unless ours == ruby
+  end
+end
+
+failures = Mismatches.new
+
+VECTORS["strings"].as_a.each do |item|
+  input = item["input"].as_s
+  shown = input.inspect
+  ruby_i = item["to_i"].as_s
+  checked = ruby_i.to_i64?
+  failures.check("to_i_checked", shown, to_i_checked(input).inspect, checked.inspect)
+  if checked.nil?
+    failures.check("to_i saturated", shown, to_i(input).to_s, ruby_i.starts_with?('-') ? -9223372036854775808_i64.to_s : 9223372036854775807_i64.to_s)
+  else
+    failures.check("to_i", shown, to_i(input).to_s, ruby_i)
+  end
+  cast = item["integer_cast"].as_s?
+  failures.check("integer_cast", shown, integer_cast(input).inspect, (cast ? cast.to_i64? : nil).inspect)
+  failures.check("to_f", shown, IyiFloatText.bits_of(to_f(input)).to_s, IyiFloatText.bits_of(item["to_f"].as_s.to_f).to_s)
+  failures.check("strip", shown, strip(input), item["strip"].as_s)
+  failures.check("html_escape", shown, html_escape(input), item["html_escape"].as_s)
+  failures.check("cgi_escape", shown, cgi_escape(input), item["cgi_escape"].as_s)
+  failures.check("url_encode", shown, url_encode(input), item["url_encode"].as_s)
+  failures.check("addressable_unreserved", shown, url_encode(input), item["addressable_unreserved"].as_s)
+end
+
+VECTORS["floats"].as_a.each do |item|
+  bits = item["bits"].as_s
+  value = IyiFloatText.from_bits(bits.to_u64(16))
+  failures.check("float_to_s", bits, float_to_s(value), item["to_s"].as_s)
+end
+
+VECTORS["byte_ranges"].as_a.each do |item|
+  header = item["header"].as_s?
+  size = item["size"].as_i64
+  ruby = item["ranges"].as_a?
+  expected = ruby ? ruby.map { |range| {range.as_a[0].as_i64, range.as_a[1].as_i64} }.inspect : "nil"
+  failures.check("byte_ranges", "#{header.inspect}, #{size}", byte_ranges(header, size).inspect, expected)
+end
+
+unless failures.lines.empty?
+  puts "#{failures.lines.size} mismatches:"
+  failures.lines.first(40).each { |line| puts line }
+  exit 1
+end

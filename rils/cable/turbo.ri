@@ -1,0 +1,67 @@
+# turbo-rails' stream tags (`Turbo::Streams::ActionHelper`) and
+# `Turbo::StreamsChannel.broadcast_*_to`, over a `PubSub`.
+module rils/cable/turbo
+
+import std/text
+import rils/template/html::{escape}
+import rils/rails_compat/json::{encode_string}
+import rils/cable/naming::{stream_name_from}
+import rils/cable/pubsub::{PubSub}
+
+pub enum Action
+  Append
+  Prepend
+  Replace
+  Update
+  Remove
+  Before
+  After
+  Refresh
+
+  def name : String
+    case self
+    when Action::Append  then "append"
+    when Action::Prepend then "prepend"
+    when Action::Replace then "replace"
+    when Action::Update  then "update"
+    when Action::Remove  then "remove"
+    when Action::Before  then "before"
+    when Action::After   then "after"
+    else                      "refresh"
+    end
+  end
+end
+
+# `turbo_stream_action_tag(action, target:, template:, **attributes)`.
+# Extra attributes come first, then `action`, then `target`, as the tag
+# helper's hash is built. Names are used as given (`maintain_scroll: true`
+# renders `maintain_scroll="true"`); a nil value leaves the attribute out.
+# *template* is already-safe HTML; `remove` and `refresh` never carry one.
+pub def action_tag(action : Action, target : String?, template : String? = nil, attributes : Array(Tuple(String, String?)) = [] of Tuple(String, String?)) : String
+  String.build do |io|
+    io << "<turbo-stream"
+    attributes.each do |name, value|
+      attribute(io, name, value) if value
+    end
+    attribute(io, "action", action.name)
+    attribute(io, "target", target) if target
+    io << '>'
+    unless action == Action::Remove || action == Action::Refresh
+      io << "<template>" << (template || "") << "</template>"
+    end
+    io << "</turbo-stream>"
+  end
+end
+
+def attribute(io : String::Builder, name : String, value : String) : Nil
+  io << ' ' << name << "=\"" << escape(value) << '"'
+end
+
+# `broadcast_action_to(*streamables, action:, target:, html:, attributes:)`:
+# blank streamables are dropped, and nothing goes out if none remain. The
+# tag is a string message, so subscribers get it JSON-encoded.
+pub def broadcast_action_to(pubsub : PubSub, streamables : Array(String), action : Action, target : String?, html : String? = nil, attributes : Array(Tuple(String, String?)) = [] of Tuple(String, String?)) : Int32
+  parts = streamables.reject(&.blank?)
+  return 0 if parts.empty?
+  pubsub.broadcast(stream_name_from(parts), encode_string(action_tag(action, target, html, attributes)))
+end

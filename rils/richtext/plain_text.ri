@@ -1,0 +1,122 @@
+# `ActionText::PlainTextConversion` (the Rust port's
+# richtext/src/plain_text.rs): a bottom-up reduction keyed on each node's
+# name.
+module rils/richtext/plain_text
+
+import std/int
+import rils/richtext/nodes::{Html}
+import rils/richtext/chars::{chomp_newlines, blank?, char_at, char_start_before}
+
+# `PlainTextConversion.node_to_plain_text`
+pub def node_to_plain_text(tree : Html, node : Int32) : Str
+  chomp_newlines(plain_text_for(tree, node))
+end
+
+private def child_values(tree : Html, node : Int32) : Str
+  writer = Str::Builder.new(64)
+  child = tree.first_child(node)
+  while child >= 0
+    writer << plain_text_for(tree, child)
+    child = tree.next_sibling(child)
+  end
+  writer.finish
+end
+
+private def plain_text_for(tree : Html, node : Int32) : Str
+  name = tree.node_name(node)
+  if name == "script" || name == "style" || name == "unsupported"
+    "".as_tape
+  elsif name == "h1" || name == "p"
+    block(child_values(tree, node))
+  elsif name == "ul" || name == "ol"
+    text = block(child_values(tree, node))
+    return text unless list_depth(tree, node) > 0
+    joined("\n", text, "")
+  elsif name == "br"
+    "\n".as_tape
+  elsif name == "text"
+    # Text nodes, and elements that happen to be named "text" (SVG's)
+    chomp_newlines(tree.text_content(node))
+  elsif name == "div"
+    joined("", chomp_newlines(child_values(tree, node)), "\n")
+  elsif name == "figcaption"
+    joined("[", chomp_newlines(child_values(tree, node)), "]")
+  elsif name == "blockquote"
+    blockquote(block(child_values(tree, node)))
+  elsif name == "li"
+    depth = list_depth(tree, node)
+    writer = Str::Builder.new(64)
+    (depth - 1).times { writer << "  " } if depth > 1
+    bullet(tree, node, writer)
+    writer << ' ' << chomp_newlines(child_values(tree, node)) << '\n'
+    writer.finish
+  else
+    child_values(tree, node)
+  end
+end
+
+private def joined(before : ::String, text : Str, after : ::String) : Str
+  writer = Str::Builder.new(text.bytesize + 2)
+  writer << before << text << after
+  writer.finish
+end
+
+private def block(text : Str) : Str
+  joined("", chomp_newlines(text), "\n\n")
+end
+
+# `text.insert(text.rindex(/\S/) + 1, "”")`, then `text.index(/\S/)` for
+# "“"; "“”" for blank text.
+private def blockquote(text : Str) : Str
+  return "“”".as_tape if blank?(text)
+  last = -1
+  at = text.bytesize
+  while at > 0
+    start = char_start_before(text, at)
+    unless ruby_space?(text[start])
+      last = at
+      break
+    end
+    at = start
+  end
+  first = -1
+  i = 0
+  while i < text.bytesize
+    unless ruby_space?(text[i])
+      first = i
+      break
+    end
+    i = i + 1
+  end
+  writer = Str::Builder.new(text.bytesize + 6)
+  if last < 0
+    writer << text
+    return writer.finish
+  end
+  writer << text[0, first] << "“" << text[first, last - first] << "”" << text[last, text.bytesize - last]
+  writer.finish
+end
+
+private def ruby_space?(byte : UInt8) : Bool
+  byte == 0x20_u8 || byte == 0x09_u8 || byte == 0x0a_u8 || byte == 0x0b_u8 || byte == 0x0c_u8 || byte == 0x0d_u8
+end
+
+private def list?(tree : Html, node : Int32) : Bool
+  name = tree.node_name(node)
+  name == "ul" || name == "ol"
+end
+
+private def list_depth(tree : Html, node : Int32) : Int32
+  tree.ancestors(node).count { |a| list?(tree, a) }
+end
+
+private def bullet(tree : Html, node : Int32, writer : Str::Builder) : Nil
+  list = tree.ancestors(node).find { |a| list?(tree, a) }
+  if list && tree.node_name(list) == "ol"
+    parent = tree.parent(node)
+    index = parent >= 0 ? (tree.element_children(parent).index(node) || 0) : 0
+    writer << (index + 1) << '.'
+  else
+    writer << "•"
+  end
+end

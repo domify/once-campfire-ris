@@ -1,0 +1,218 @@
+# The canonical token stream of an HTML page that the Rust port's views
+# goldens (`golden/b`, `reference-tools/views/b/canonical.rb`) hold: start
+# tags with their attributes as written (minus repeats), end tags, and
+# text with entities decoded and whitespace runs collapsed, as `#text`.
+# For our own well-formed output; an end tag closes what's open inside it,
+# as the HTML parser does.
+module test/views/dom
+
+import std/text
+import std/indexable
+
+pub VOID     = ["area", "base", "br", "col", "embed", "hr", "img", "input", "keygen", "link", "meta", "source", "track", "wbr"]
+RAW_TEXT = ["script", "style", "textarea", "title"]
+
+pub def tokens(html : String) : Array(String)
+  stream = [] of String
+  bytes = html.bytes
+  size = bytes.size
+  i = 0
+  text = [] of String
+  open = [] of String
+  while i < size
+    if bytes[i] == '<'.ord
+      if html.byte_index("<!--", i) == i
+        flush(text, stream)
+        stop = html.byte_index("-->", i)
+        i = stop ? stop + 3 : size
+        next
+      end
+      if html.byte_index("<!", i) == i
+        flush(text, stream)
+        stop = html.byte_index(">", i)
+        i = stop ? stop + 1 : size
+        next
+      end
+      if html.byte_index("</", i) == i
+        flush(text, stream)
+        stop = html.byte_index(">", i) || raise "unclosed end tag"
+        name = html[i + 2, stop - i - 2].strip.split(' ')[0].downcase
+        if depth = open.rindex(name)
+          while open.size > depth
+            stream << "</#{open.pop}>"
+          end
+        end
+        i = stop + 1
+        next
+      end
+      if i + 1 < size && ascii_letter?(bytes[i + 1])
+        flush(text, stream)
+        token, name, stop = start_tag(html, bytes, i)
+        stream << token unless token.empty?
+        i = stop
+        open << name unless VOID.includes?(name)
+        if RAW_TEXT.includes?(name)
+          close = html.downcase.byte_index("</#{name}", i) || size
+          raw = html[i, close - i]
+          push_text(stream, name == "script" || name == "style" ? raw : decode(raw)) unless raw.empty?
+          i = close
+        end
+        next
+      end
+    end
+    following = html.byte_index("<", i + 1) || size
+    text << html[i, following - i]
+    i = following
+  end
+  flush(text, stream)
+  until open.empty?
+    stream << "</#{open.pop}>"
+  end
+  stream.reject { |token| token == "#" }
+end
+
+def flush(text : Array(String), stream : Array(String)) : Nil
+  return if text.empty?
+  push_text(stream, decode(text.join))
+  text.clear
+end
+
+# Text, collapsed, merged into the text token before it.
+pub def push_text(stream : Array(String), text : String) : Nil
+  collapsed = collapse(text)
+  last = stream.last?
+  if last && last.starts_with?('#')
+    stream[stream.size - 1] = "#" + collapse(last[1, last.bytesize - 1] + collapsed)
+  else
+    stream << "#" + collapsed
+  end
+end
+
+def collapse(text : String) : String
+  String.build(text.bytesize) do |io|
+    in_space = false
+    text.each_char do |c|
+      if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f'
+        io << ' ' unless in_space
+        in_space = true
+      else
+        io << c
+        in_space = false
+      end
+    end
+  end
+end
+
+def ascii_letter?(byte : UInt8) : Bool
+  (byte >= 'a'.ord && byte <= 'z'.ord) || (byte >= 'A'.ord && byte <= 'Z'.ord)
+end
+
+def ascii_space?(byte : UInt8) : Bool
+  byte == ' '.ord || byte == '\t'.ord || byte == '\n'.ord || byte == '\r'.ord || byte == '\f'.ord
+end
+
+# The start tag at *start*: its canonical token (empty for a forgery
+# token, which Rails renders and this app doesn't), its name, and where it
+# ends.
+def start_tag(html : String, bytes : Array(UInt8), start : Int32) : Tuple(String, String, Int32)
+  size = bytes.size
+  i = start + 1
+  name_end = i
+  while name_end < size && !ascii_space?(bytes[name_end]) && bytes[name_end] != '>'.ord && bytes[name_end] != '/'.ord
+    name_end += 1
+  end
+  name = html[i, name_end - i].downcase
+  i = name_end
+  attrs = [] of Tuple(String, String)
+  loop do
+    while i < size && (ascii_space?(bytes[i]) || bytes[i] == '/'.ord)
+      i += 1
+    end
+    if i >= size || bytes[i] == '>'.ord
+      i += 1
+      break
+    end
+    key_end = i
+    while key_end < size && !ascii_space?(bytes[key_end]) && bytes[key_end] != '='.ord && bytes[key_end] != '>'.ord
+      key_end += 1
+    end
+    key = html[i, key_end - i].downcase
+    i = key_end
+    while i < size && ascii_space?(bytes[i])
+      i += 1
+    end
+    value = ""
+    if i < size && bytes[i] == '='.ord
+      i += 1
+      while i < size && ascii_space?(bytes[i])
+        i += 1
+      end
+      if bytes[i] == '"'.ord || bytes[i] == '\''.ord
+        quote = bytes[i] == '"'.ord ? "\"" : "'"
+        stop = html.byte_index(quote, i + 1) || raise "unclosed attribute"
+        value = decode(html[i + 1, stop - i - 1])
+        i = stop + 1
+      else
+        stop = i
+        while stop < size && !ascii_space?(bytes[stop]) && bytes[stop] != '>'.ord
+          stop += 1
+        end
+        value = decode(html[i, stop - i])
+        i = stop
+      end
+    end
+    attrs << {key, value} unless attrs.any? { |(k, _)| k == key }
+  end
+  named = ->(wanted : String) { attrs.any? { |(k, v)| k == "name" && v == wanted } }
+  if (name == "input" && named.call("authenticity_token")) || (name == "meta" && (named.call("csrf-token") || named.call("csrf-param")))
+    return {"", name, i}
+  end
+  rendered = String.build do |io|
+    attrs.each { |(k, v)| io << ' ' << k << "=\"" << v.gsub("&", "&amp;").gsub("\"", "&quot;").gsub("<", "&lt;") << '"' }
+  end
+  {"<#{name}#{rendered}>", name, i}
+end
+
+# Character references, as the parser decodes them; an unknown one stays.
+def decode(text : String) : String
+  return text unless text.includes?("&")
+  String.build(text.bytesize) do |io|
+    rest = text
+    while amp = rest.byte_index("&")
+      io << rest[0, amp]
+      rest = rest[amp, rest.bytesize - amp]
+      window = rest[0, rest.bytesize < 12 ? rest.bytesize : 12]
+      semi = window.byte_index(";")
+      decoded = semi ? entity(rest[1, semi - 1]) : nil
+      if semi && decoded
+        io << decoded
+        rest = rest[semi + 1, rest.bytesize - semi - 1]
+      else
+        io << '&'
+        rest = rest[1, rest.bytesize - 1]
+      end
+    end
+    io << rest
+  end
+end
+
+def entity(name : String) : String?
+  case name
+  when "amp"  then "&"
+  when "lt"   then "<"
+  when "gt"   then ">"
+  when "quot" then "\""
+  when "apos" then "'"
+  when "nbsp" then " "
+  else
+    if name.starts_with?("#x") || name.starts_with?("#X")
+      code = name[2, name.bytesize - 2].to_i64?(16)
+      code ? code.to_i32.chr.to_s : nil
+    elsif name.starts_with?("#")
+      code = name[1, name.bytesize - 1].to_i64?
+      code ? code.to_i32.chr.to_s : nil
+    else
+      nil
+    end
+  end
+end

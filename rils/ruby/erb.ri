@@ -1,0 +1,31 @@
+# `ERB::Util.html_escape` (and `h`): `& < > " '` become
+# `&amp; &lt; &gt; &quot; &#39;`.
+module rils/ruby/erb
+
+pub def html_escape(s : String) : String
+  String.build(s.bytesize + 16) { |io| write_html_escaped(io, s) }
+end
+
+# Writes the text between the escaped bytes a run at a time. The five are
+# ASCII, so they're never part of a multibyte character.
+pub def write_html_escaped(io : String::Builder, s : String) : Nil
+  last = 0
+  index = 0
+  while index < s.bytesize
+    replacement = case s[index]
+                  when '&'  then "&amp;"
+                  when '<'  then "&lt;"
+                  when '>'  then "&gt;"
+                  when '"'  then "&quot;"
+                  when '\'' then "&#39;"
+                  else nil
+                  end
+    if replacement
+      io << s[last, index - last]
+      io << replacement
+      last = index + 1
+    end
+    index += 1
+  end
+  io << s[last, s.bytesize - last]
+end

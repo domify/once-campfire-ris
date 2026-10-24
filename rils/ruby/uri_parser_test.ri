@@ -1,0 +1,35 @@
+# `URI.parse` as Ruby's uri 1.1 does it, the cases the Rust port probed.
+module rils/ruby/uri_parser_test
+
+import rils/ruby/uri_parser::*
+import web/web/spec::*
+
+def parsed(text : String) : Uri
+  found = parse_uri(text)
+  raise "#{text} didn't parse" if found.is_a?(UriError)
+  found
+end
+
+describe "URI.parse" do
+  it "parses like Ruby" do
+    uri = parsed("https://x.com/dhh/status/1?s=20")
+    assert uri.host == "x.com"
+    assert uri.query == "s=20"
+    assert parse_uri("http://exa mple.com/ ").is_a?(UriError)
+    assert parsed("https:/rooms/1").host.nil?
+    assert parsed("https:rooms/1").opaque == "rooms/1"
+    assert parsed("https://").host == ""
+    assert parsed("http://[::1]/x").host == "[::1]"
+    mailto = parse_uri("mailto:foo")
+    assert mailto.is_a?(UriError) && mailto.component
+    assert parsed("mailto:a@b.com").opaque == "a@b.com"
+    assert parsed("https://x.com:443/a").to_s == "https://x.com/a"
+  end
+
+  it "downcases the scheme" do
+    assert parsed("HTTPS://x.com/a").scheme == "https"
+    assert parsed("HTTP://X.com:80/a").to_s == "http://X.com/a"
+    assert parsed("FILE:///etc").to_s == "file:///etc"
+    assert parsed("MailTo:a@b.com").to_s == "mailto:a@b.com"
+  end
+end

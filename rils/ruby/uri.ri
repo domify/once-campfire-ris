@@ -1,0 +1,40 @@
+# `CGI.escape` and `ERB::Util.url_encode`.
+module rils/ruby/uri
+import std/text
+import std/int
+
+HEX = "0123456789ABCDEF"
+
+# `CGI.escape`: everything but `A-Za-z0-9_.-~` is percent-encoded, and a
+# space becomes `+`.
+pub def cgi_escape(s : String) : String
+  percent_encode(s, true)
+end
+
+# `ERB::Util.url_encode`: everything but `A-Za-z0-9_.-~` is percent-encoded,
+# a space as `%20`. Addressable's `encode_component(s, UNRESERVED)` keeps the
+# same set.
+pub def url_encode(s : String) : String
+  percent_encode(s, false)
+end
+
+def percent_encode(s : String, space_as_plus : Bool) : String
+  String.build(s.bytesize + 8) do |io|
+    s.each_byte do |byte|
+      if unreserved?(byte)
+        io.write_byte(byte)
+      elsif byte == 32 && space_as_plus
+        io << '+'
+      else
+        io << '%'
+        io.write_byte(HEX.as_tape[(byte >> 4).to_i32])
+        io.write_byte(HEX.as_tape[(byte & 15).to_i32])
+      end
+    end
+  end
+end
+
+def unreserved?(byte : UInt8) : Bool
+  (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57) ||
+    byte == 95 || byte == 46 || byte == 45 || byte == 126
+end

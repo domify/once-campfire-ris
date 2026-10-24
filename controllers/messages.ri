@@ -1,0 +1,565 @@
+# `MessagesController` (`reference/app/controllers/messages_controller.rb`):
+# the room's messages, and creating, editing and deleting one.
+module controllers/messages
+
+import std/text
+import std/time::{Time}
+import rils/rails_compat/signed_id::{generate_signed_id}
+import rils/record/sqlite::{Connection, SqlValue}
+import models/message::{Message, NewMessage, sound_in}
+import rils/storage/blob::{Blob}
+import rils/storage/variation::{Variation}
+import rils/storage/marshal::{Value}
+import rils/storage/paths::{blob_redirect_path, representation_redirect_path}
+import rils/storage/errors::{StorageError}
+import models/room::{Room}
+import models/user::{User}
+import models/boost::{Boost}
+import rils/record/database::{RichText}
+import rils/record/errors::{RecordNotFound}
+import rils/record/timestamp::{Timestamp}
+import rils/routes/paths::{fresh_user_avatar_path}
+import rils/kit/ctx::{Ctx, ActionResult, Freshness}
+import rils/kit/response::{Response, Parts}
+import rils/kit/errors::{HttpError}
+import rils/kit/format::{HTML}
+import rils/ruby/integers::{integer_cast}
+import views/context::{ViewContext}
+import rils/template/recorded::{Fragment, RecordedPage}
+import rils/template/template::{Buffer}
+import views/helpers/application::{to_sentence}
+import views/messages/messages::*
+import config/app::{App}
+import views/helpers/user_paths::{avatar_path}
+import models/action_text::{DbResolver}
+import rils/richtext/richtext::{present_message, Unrenderable}
+import rils/ruby/all_emoji::{all_emoji?}
+import controllers/concerns::{Current, Passed, allow_browser, set_version_headers, require_authentication, set_room, before_actions, head}
+import rils/kit/errors::{HttpErrorKind, halt}
+import rils/kit/format::{TURBO_STREAM, JSON_MIME}
+import rils/kit/params::{ParamMap, UploadedFile, permit_keys}
+import rils/routes/paths::{room_message_path}
+import views/context::{CurrentUser}
+import rils/record/database::{Tx}
+import rils/storage/storage::{Staged}
+import rils/storage/filename::{Filename}
+import rils/storage/blob::{attachment_records}
+import rils/richtext/richtext::{editable_value, canonical_body, RichtextError}
+import jobs/jobs::{AnalyzeBlob}
+
+# Stands in for the digest `ETagWithTemplateDigest` adds for
+# `messages/index`, as the Rust port's does.
+TEMPLATE_DIGEST_INDEX = "messages/index"
+
+# `index` (`layout false`): the page before or after a message, or the last
+# page; 204 when there's none.
+pub def index(app : App, c : Ctx) : ActionResult
+  platform = allow_browser(app, c, own_layout: true)
+  return platform if platform.is_a?(HttpError)
+  set_version_headers(app, c)
+  ticket = app.responses.begin(c, "messages#index")
+  current = require_authentication(app, c)
+  return current if current.is_a?(HttpError)
+  scoped = set_room(app, c, current)
+  return scoped if scoped.is_a?(HttpError)
+  room = scoped[1]
+  if cached = app.responses.lookup(c, ticket, current.user.id, current.session.id)
+    return cached
+  end
+
+  messages = find_paged_messages(app, c, room)
+  return messages if messages.is_a?(HttpError)
+  return c.head(204) if messages.empty?
+
+  format = c.respond_to([HTML])
+  return format if format.is_a?(HttpError)
+  ctx = app.view_context(c.request)
+  fragments = MessagePresenter.new(app, ctx, room, c.request.host).fragments(messages)
+  page = RecordedPage.new("")
+  tape do
+    buffer = Buffer.new
+    Index.new(ctx, fragments).render_into(buffer)
+    page = buffer.to_page
+  end
+  response = c.render(200, HTML, Parts.new(page.text, page.inserts))
+  # Presentation also depends on creators, boosts and rich text, which can
+  # change without touching `messages.updated_at`: the body is the
+  # validator, as in the Rust port.
+  fresh = c.fresh_when(Freshness.new(etag: page.etag, template: TEMPLATE_DIGEST_INDEX))
+  app.responses.admit(c, ticket)
+  fresh || response
+end
+
+# `find_paged_messages`: `params[:before]`, else `params[:after]`, else the
+# last page. A message that isn't in the room is a 404 (`find`).
+pub def find_paged_messages(app : App, c : Ctx, room : Room) : Array(Message) | HttpError
+  app.db.read do |conn|
+    if before = present(c.param_str("before"))
+      anchor = find_in_room(conn, room.id, before)
+      anchor.is_a?(HttpError) ? anchor : Message.page_before(conn, room.id, anchor)
+    elsif after = present(c.param_str("after"))
+      anchor = find_in_room(conn, room.id, after)
+      anchor.is_a?(HttpError) ? anchor : Message.page_after(conn, room.id, anchor)
+    else
+      Message.last_page(conn, room.id)
+    end
+  end
+end
+
+def present(value : String?) : String?
+  value && !value.blank? ? value : nil
+end
+
+def find_in_room(conn : Connection, room_id : Int64, id : String) : Message | HttpError
+  number = integer_cast(id) || return HttpError.not_found
+  found = Message.find_in_room(conn, room_id, number)
+  found.is_a?(RecordNotFound) ? HttpError.not_found : found
+end
+
+# `render partial: "messages/message", collection: @messages, cached: true`:
+# `Message::THUMBNAIL_MAX_WIDTH` / `THUMBNAIL_MAX_HEIGHT`.
+THUMBNAIL_WIDTH  = 1200_i64
+THUMBNAIL_HEIGHT =  800_i64
+
+# `attachment.metadata[:width]`: an Integer, or a Float for a video.
+def metadata_number(blob : Blob, name : String) : RubyNumber?
+  h = blob.metadata.as_h?
+  value = h ? h[name]? : nil
+  return nil unless value
+  raw = value.raw
+  case raw
+  when Int64   then raw
+  when Float64 then raw
+  else              nil
+  end
+end
+
+# Build views only on a miss; the ERB partial owns fragment cache lookup and storage.
+pub class MessagePresenter
+  @users : Hash(Int64, UserView?)
+  @room_name : String?
+
+  # *request_host* is `Current.request_host`, which embeds are checked
+  # against; nil outside a request.
+  def initialize(@app : App, @ctx : ViewContext, @room : Room, @request_host : String? = nil)
+    @users = {} of Int64 => UserView?
+    @room_name = nil
+  end
+
+  pub def fragments(messages : Array(Message)) : Array(Fragment)
+    messages.map do |message|
+      key = message_fragment_key(message.id, message.updated_at.microseconds)
+      message_fragment(@ctx, key, @app.fragments) { view(message) }
+    end
+  end
+
+  pub def view(message : Message) : MessageView
+    @app.db.read do |conn|
+      creator = user(conn, message.creator_id)
+      if creator.nil?
+        # `avatar_tag message.creator` raises for a creator that's gone, and
+        # `message_tag` renders `messages/_unrenderable` instead.
+        MessageView.new(message.id, message.client_message_id, message.room_id, room_name(conn), UserView.new(message.creator_id, "", "", ""),
+          message.created_at.time, message.updated_at.time, false, TextContent.new(""), [] of BoostView, unrenderable: true)
+      else
+        plain = message.plain_text_body(conn, @app.db.env.rich_text)
+        content = content(conn, message, plain)
+        if content.is_a?(Unrenderable)
+          # `message_tag` rescued what rendering the body raised.
+          MessageView.new(message.id, message.client_message_id, message.room_id, room_name(conn), creator,
+            message.created_at.time, message.updated_at.time, false, TextContent.new(""), [] of BoostView, unrenderable: true)
+        else
+          MessageView.new(message.id, message.client_message_id, message.room_id, room_name(conn), creator,
+            message.created_at.time, message.updated_at.time, all_emoji?(plain), content, boosts(conn, message))
+        end
+      end
+    end
+  end
+
+  # `room_display_name(message.room, for_user: nil)`: a direct room is named
+  # after all its users.
+  def room_name(conn : Connection) : String
+    @room_name ||= if @room.direct?
+                     to_sentence(@room.users(conn).map(&.name), " and ")
+                   else
+                     @room.name || ""
+                   end
+  end
+
+  def user(conn : Connection, id : Int64) : UserView?
+    return @users[id] if @users.has_key?(id)
+    found = User.find_by_id(conn, id)
+    @users[id] = found ? UserView.new(found.id, found.name, found.title, avatar_url(found)) : nil
+  end
+
+  # `fresh_user_avatar_path(user)`: the avatar token, versioned by
+  # `updated_at.to_fs(:number)`.
+  # `message.content_type`, with what `message_presentation` shows for it.
+  def content(conn : Connection, message : Message, plain : String) : MessageContent | Unrenderable
+    if blob = Blob.attached(conn, "Message", message.id, "attachment")
+      return attachment_view(blob)
+    end
+    if sound = sound_in(plain)
+      image = sound.image
+      shown = image ? SoundImageView.new(@ctx.asset(image.asset_path), image.width, image.height) : nil
+      return SoundView.new(@ctx.asset(sound.asset_path), shown, sound.text)
+    end
+    # The text branch: Action Text's pipeline, sanitized and auto-linked.
+    html = present_message(message.body_html(conn) || "", @request_host, DbResolver.new(conn, @app.secrets, @app.stack.clock))
+    html.is_a?(Unrenderable) ? html : TextContent.new(html)
+  end
+
+  # `message.attachment` as `Messages::AttachmentPresentation` needs it.
+  def attachment_view(blob : Blob) : AttachmentView
+    verifier = @app.storage.verifier
+    preview = "file"
+    url = nil.as(String?)
+    if blob.previewable? || blob.variable?
+      if blob.video?
+        preview = "video"
+        # `attachment.preview(format: :webp, resize_to_limit: [ ... ])`
+        poster = Variation.new([{"format", Value.sym("webp")}, {"resize_to_limit", Value.list([Value.int(THUMBNAIL_WIDTH), Value.int(THUMBNAIL_HEIGHT)])}] of Tuple(String, Value))
+        url = representation_redirect_path(verifier, blob, poster)
+      else
+        preview = "image"
+        url = thumb_path(blob)
+      end
+    end
+    AttachmentView.new(blob.filename.raw, blob_redirect_path(verifier, blob), blob_redirect_path(verifier, blob, "attachment"), preview, url,
+      metadata_number(blob, "width"), metadata_number(blob, "height"))
+  end
+
+  # `polymorphic_url(attachment.representation(:thumb), only_path: true)`.
+  def thumb_path(blob : Blob) : String
+    thumb = Variation.resize_to_limit(THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT)
+    variation = blob.previewable? ? thumb : @app.storage.variation_for(blob, thumb)
+    raise variation.message if variation.is_a?(StorageError)
+    representation_redirect_path(@app.storage.verifier, blob, variation)
+  end
+
+  # The message views' `UserView` of *user*.
+  pub def user_view(user : User) : UserView
+    UserView.new(user.id, user.name, user.title, avatar_url(user))
+  end
+
+  def avatar_url(user : User) : String
+    avatar_path(@app.secrets, user)
+  end
+
+  def boosts(conn : Connection, message : Message) : Array(BoostView)
+    message.boosts(conn).compact_map do |boost|
+      booster = user(conn, boost.booster_id)
+      booster ? BoostView.new(boost.id, boost.message_id, boost.content, all_emoji?(boost.content), booster) : nil
+    end
+  end
+end
+
+# `create`: `set_room` runs inside the action, and a room that's gone
+# renders `room_not_found`.
+pub def create(app : App, c : Ctx) : ActionResult
+  passed = before_actions(app, c)
+  return passed if passed.is_a?(HttpError)
+  current = passed.signed_in
+  scoped = set_room(app, c, current)
+  if scoped.is_a?(HttpError)
+    return render_room_not_found(app, c, passed) if scoped.kind == HttpErrorKind::NotFound
+    return scoped
+  end
+  room = scoped[1]
+  attributes = message_params(c)
+  return attributes if attributes.is_a?(HttpError)
+  message = create_message(app, c, room, current.user, attributes)
+  return message if message.is_a?(HttpError)
+  ctx = app.view_context(c.request)
+  view = broadcast_create(app, ctx, room, message)
+  deliver_webhooks_to_bots(app, room, message)
+
+  # The partial comes out of the fragment cache `broadcast_create` filled
+  # (`cache [ message, "presentation-v3" ]`).
+  format = c.respond_to([TURBO_STREAM])
+  return format if format.is_a?(HttpError)
+  c.render(200, TURBO_STREAM, app.written(->(buffer : Buffer) { CreateTurboStream.new(ctx, view, room_kind(room)).render_into(buffer) }))
+end
+
+pub def show(app : App, c : Ctx) : ActionResult
+  found = room_and_message(app, c)
+  return found if found.is_a?(HttpError)
+  passed, room, message = found
+  format = c.respond_to([HTML])
+  return format if format.is_a?(HttpError)
+  ctx = app.layout_context(c, current_user(passed.user), passed.platform)
+  view = MessagePresenter.new(app, ctx, room, c.request.host).view(message)
+  app.render_layout(c, 200, nil, nil, ctx) { |buffer| Show.new(ctx, view).render_into(buffer) }
+end
+
+pub def edit(app : App, c : Ctx) : ActionResult
+  found = room_and_message(app, c, administer: true)
+  return found if found.is_a?(HttpError)
+  passed, room, message = found
+  format = c.respond_to([HTML])
+  return format if format.is_a?(HttpError)
+  ctx = app.layout_context(c, current_user(passed.user), passed.platform)
+  view = MessagePresenter.new(app, ctx, room, c.request.host).view(message)
+  body = app.db.read do |conn|
+    editable_value(message.body_html(conn) || "", c.request.host, DbResolver.new(conn, app.secrets, app.stack.clock))
+  end
+  return HttpError.internal(body.message) if body.is_a?(RichtextError)
+  app.render_layout(c, 200, nil, nil, ctx) { |buffer| Edit.new(ctx, view, body || "").render_into(buffer) }
+end
+
+pub def update(app : App, c : Ctx) : ActionResult
+  found = room_and_message(app, c, administer: true)
+  return found if found.is_a?(HttpError)
+  passed, room, message = found
+  attributes = message_params(c)
+  return attributes if attributes.is_a?(HttpError)
+  updated = update_message(app, c, message, attributes)
+  return updated if updated.is_a?(HttpError)
+  broadcast_replace(app, c, room, updated)
+
+  # respond_to html: redirect; json: `render :show`, which has no JSON
+  # template.
+  format = c.respond_to([HTML, JSON_MIME])
+  return format if format.is_a?(HttpError)
+  return HttpError.internal("Missing template messages/show") if format == JSON_MIME
+  c.redirect_to(c.url_for(room_message_path(room.id, updated.id)))
+end
+
+pub def destroy(app : App, c : Ctx) : ActionResult
+  found = room_and_message(app, c, administer: true)
+  return found if found.is_a?(HttpError)
+  passed, room, message = found
+  view = MessagePresenter.new(app, app.view_context(c.request), room, c.request.host).view(message)
+  destroy_message(app, room, message)
+  format = c.respond_to([TURBO_STREAM])
+  return format if format.is_a?(HttpError)
+  ctx = app.view_context(c.request)
+  c.render(200, TURBO_STREAM, app.written(->(buffer : Buffer) { DestroyTurboStream.new(ctx, view).render_into(buffer) }))
+end
+
+# The before-actions, `set_room`, `set_message` and, for *administer*,
+# `ensure_can_administer`.
+def room_and_message(app : App, c : Ctx, administer : Bool = false) : Tuple(Passed, Room, Message) | HttpError
+  passed = before_actions(app, c)
+  return passed if passed.is_a?(HttpError)
+  current = passed.signed_in
+  scoped = set_room(app, c, current)
+  return scoped if scoped.is_a?(HttpError)
+  room = scoped[1]
+  message = set_message(app, c, room)
+  return message if message.is_a?(HttpError)
+  if administer && !current.user.can_administer?(message.creator_id)
+    return halt(head(403))
+  end
+  {passed, room, message}
+end
+
+# `@room.messages.find(params[:id])`
+pub def set_message(app : App, c : Ctx, room : Room) : Message | HttpError
+  raw = c.param_str("id") || return HttpError.not_found
+  id = integer_cast(raw) || return HttpError.not_found
+  found = app.db.read { |conn| Message.find_in_room(conn, room.id, id) }
+  found.is_a?(RecordNotFound) ? HttpError.not_found : found
+end
+
+pub def current_user(user : User) : CurrentUser
+  CurrentUser.new(user.id, user.name, user.administrator?, user.bot?)
+end
+
+# "open", "closed" or "direct", for the room's `dom_id`.
+pub def room_kind(room : Room) : String
+  room.direct? ? "direct" : room.closed? ? "closed" : "open"
+end
+
+# What assigning a permitted `attachment` does: an upload replaces the
+# attachment, nil or "" removes it (`Attached::Changes::DeleteOne`),
+# anything else raises.
+pub class Assignment
+  getter upload : UploadedFile?
+  getter delete : Bool
+  getter invalid : Bool
+
+  def initialize(@upload : UploadedFile? = nil, @delete : Bool = false, @invalid : Bool = false)
+  end
+
+  # Nil when the key wasn't given.
+  pub def self.from_params(params : ParamMap, key : String) : Assignment?
+    return nil unless params.has_key?(key)
+    param = params[key]? || return Assignment.new(delete: true)
+    return Assignment.new(delete: true) if param.null? || param.as_s? == ""
+    file = param.as_file?
+    file ? Assignment.new(upload: file) : Assignment.new(invalid: true)
+  end
+end
+
+# What `create_with_attachment!` / `update!` receive.
+pub class MessageParams
+  getter body : String?
+  getter attachment : Assignment?
+  getter client_message_id : String?
+
+  def initialize(@body : String?, @attachment : Assignment?, @client_message_id : String?)
+  end
+end
+
+# `params.require(:message).permit(:body, :attachment, :client_message_id)`
+pub def message_params(c : Ctx) : MessageParams | HttpError
+  message = c.require("message")
+  return message if message.is_a?(HttpError)
+  permitted = message.permit(permit_keys(["body", "attachment", "client_message_id"]))
+  MessageParams.new(permitted.str("body"), Assignment.from_params(permitted, "attachment"), permitted.str("client_message_id"))
+end
+
+# Assigning something that isn't an upload, a signed blob id, nil or "".
+def invalid_attachment : HttpError
+  HttpError.internal("Could not find or build blob: expected attachable")
+end
+
+# The upload's file, copied into storage ahead of the write that saves it.
+pub def stage_upload(app : App, upload : UploadedFile) : Staged
+  app.storage.stage_file(upload.path, Filename.from_bytes(upload.original_filename), upload.content_type)
+end
+
+# Assigning a String to a rich text attribute stores the canonicalized
+# content (`ActionText::Content.new(body, canonicalize: true).to_html`).
+pub def canonicalize_body(app : App, body : String, request_host : String?) : String
+  app.db.read { |conn| canonical_body(body, request_host, DbResolver.new(conn, app.secrets, app.stack.clock)) }
+end
+
+# `@room.messages.create_with_attachment!(attributes)`: the message, with
+# its uploaded blob, in one transaction, then `process_attachment`.
+pub def create_message(app : App, c : Ctx?, room : Room, creator : User, attributes : MessageParams) : Message | HttpError
+  staged = nil.as(Staged?)
+  if assignment = attributes.attachment
+    return invalid_attachment if assignment.invalid
+    if upload = assignment.upload
+      staged = stage_upload(app, upload)
+    end
+  end
+  body = attributes.body
+  body = canonicalize_body(app, body, c ? c.request.host : nil) if body
+  created = app.db.write do |tx|
+    blob = nil.as(Blob?)
+    if staged
+      blob = save_staged(tx, staged)
+    end
+    {Message.create(tx, NewMessage.new(room.id, creator.id, attributes.client_message_id, body, blob ? blob.id : nil)), blob}
+  end
+  staged.discard if staged
+  message, blob = created
+  # Analyzing an attachment touches the message, so then it's read back.
+  return message unless blob
+  process_attachment(app, blob)
+  app.db.read { |conn| Message.find_by_id(conn, message.id) } || message
+end
+
+# Inserts a staged blob's row, keeping its file once the write commits.
+pub def save_staged(tx : Tx, staged : Staged) : Blob
+  blob = staged.insert(tx.conn, tx.now)
+  tx.after_commit { |_| staged.keep }
+  blob
+end
+
+# `Message#process_attachment`: analyze the blob now (which touches the
+# message), then the video preview or the `:thumb` representation.
+pub def process_attachment(app : App, blob : Blob) : Nil
+  analyzed = analyze_blob(app, blob)
+  app.db.write do |tx|
+    now = tx.now
+    if analyzed.video?
+      # attachment.preview(format: :webp).processed
+      app.storage.process_preview(tx.conn, analyzed, Variation.new([{"format", Value.sym("webp")}] of Tuple(String, Value)), now)
+    elsif analyzed.representable?
+      # attachment.representation(:thumb).processed
+      app.storage.process_representation(tx.conn, analyzed, Variation.resize_to_limit(THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT), now)
+    end
+  end
+end
+
+# `blob.analyze`: its `after_update` touches the attached records (a
+# message also touches its room).
+pub def analyze_blob(app : App, blob : Blob) : Blob
+  metadata = app.storage.analyzed_metadata(blob)
+  return blob if metadata.is_a?(StorageError)
+  app.db.write do |tx|
+    blob.update_metadata(tx.conn, metadata)
+    attachment_records(tx.conn, blob.id).each do |record_type, record_id|
+      if record_type == "Message"
+        if message = Message.find_by_id(tx.conn, record_id)
+          message.touch(tx)
+        end
+      end
+    end
+  end
+  app.db.read { |conn| Blob.find(conn, blob.id) } || blob
+end
+
+# `@message.update!(message_params)`. A new attachment replaces the old
+# one without `process_attachment`: the blob is only analyzed, by
+# `ActiveStorage::AnalyzeJob` after commit.
+pub def update_message(app : App, c : Ctx, message : Message, attributes : MessageParams) : Message | HttpError
+  staged = nil.as(Staged?)
+  replace = false
+  if assignment = attributes.attachment
+    return invalid_attachment if assignment.invalid
+    replace = true
+    if upload = assignment.upload
+      staged = stage_upload(app, upload)
+    end
+  end
+  body = attributes.body
+  body = canonicalize_body(app, body, c.request.host) if body
+  blob = app.db.write do |tx|
+    message.update_body(tx, body) if body
+    saved = staged ? save_staged(tx, staged) : nil
+    message.replace_attachment(tx, saved ? saved.id : nil) if replace
+    saved
+  end
+  staged.discard if staged
+  app.jobs.perform_later(AnalyzeBlob.new(blob.id)) if blob && !blob.analyzed?
+  app.db.read { |conn| Message.find_by_id(conn, message.id) } || message
+end
+
+# `@message.destroy` then `@message.broadcast_remove`.
+pub def destroy_message(app : App, room : Room, message : Message) : Nil
+  app.db.write { |tx| message.destroy(tx) }
+  app.broadcasts.message_remove(room, message)
+end
+
+# `@message.broadcast_create`: the message partial appended to the room,
+# then the unread pings. Returns the message's view.
+pub def broadcast_create(app : App, ctx : ViewContext, room : Room, message : Message) : MessageView
+  presenter = MessagePresenter.new(app, ctx, room, nil)
+  view = presenter.view(message)
+  html = presenter.fragments([message]).first.html
+  app.db.read { |conn| app.broadcasts.message_create(conn, room, html) }
+  view
+end
+
+# `broadcast_replace_to @room, :messages, target: [ @message, :presentation
+# ], partial: "messages/presentation", attributes: { maintain_scroll: true }`
+pub def broadcast_replace(app : App, c : Ctx, room : Room, message : Message) : Nil
+  ctx = app.view_context(c.request)
+  view = MessagePresenter.new(app, ctx, room, nil).view(message)
+  app.broadcasts.message_replace(room, message, PresentationPartial.new(ctx, view).render.to_s)
+end
+
+# `deliver_webhooks_to_bots`: every active bot in a direct room, else
+# every mentioned active bot, except the message's creator.
+pub def deliver_webhooks_to_bots(app : App, room : Room, message : Message) : Nil
+  bots = app.db.read do |conn|
+    candidates = room.direct? ? room.active_bots(conn) : message.mentionees(conn, app.db.env.rich_text)
+    candidates.select { |user| user.bot? && user.active? && user.id != message.creator_id }
+  end
+  return if bots.empty?
+  app.db.write { |tx| bots.each(&.deliver_webhook_later(tx, message.id)) }
+end
+
+# `render action: :room_not_found`, in the layout.
+def render_room_not_found(app : App, c : Ctx, passed : Passed) : ActionResult
+  format = c.respond_to([HTML])
+  return format if format.is_a?(HttpError)
+  ctx = app.layout_context(c, current_user(passed.user), passed.platform)
+  view = RoomNotFound.new(ctx)
+  app.render_page(c, 200, app.layout_body(ctx, nil, nil, c.turbo_frame_request?, ->(buffer : Buffer) { view.render_into(buffer) }))
+end

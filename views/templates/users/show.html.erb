@@ -1,0 +1,46 @@
+<%# reference/app/views/users/show.html.erb %>
+<% content_for "nav" do %>  <div class="flex-item-justify-start">
+    <%= link_back(ctx) %>
+  </div>
+
+  <div class="flex align-center gap flex-item-justify-end">
+<% if ctx.current_user?(user.id) %>      <%= link_to(user_profile_path, attrs.class("btn")) do %>
+        <%= image_tag(ctx, "pencil.svg", attrs.aria_hidden) %>
+        <span class="for-screen-reader">Edit my profile</span>
+<% end %><% end %>  </div>
+<% end %>
+<section class="panel txt-align-center">
+  <div class="flex flex-column gap <% if user.banned? %>banned<% end %>">
+    <div class="avatar txt-xx-large center" style="background: white">
+      <%= image_tag(ctx, user.avatar_path, attrs.alt("Profile avatar").class("avatar")) %>
+    </div>
+
+<% if user.bot? %>      <div class="pad-double--inline push--inline push--block-start">
+<% if user.active %>          <%= button_to_direct_room_with(ctx, user.id) %>
+<% else %>          <div><%= user.name %> is no longer on this account</div>
+<% end %>      </div>
+<% else %><% if !user.deactivated? %>        <div class="flex flex-column gap" style="--row-gap: calc(var(--block-space) / 3)">
+          <h1 class="txt-x-large txt-tight-lines margin-none"><%= user.name %></h1>
+<% if ctx.can_administer? %>            <div><%= mail_to(user.email_address || "") %></div>
+<% end %>          <div><%= user.bio || "" %></div>
+        </div>
+
+<% if user.active %>          <div class="pad-inline-double margin-inline margin-block-start">
+            <%= button_to(rooms_directs_with_users([user.id]), attrs.class("btn btn--reversed full-width txt-large")) do %>
+              <%= image_tag(ctx, "messages.svg", attrs.aria("hidden", "true").aria("label", "Ping #{user.name}")) %>
+<% end %>          </div>
+
+<% if ctx.can_administer? %>            <hr class="margin-block-start borderless">
+
+            <% include "users/profiles/_transfer.html.erb" %>
+<% end %><% end %>
+<% if ctx.can_administer? && !ctx.current_user?(user.id) %>          <div class="margin-block-start">
+            <% include "users/_ban_button.html.erb" %>
+          </div>
+<% end %><% else %>        <div>
+          <h1 class="txt-x-large margin-none"><%= user.name %></h1>
+          <div><%= user.name %> is no longer on this account</div>
+        </div>
+<% end %><% end %>  </div>
+</section>
+

@@ -1,0 +1,35 @@
+# Two threads' pubsubs over one relay database: each delivers the other's
+# broadcasts, and not its own twice.
+module rils/cable/cable_relay_test
+
+import std/dir::{Dir}
+import std/file::{File}
+import rils/cable/pubsub::{PubSub}
+import rils/cable/cable_relay::{CableRelay}
+import web/web/spec::*
+
+describe "the cable relay" do
+  it "carries broadcasts between pubsubs" do
+    path = "#{Dir.tempdir}/campfire-relay-test.sqlite3"
+    File.delete(path) if File.exists?(path)
+    CableRelay.prepare(path)
+    a = PubSub.new
+    b = PubSub.new
+    relay_a = CableRelay.new(path, a)
+    relay_b = CableRelay.new(path, b)
+    got_a = [] of String
+    got_b = [] of String
+    a.subscribe("rooms", ->(message : String) { got_a << message; nil })
+    b.subscribe("rooms", ->(message : String) { got_b << message; nil })
+    a.broadcast("rooms", %("from a"))
+    relay_a.poll
+    relay_b.poll
+    assert got_a == [%("from a")]
+    assert got_b == [%("from a")]
+    b.broadcast("rooms", %("from b"))
+    relay_a.poll
+    relay_b.poll
+    assert got_a == [%("from a"), %("from b")]
+    assert got_b == [%("from a"), %("from b")]
+  end
+end

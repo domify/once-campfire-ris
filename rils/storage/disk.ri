@@ -1,0 +1,223 @@
+# `ActiveStorage::Service::DiskService`: files at
+# `<root>/<key[0..2]>/<key[2..4]>/<key>`, the signed disk URLs
+# (`/rails/active_storage/disk/:encoded_key/*filename`) and upload tokens
+# (`PUT /rails/active_storage/disk/:encoded_token`). Unexpected disk
+# failures panic (see `storage/errors`).
+module rils/storage/disk
+
+import std/time::{Time}
+import std/json::{Any}
+import std/file
+import std/dir::{Dir}
+import rils/rails_compat/json::{encode}
+import rils/rails_compat/message_verifier::{MessageVerifier}
+import rils/rails_compat/metadata::{Failure}
+import rils/storage/errors::{StorageError}
+import rils/storage/filename::{Filename}
+import rils/storage/key::{checksum_file}
+import rils/storage/json::{json_parse}
+import rils/storage/disposition::{content_disposition_with, escape_path, escape_segment}
+
+CHUNK = 1 << 20
+
+pub class DiskService
+  getter root : String
+  getter name : String
+
+  # Campfire's `local` service: `root: Rails.root.join("storage", "files")`
+  # (config/storage.yml).
+  def initialize(@root : String, @name : String)
+  end
+
+  pub def path_for(key : String) : String
+    "#{@root}/#{folder_for(key)}/#{key}"
+  end
+
+  # `upload(key, io, checksum:)`: write, then verify the MD5 and delete on
+  # a mismatch.
+  pub def upload(key : String, data : String, checksum : String? = nil) : StorageError?
+    File.write(make_path_for(key), data)
+    checksum ? ensure_integrity_of(key, checksum) : nil
+  end
+
+  # `upload` from a file on disk, copied a megabyte at a time.
+  pub def upload_file(key : String, source : String, checksum : String? = nil) : StorageError?
+    copy_file(source, make_path_for(key))
+    checksum ? ensure_integrity_of(key, checksum) : nil
+  end
+
+  pub def download(key : String) : String | StorageError
+    path = path_for(key)
+    return StorageError.file_not_found unless File.exists?(path)
+    File.read(path)
+  end
+
+  pub def delete(key : String) : Nil
+    path = path_for(key)
+    File.delete(path) if File.exists?(path)
+  end
+
+  # `delete_prefixed(prefix)`: `rm_rf` whatever matches
+  # `path_for("#{prefix}*")`.
+  pub def delete_prefixed(prefix : String) : Nil
+    pattern = path_for(prefix)
+    slash = last_slash(pattern)
+    dir = slash ? pattern[0, slash] : "."
+    stem = slash ? pattern[slash + 1, pattern.bytesize - slash - 1] : pattern
+    return unless Dir.exists?(dir)
+    Dir.children(dir).each do |entry|
+      remove_tree("#{dir}/#{entry}") if entry.starts_with?(stem)
+    end
+  end
+
+  pub def exist?(key : String) : Bool
+    File.exists?(path_for(key))
+  end
+
+  # The path of `service.url(key, expires_in:, filename:, content_type:,
+  # disposition:)`; the caller prefixes the protocol and host.
+  pub def url_path(verifier : MessageVerifier, key : String, expires_at : Time?, filename : Filename,
+                   content_type : String?, disposition : String) : String
+    sanitized = filename.sanitized
+    payload = {} of String => Any
+    payload["key"] = Any.new(key)
+    payload["disposition"] = Any.new(content_disposition_with(disposition, sanitized))
+    payload["content_type"] = content_type ? Any.new(content_type) : Any.new(nil)
+    payload["service_name"] = Any.new(@name)
+    encoded_key = verifier.generate_raw(encode(Any.new(payload)), "blob_key", expires_at)
+    "/rails/active_storage/disk/#{escape_segment(encoded_key)}/#{escape_path(sanitized)}"
+  end
+
+  # The path of `url_for_direct_upload`.
+  pub def url_path_for_direct_upload(verifier : MessageVerifier, key : String, expires_at : Time,
+                                     content_type : String?, content_length : Int64, checksum : String) : String
+    payload = {} of String => Any
+    payload["key"] = Any.new(key)
+    payload["content_type"] = content_type ? Any.new(content_type) : Any.new(nil)
+    payload["content_length"] = Any.new(content_length)
+    payload["checksum"] = Any.new(checksum)
+    payload["service_name"] = Any.new(@name)
+    token = verifier.generate_raw(encode(Any.new(payload)), "blob_token", expires_at)
+    "/rails/active_storage/disk/#{escape_segment(token)}"
+  end
+
+  def make_path_for(key : String) : String
+    path = path_for(key)
+    Dir.mkdir_p("#{@root}/#{folder_for(key)}")
+    path
+  end
+
+  def ensure_integrity_of(key : String, checksum : String) : StorageError?
+    if checksum_file(path_for(key)) != checksum
+      delete(key)
+      return StorageError.integrity
+    end
+    nil
+  end
+end
+
+# The payload of a disk URL's `encoded_key` (purpose "blob_key").
+pub struct DiskKey
+  getter key : String
+  getter disposition : String
+  getter content_type : String?
+  getter service_name : String
+
+  def initialize(@key : String, @disposition : String, @content_type : String?, @service_name : String)
+  end
+end
+
+# The payload of a direct-upload `encoded_token` (purpose "blob_token").
+pub struct DiskToken
+  getter key : String
+  getter content_type : String?
+  getter content_length : Int64
+  getter checksum : String
+  getter service_name : String
+
+  def initialize(@key : String, @content_type : String?, @content_length : Int64, @checksum : String, @service_name : String)
+  end
+end
+
+def verified_object(verifier : MessageVerifier, message : String, purpose : String, now : Time) : Hash(String, Any)?
+  data = verifier.verify_raw(message, purpose, now)
+  return nil if data.is_a?(Failure)
+  json = json_parse(data)
+  json ? json.as_h? : nil
+end
+
+def text(h : Hash(String, Any), name : String) : String?
+  value = h[name]?
+  value ? value.as_s? : nil
+end
+
+# `DiskController#decode_verified_key`.
+pub def decode_verified_key(verifier : MessageVerifier, encoded_key : String, now : Time) : DiskKey?
+  h = verified_object(verifier, encoded_key, "blob_key", now)
+  return nil unless h
+  key = text(h, "key")
+  disposition = text(h, "disposition")
+  service_name = text(h, "service_name")
+  return nil unless key && disposition && service_name
+  DiskKey.new(key, disposition, text(h, "content_type"), service_name)
+end
+
+# `DiskController#decode_verified_token`.
+pub def decode_verified_token(verifier : MessageVerifier, encoded_token : String, now : Time) : DiskToken?
+  h = verified_object(verifier, encoded_token, "blob_token", now)
+  return nil unless h
+  key = text(h, "key")
+  checksum = text(h, "checksum")
+  service_name = text(h, "service_name")
+  length = h["content_length"]?
+  content_length = length ? length.as_i64? : nil
+  return nil unless key && checksum && service_name && content_length
+  DiskToken.new(key, text(h, "content_type"), content_length, checksum, service_name)
+end
+
+# `[key[0..1], key[2..3]].join("/")`.
+def folder_for(key : String) : String
+  a = key.bytesize >= 2 ? key[0, 2] : key
+  b = key.bytesize > 2 ? key[2, key.bytesize >= 4 ? 2 : key.bytesize - 2] : ""
+  "#{a}/#{b}"
+end
+
+# Copies *source* to *target* a megabyte at a time.
+pub def copy_file(source : String, target : String) : Nil
+  File.open(source, "r", CHUNK) do |input|
+    File.open(target, "w", CHUNK) do |output|
+      while !(chunk = input.read_bytes(CHUNK)).empty?
+        output.write(chunk)
+      end
+      raise "cannot read #{source}" if input.read_failed?
+      output.flush
+    end
+  end
+end
+
+# `FileUtils.rm_rf`.
+pub def remove_tree(path : String) : Nil
+  if Dir.exists?(path)
+    Dir.children(path).each { |entry| remove_tree("#{path}/#{entry}") }
+    Dir.delete(path)
+  elsif File.exists?(path)
+    File.delete(path)
+  end
+end
+
+def last_slash(path : String) : Int32?
+  i = path.bytesize - 1
+  while i >= 0
+    return i if path.as_tape[i] == '/'.ord
+    i -= 1
+  end
+  nil
+end
+
+# A new, empty directory under the temp dir (`Dir.mktmpdir`).
+pub def make_tempdir(prefix : String) : String
+  path = File.tempfile(prefix)
+  File.delete(path)
+  Dir.mkdir_p(path)
+  path
+end

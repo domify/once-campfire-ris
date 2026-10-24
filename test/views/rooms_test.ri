@@ -1,0 +1,43 @@
+# `rooms/show` against the reference's renders (vectors/views_b), region
+# by region.
+module test/views/rooms_test
+
+import std/text
+import rils/template/recorded::{Fragment}
+import views/messages/messages::{MessagePartial}
+import views/rooms::{Show, ShowView, RoomView}
+import test/views/golden_b::*
+import web/web/spec::*
+
+def show(name : String) : Nil
+  golden = GoldenB.new(name)
+  ctx = golden.context
+  input = golden.input
+  room = input["room"]
+  messages = input["messages"].as_a.map { |message| Fragment.new(MessagePartial.new(ctx, message_view(message)).render.to_s) }
+  view = ShowView.new(RoomView.new(room["id"].as_i64, room["kind"].as_s, room["name"].as_s?, room["display_name"].as_s), parse_utc(input["updated_at"].as_s),
+    user_view(input["user"]), messages, input["invitation"].as_bool, input["join_code"].as_s? || "", input["messages_stream_name"].as_s)
+  golden.assert_dom(Show.new(ctx, view).page.to_s)
+end
+
+describe "rooms/show" do
+  it "renders an open room for a member" do
+    show("rooms_show_member")
+  end
+
+  it "renders a direct room" do
+    show("rooms_show_direct")
+  end
+
+  it "renders the original room with its invitation" do
+    show("rooms_show_original")
+  end
+
+  it "renders a closed room's attachments and sounds" do
+    show("rooms_show_closed")
+  end
+
+  it "renders the page around a message" do
+    show("rooms_show_at_message")
+  end
+end

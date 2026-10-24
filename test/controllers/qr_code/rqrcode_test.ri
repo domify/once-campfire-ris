@@ -1,0 +1,41 @@
+# The Rust port's rqrcode tests: every vector in testdata/rqrcode.json
+# (written by `reference-tools/campfire/rqrcode.rb` from the gem) must come
+# out module for module, and the SVG byte for byte where one is recorded.
+module test/controllers/qr_code/rqrcode_test
+
+import std/file::{File}
+import std/json::{JSON}
+import std/text
+import rils/rails_compat/encoding::{strict_decode}
+import controllers/qr_code/rqrcode::{svg_bytes, qr_modules, minimum_version}
+import web/web/spec::*
+
+VECTORS = JSON.parse(File.read("#{__DIR__}/testdata/rqrcode.json"))
+
+def shown(modules : Array(Array(Bool))) : String
+  modules.map { |row| row.map { |m| m ? "1" : "0" }.join }.join("\n")
+end
+
+describe "rqrcode" do
+  it "matches the gem" do
+    vectors = VECTORS.as_a
+    assert vectors.size >= 30
+    vectors.each do |vector|
+      label = vector["input_base64"].as_s
+      input = strict_decode(label) || raise "bad base64 #{label}"
+      assert minimum_version(input) == vector["version"].as_i, "version for #{label.inspect}"
+      modules = qr_modules(input) || raise "no code for #{label}"
+      assert shown(modules) == vector["modules"].as_s, "modules for #{label.inspect}"
+      if field = vector.as_h["svg"]?
+        if svg = field.as_s?
+          assert svg_bytes(input) == svg, "svg for #{label.inspect}"
+        end
+      end
+    end
+  end
+
+  it "answers nil for data too long for version 40" do
+    assert svg_bytes("a" * 3000).nil?
+    assert !svg_bytes("http://campfire.test").nil?
+  end
+end

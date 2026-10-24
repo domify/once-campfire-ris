@@ -1,0 +1,380 @@
+# Responses as controllers build them, before the kit finishes them
+# (cookies, default headers, ETags, conditional GET, HEAD) and hands them to
+# web.
+module rils/kit/response
+
+import std/text
+import std/indexable
+import std/http::{HTTP}
+import rils/rails_compat/content_disposition::{content_disposition}
+import rils/kit/format::{lookup_by_extension}
+
+pub HTML_UTF8         = "text/html; charset=utf-8"
+pub JSON_UTF8         = "application/json; charset=utf-8"
+pub TURBO_STREAM_UTF8 = "text/vnd.turbo-stream.html; charset=utf-8"
+
+# Header names are kept lowercased, as HTTP/2 and the `http` crate keep
+# them; a name may repeat (`Set-Cookie`).
+pub class HeaderList
+  getter entries : Array(Tuple(String, String))
+  # Whether *entries* is another's list, copied before the first change.
+  @shared : Bool
+
+  # Room for a response's usual headers, so the list is not regrown.
+  def initialize
+    @entries = Array(Tuple(String, String)).new(16)
+    @shared = false
+  end
+
+  # A request's fields as web read them, shared rather than copied: the
+  # names keep their spelling, and every lookup ignores case.
+  def initialize(@entries : Array(Tuple(String, String)), @shared : Bool)
+  end
+
+  pub def [](name : String) : String?
+    @entries.each { |entry| return entry[1] if HTTP.same_name?(entry[0], name) }
+    nil
+  end
+
+  pub def has_key?(name : String) : Bool
+    !self[name].nil?
+  end
+
+  pub def all(name : String) : Array(String)
+    @entries.select { |entry| HTTP.same_name?(entry[0], name) }.map { |entry| entry[1] }
+  end
+
+  # Replaces every value of *name* with this one, last in the list as a
+  # delete and an append leave it, without building a new list.
+  pub def []=(name : String, value : String) : String
+    own
+    at = 0
+    while at < @entries.size
+      if HTTP.same_name?(@entries[at][0], name)
+        @entries.delete_at(at)
+      else
+        at += 1
+      end
+    end
+    @entries << {lowercase(name), value}
+    value
+  end
+
+  pub def append(name : String, value : String) : Nil
+    own
+    @entries << {lowercase(name), value}
+  end
+
+  pub def delete(name : String) : Nil
+    @entries = @entries.reject { |entry| HTTP.same_name?(entry[0], name) }
+    @shared = false
+  end
+
+  # The list made this one's own before it changes.
+  private def own : Nil
+    if @shared
+      @entries = @entries.dup
+      @shared = false
+    end
+  end
+
+  pub def each(& : String, String -> Nil) : Nil
+    @entries.each { |entry| yield entry[0], entry[1] }
+  end
+
+  pub def size : Int32
+    @entries.size
+  end
+
+  # The name of the *index*th field, as it was spelled.
+  pub def name_at(index : Int32) : String
+    @entries[index][0]
+  end
+
+  pub def value_at(index : Int32) : String
+    @entries[index][1]
+  end
+
+  pub def empty? : Bool
+    @entries.empty?
+  end
+end
+
+# *name* lowercased, itself when it already is: the kit's own names are
+# written lowercase, and copying them for each response cost a string a
+# header.
+def lowercase(name : String) : String
+  name.each_byte { |byte| return name.downcase if byte >= 65_u8 && byte <= 90_u8 }
+  name
+end
+
+# A file (or a byte range of one) to stream from disk.
+pub struct FileBody
+  getter path : String
+  getter offset : Int64
+  getter length : Int64
+
+  def initialize(@path : String, @offset : Int64, @length : Int64)
+  end
+end
+
+# A body in pieces, sent one after another: a page's text around the
+# cached fragments it prints, the fragments shared with the cache rather
+# than copied into one string. The server joins them on the request's tape.
+pub class Parts
+  # The text around the shared pieces, and each shared piece with its byte
+  # offset in the text, in order.
+  getter text : String
+  getter inserts : Array(Tuple(Int32, String))
+  getter bytesize : Int32
+
+  def initialize(@text : String, @inserts : Array(Tuple(Int32, String)) = [] of Tuple(Int32, String))
+    @bytesize = @text.bytesize + @inserts.sum { |(_, piece)| piece.bytesize }
+  end
+
+  def empty? : Bool
+    @bytesize == 0
+  end
+
+  # Each piece in order, a view of where it lies: the text between the
+  # inserts and every insert, nothing copied.
+  def each_piece(& : Str -> Nil) : Nil
+    text = @text.as_tape
+    position = 0
+    @inserts.each do |(offset, piece)|
+      yield text[position, offset - position] if offset > position
+      yield piece.as_tape
+      position = offset
+    end
+    yield text[position, @text.bytesize - position] if @text.bytesize > position
+  end
+
+  # The pieces as one string: a copy, for tests.
+  def to_s : String
+    return @text if @inserts.empty?
+    String.build(@bytesize) do |io|
+      position = 0
+      @inserts.each do |(offset, piece)|
+        io << @text[position, offset - position] << piece
+        position = offset
+      end
+      io << @text[position, @text.bytesize - position]
+    end
+  end
+end
+
+# A page written when the response is sent, straight into the response's
+# buffer on the request's tape: its text is never put on the heap. The
+# kit gives it its ETag and conditional GET once it is written
+# (`Ctx#write_page`).
+pub class Rendered
+  getter capacity : Int32
+  @write : Proc(Str::Builder, Nil)
+
+  def initialize(@capacity : Int32, @write : Proc(Str::Builder, Nil))
+  end
+
+  def write_into(io : Str::Builder) : Nil
+    @write.call(io)
+  end
+
+  # The page as a string: a copy, for tests.
+  def to_s : String
+    text = ""
+    tape do
+      io = Str::Builder.new(@capacity)
+      write_into(io)
+      text = io.finish.to_heap
+    end
+    text
+  end
+end
+
+# A `Rendered` page once it is written into the response's buffer, which
+# holds it until it is sent.
+pub struct Written
+end
+
+pub alias Body = String | Parts | Rendered | Written | FileBody | Nil
+
+pub class Response
+  property status : Int32
+  getter headers : HeaderList
+  property body : Body
+
+  def initialize(@status : Int32 = 200)
+    @headers = HeaderList.new
+    @body = nil
+  end
+
+  pub def self.with_body(status : Int32, content_type : String, body : String | Parts | Rendered) : Response
+    response = Response.new(status)
+    response.content_type(content_type)
+    response.body = body
+    response
+  end
+
+  pub def content_type(value : String) : Response
+    header("content-type", value)
+  end
+
+  # Set (replace) a header, as Puma would write the value (see
+  # `set_header_value`).
+  pub def header(name : String, value : String) : Response
+    set_header_value(@headers, name, value)
+    self
+  end
+
+  pub def [](name : String) : String?
+    @headers[name]
+  end
+
+  pub def location : String?
+    @headers["location"]
+  end
+
+  # The body text, for tests and middleware; nil for files.
+  pub def body_text : String?
+    body = @body
+    case body
+    when String then body
+    when Parts    then body.to_s
+    when Rendered then body.to_s
+    else               nil
+    end
+  end
+end
+
+# A header value Puma writes as is: no control characters but tab, no DEL.
+def clean_header_value?(value : String) : Bool
+  value.each_byte do |byte|
+    return false if (byte < 32 && byte != 9) || byte == 127
+  end
+  true
+end
+
+# Replaces *name* with *value* the way Puma writes a Rack header (puma
+# 7.2.1, `Puma::Request#str_headers`). A value with a line break goes out
+# one line per header line (`split("\n")`, which drops trailing empty
+# lines), and a line holding any other control character
+# (`ILLEGAL_HEADER_VALUE_REGEX`) is left out. Puma writes a DEL, which
+# Thruster then refuses with a 502; that line is left out too.
+pub def set_header_value(headers : HeaderList, name : String, value : String) : Nil
+  if clean_header_value?(value)
+    headers[name] = value
+    return
+  end
+  headers.delete(name)
+  lines = value.split('\n')
+  while !lines.empty? && lines.last.empty?
+    lines.pop
+  end
+  lines.each { |line| headers.append(name, line) if clean_header_value?(line) }
+end
+
+# `Content-Disposition` as `ActionDispatch::Http::ContentDisposition#to_s`
+# builds it.
+pub def disposition_header(disposition : String, filename : String?) : String
+  filename ? content_disposition(disposition, filename) : disposition
+end
+
+# Options for `send_file` / `send_data`.
+pub class SendOptions
+  property filename : String?
+  # `type:`; defaults to the filename's MIME type, else
+  # `application/octet-stream`.
+  property content_type : String?
+  # `disposition:`; nil omits the header. Defaults to `attachment`.
+  property disposition : String?
+  property status : Int32
+
+  def initialize(@filename : String? = nil, @content_type : String? = nil, @disposition : String? = "attachment", @status : Int32 = 200)
+  end
+
+  pub def self.inline(content_type : String) : SendOptions
+    SendOptions.new(content_type: content_type, disposition: "inline")
+  end
+end
+
+# `send_file_headers!` then the body: file or bytes, whole.
+pub def send_response(options : SendOptions, body : Body) : Response
+  content_type = options.content_type
+  unless content_type
+    filename = options.filename
+    extension = filename && filename.includes?(".") ? filename.rpartition('.')[2].downcase : nil
+    mime = extension ? lookup_by_extension(extension) : nil
+    content_type = mime ? mime.string : "application/octet-stream"
+  end
+  response = Response.new(options.status).content_type(content_type)
+  if disposition = options.disposition
+    response.header("content-disposition", disposition_header(disposition, options.filename))
+  end
+  response.header("content-transfer-encoding", "binary")
+  response.body = body
+  response
+end
+
+# `Cache-Control` directives set by `expires_in`, `fresh_when(public:)`,
+# `no_store` and friends, normalized like
+# `ActionDispatch::Http::Cache::Response#merge_and_normalize_cache_control!`.
+pub class CacheControl
+  property max_age : Int64?
+  property public : Bool
+  property private : Bool
+  property must_revalidate : Bool
+  property no_cache : Bool
+  property no_store : Bool
+  property must_understand : Bool
+  property stale_while_revalidate : Int64?
+  property stale_if_error : Int64?
+  property immutable : Bool
+  property extras : Array(String)
+
+  def initialize
+    @max_age = nil
+    @public = false
+    @private = false
+    @must_revalidate = false
+    @no_cache = false
+    @no_store = false
+    @must_understand = false
+    @stale_while_revalidate = nil
+    @stale_if_error = nil
+    @immutable = false
+    @extras = [] of String
+  end
+
+  pub def empty? : Bool
+    @max_age.nil? && !@public && !@private && !@must_revalidate && !@no_cache && !@no_store && !@must_understand &&
+      @stale_while_revalidate.nil? && @stale_if_error.nil? && !@immutable && @extras.empty?
+  end
+
+  pub def to_header : String?
+    return nil if empty?
+    options = [] of String
+    if @no_store
+      options << "private" if @private
+      options << "must-understand" if @must_understand
+      options << "no-store"
+    elsif @no_cache
+      options << "public" if @public
+      options << "no-cache"
+      options.concat(@extras)
+    else
+      if max_age = @max_age
+        options << "max-age=#{max_age}"
+      end
+      options << (@public ? "public" : "private")
+      options << "must-revalidate" if @must_revalidate
+      if swr = @stale_while_revalidate
+        options << "stale-while-revalidate=#{swr}"
+      end
+      if sie = @stale_if_error
+        options << "stale-if-error=#{sie}"
+      end
+      options << "immutable" if @immutable
+      options.concat(@extras)
+    end
+    options.join(", ")
+  end
+end

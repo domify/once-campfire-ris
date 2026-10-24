@@ -1,0 +1,193 @@
+# The Rust port's unit tests of the pipeline's parts (richtext/src/*.rs,
+# `mod tests`), whose answers come from Rails, Loofah, CGI and URI in the
+# reference image: the corners the corpus doesn't reach.
+module rils/richtext/units_test
+
+import std/text
+import std/file::{File}
+import std/json::{JSON, Any}
+import htmlparse/htmlparse/tokenizer::{Attr}
+import rils/richtext/records::*
+import rils/richtext/nodes::{Html, Failure}
+import rils/richtext/sanitizer::{sanitize, content_filter, action_text, allowed_uri, cgi_unescape_html, SafeList}
+import rils/richtext/attachables::{attachment_from_node, Attachment, Kind}
+import rils/richtext/ruby_json::{json_parse, inspect}
+import rils/richtext/chars::{chomp_newlines, truncate}
+import rils/richtext/filters::{normalize_tweet_url}
+import web/web/spec::*
+
+def sanitized(html : String, list : SafeList) : String
+  result = ""
+  tape do
+    out_html = sanitize(Str.new(html), list)
+    result = out_html.is_a?(Failure) ? "raised" : out_html.to_heap
+  end
+  result
+end
+
+def uri_allowed?(uri : String) : Bool
+  allowed = false
+  tape do
+    allowed = allowed_uri(Str.new(uri))
+  end
+  allowed
+end
+
+def unescaped(text : String) : String
+  result = ""
+  tape do
+    result = cgi_unescape_html(Str.new(text)).to_heap
+  end
+  result
+end
+
+# `GlobalID.find` over the records the vectors name: users 1 and 2 exist,
+# and the default locator ignores the GID's app.
+class VectorRecords < Resolver
+  pub def find_gid(gid : String) : GidLookup
+    return GidLookup.new unless gid.starts_with?("gid://")
+    path = gid[6, gid.size - 6].split('?')[0]
+    slash = path.index("/")
+    return GidLookup.new unless slash
+    rest = path[slash + 1, path.size - slash - 1]
+    return GidLookup.new(outcome: "other") unless rest.starts_with?("User/")
+    id = rest[5, rest.size - 5]
+    return GidLookup.new unless id == "1" || id == "2"
+    GidLookup.new(user: MentionUser.new(id.to_i64, "", "", "", "", ""))
+  end
+end
+
+# The user an attachment with *sgid* (and nothing else) finds through the
+# invalid-signature fallback: its id, 0 for none, -1 when it raises.
+def found_user(sgid : String) : Int64
+  ctx = RenderContext.new(VectorRecords.new, nil)
+  found = 0_i64
+  tape do
+    tree = Html.new
+    attrs = Ary(Attr).new
+    attrs << Attr.new("sgid".as_tape, Str.new(sgid), "".as_tape, 0_u8)
+    node = tree.create_element("action-text-attachment", attrs)
+    attachment = attachment_from_node(tree, node, ctx)
+    case attachment
+    in Failure
+      found = -1_i64
+    in Attachment
+      user = attachment.attachable.user
+      found = user ? user.id : 0_i64
+    end
+  end
+  found
+end
+
+describe "the sanitizer" do
+  it "scrubs like Rails" do
+    list = content_filter
+    assert sanitized("<div><a href=\"javascript:alert(1)\">x</a></div>", list) == "<div><a>x</a></div>"
+    assert sanitized("<a href=\"/x\" onmouseover=\"alert(1)\">x</a>", list) == "<a href=\"/x\">x</a>"
+    assert sanitized("<a href=\"data:text/html,pwned\">x</a>", list) == "<a>x</a>"
+    assert sanitized("<a href=\"a b\">x</a><!-- c -->", list) == "<a href=\"a%20b\">x</a>"
+    assert sanitized("<svg><a>x</a></svg>y<script>z</script>", list) == "yz"
+  end
+
+  it "re-escapes URL attributes as each attribute is scrubbed" do
+    list = SafeList.new(["img", "a"], ["src", "href", "name", "title", "alt"])
+    assert sanitized("<img src=\" \" href=\" javascript:alert(1)\">", list) == "<img href=\"%20javascript:alert(1)\">"
+    assert sanitized("<img href=\" javascript:alert(1)\">", list) == "<img>"
+    assert sanitized("<a href=\"a b\" name=\"c d\" title=\"x y\">t</a>", list) ==
+           "<a href=\"a%20b\" name=\"c%20d\" title=\"x y\">t</a>"
+    assert sanitized("<img src=\"a b\" alt=\"q\">", list) == "<img src=\"a%20b\" alt=\"q\">"
+  end
+
+  it "keeps only Lexxy's highlight colors in style" do
+    list = action_text
+    highlight = "<mark style=\"color: var(--highlight-1);background-color: var(--highlight-bg-2);\">x</mark>"
+    assert sanitized(highlight, list) == highlight
+    assert sanitized("<span style=\"color: #f00; position: fixed; top: 0\">x</span>", list) ==
+           "<span style=\"color: #f00;\">x</span>"
+    rgb = "<span style=\"COLOR: rgb(1 2 3 / 50%)\">x</span>"
+    assert sanitized(rgb, list) == rgb
+    ["background-color: url(https://evil.test/beacon)", "color: expression(alert(1))",
+     "background-color: red; background-image: url(x)", "color: \\72 ed", "color: red /* */",
+     "width: 100000px", ""].each do |hostile|
+      html = sanitized("<span style=\"#{hostile}\">x</span>", list)
+      assert !html.includes?("url") && !html.includes?("expression") && !html.includes?("\\") &&
+             !html.includes?("width")
+    end
+    assert sanitized("<span style=\"position: fixed\">x</span>", list) == "<span>x</span>"
+  end
+
+  it "checks URIs like Loofah" do
+    assert !uri_allowed?("javascript:alert(1)")
+    assert !uri_allowed?("java\nscript:alert(1)")
+    assert !uri_allowed?("javascript&#58;alert(1)")
+    assert !uri_allowed?("&#106;avascript:alert(1)")
+    assert !uri_allowed?("javascript&colon;alert(1)")
+    assert uri_allowed?("/rooms/1")
+    assert uri_allowed?("https://example.com")
+    assert uri_allowed?("data:image/png;base64,xx")
+    assert !uri_allowed?("data:text/html,xx")
+    # CGI.unescapeHTML turns the zero-padded `&` into `&#106;`, which
+    # Loofah then decodes.
+    assert sanitized("<a href=\"&amp;#0000000000038;#106;avascript:alert(1)\">x</a>", content_filter) == "<a>x</a>"
+  end
+
+  it "unescapes HTML like CGI" do
+    [{"&#65;", "A"}, {"&#X41;", "A"}, {"&#00000000065;", "A"}, {"&#0000000000000000000000065;", "A"},
+     {"&#x000000041;", "A"}, {"&#x0000000000000000000041;", "A"},
+     {"&#00000000000000000000000000000000106;avascript", "javascript"}, {"&#0;", "\0"},
+     {"&#65535;", "\u{ffff}"}, {"&#1114110;", "\u{10fffe}"}, {"&#1114111;", "&#1114111;"},
+     {"&#x10FFFF;", "&#x10FFFF;"}, {"&#x110000;", "&#x110000;"},
+     {"&#99999999999999999999;", "&#99999999999999999999;"},
+     {"&#18446744073709551615;", "&#18446744073709551615;"},
+     {"&#x10000000000000041;", "&#x10000000000000041;"}, {"&#;", "&#;"}, {"&#x;", "&#x;"},
+     {"&#65", "&#65"}, {"&#0x41;", "&#0x41;"}, {"&amp;#65;", "&#65;"}].each do |pair|
+      assert unescaped(pair[0]) == pair[1]
+    end
+  end
+end
+
+describe "attachables" do
+  it "finds users through possibly expired SGIDs like Rails" do
+    vectors = JSON.parse(File.read("#{__DIR__}/../../vectors/rails_compat.json"))
+    vectors["unverified_sgids"].as_a.each do |c|
+      sgid = c["sgid"].as_s?
+      found = sgid ? found_user(sgid) : 0_i64
+      expected = c["expected"]
+      if expected.raw.nil?
+        assert found == 0
+      elsif gid = expected.as_s?
+        assert found == gid.split("/").last.to_i64
+      else
+        assert found == -1
+      end
+    end
+  end
+end
+
+describe "Ruby's string behaviours" do
+  it "match Ruby" do
+    tape do
+      assert chomp_newlines("a\r\n\r\n".as_tape) == "a"
+      assert chomp_newlines("a\n\r".as_tape) == "a\n\r"
+      assert truncate(Str.new("a" * 300), 280, "…").to_heap.size == 280
+    end
+    parsed = json_parse("{\"a\":[1.5e16, 0.1]}")
+    assert parsed ? inspect(parsed) == "{\"a\" => [1.5e+16, 0.1]}" : false
+    assert inspect(Any.new("\#{a} \#$b \#@c # #")) == "\"\\\#{a} \\\#$b \\\#@c # #\""
+    with_comment = json_parse("{\"a\":1/*c*/}")
+    assert with_comment ? with_comment["a"].as_i == 1 : false
+    assert json_parse("{\"a\":1,}").nil?
+  end
+end
+
+describe "filters" do
+  it "normalizes tweet URLs like Rails" do
+    # `RemoveSoloUnfurledLinkText#normalize_tweet_url` in the reference.
+    [{"HTTPS://x.com/dhh/status/1?s=20", "https://twitter.com/dhh/status/1"},
+     {"https://x.com/dhh/status/1?s=20", "https://twitter.com/dhh/status/1"},
+     {"HTTP://twitter.com/a", "http://twitter.com/a"},
+     {"Https://X.com/dhh/status/1", "Https://X.com/dhh/status/1"}].each do |pair|
+      assert normalize_tweet_url(pair[0]) == pair[1]
+    end
+  end
+end

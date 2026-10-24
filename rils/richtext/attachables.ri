@@ -1,0 +1,511 @@
+# Resolving `<action-text-attachment>` nodes to what they attach, and
+# rendering each attachable's partial, as Action Text, Lexxy and
+# Campfire's extensions do (the Rust port's richtext/src/attachables.rs).
+module rils/richtext/attachables
+
+import std/int
+import std/text
+import std/regex::{Regex}
+import std/json::{Any}
+import htmlparse/htmlparse/tokenizer::{Attr}
+import rils/rails_compat/encoding::{strict_decode, urlsafe_decode}
+import rils/ruby/uri_parser::{parse_uri, Uri, UriError}
+import rils/richtext/nodes::{Html, Failure}
+import rils/richtext/records::{MentionUser, SignedLookup, GidLookup, RenderContext}
+import rils/richtext/ruby_json::{json_parse}
+import rils/richtext/chars::{blank?, strip, chomp, html_escape, truncate, lossy, valid_utf8?}
+
+pub MENTION_CONTENT_TYPE         = "application/vnd.campfire.mention"
+pub OPENGRAPH_EMBED_CONTENT_TYPE = "application/vnd.actiontext.opengraph-embed"
+TWITTER_AVATAR_URL_PREFIX    = "https://pbs.twimg.com/profile_images"
+
+pub enum Kind : UInt8
+  User
+  OpengraphEmbed
+  # `ActionText::Attachables::ContentAttachment`
+  Content
+  # `ActionText::Attachables::RemoteImage`
+  RemoteImage
+  # Lexxy's `ActionText::Attachables::RemoteVideo`
+  RemoteVideo
+  # `ActionText::Attachables::MissingAttachable`
+  Missing
+end
+
+# An optional text: `present` tells nil apart from "".
+@[OnTape]
+pub struct Opt
+  getter text : Str
+  getter present : Bool
+
+  def initialize(@text : Str, @present : Bool)
+  end
+
+  def self.none : Opt
+    Opt.new("".as_tape, false)
+  end
+end
+
+# `ActionText::Attachment::OpengraphEmbed`
+@[OnTape]
+pub struct OpengraphEmbed
+  getter href : Opt
+  getter url : Opt
+  getter filename : Opt
+  getter description : Opt
+
+  def initialize(@href : Opt, @url : Opt, @filename : Opt, @description : Opt)
+  end
+
+  def twitter_avatar? : Bool
+    @url.present && @url.text.starts_with?(TWITTER_AVATAR_URL_PREFIX)
+  end
+end
+
+# What an attachment attaches. Which fields mean anything follows `kind`:
+# `user`; `embed`; `content`; `url`, `width`, `height` (and for a video
+# `content_type` and `filename`); `signed_model` for a missing one.
+@[OnTape]
+pub struct Attachable
+  getter kind : Kind
+  getter user : MentionUser?
+  getter embed : OpengraphEmbed
+  getter content : Str
+  getter url : Str
+  getter content_type : Str
+  getter width : Opt
+  getter height : Opt
+  getter filename : Opt
+
+  def initialize(@kind : Kind, @user : MentionUser?,
+                 @embed : OpengraphEmbed, @content : Str,
+                 @url : Str, @content_type : Str, @width : Opt,
+                 @height : Opt, @filename : Opt)
+  end
+
+  def self.of(kind : Kind) : Attachable
+    empty = "".as_tape
+    Attachable.new(kind, nil, OpengraphEmbed.new(Opt.none, Opt.none, Opt.none, Opt.none), empty, empty, empty,
+      Opt.none, Opt.none, Opt.none)
+  end
+
+  def self.user(user : MentionUser) : Attachable
+    empty = "".as_tape
+    Attachable.new(Kind::User, user, OpengraphEmbed.new(Opt.none, Opt.none, Opt.none, Opt.none), empty, empty,
+      empty, Opt.none, Opt.none, Opt.none)
+  end
+
+  def self.embed(embed : OpengraphEmbed) : Attachable
+    empty = "".as_tape
+    Attachable.new(Kind::OpengraphEmbed, nil, embed, empty, empty, empty, Opt.none, Opt.none, Opt.none)
+  end
+
+  # `attachable_content_type`, which only some attachables define.
+  def attachable_content_type : String | Failure
+    case @kind
+    when Kind::User           then MENTION_CONTENT_TYPE
+    when Kind::OpengraphEmbed then OPENGRAPH_EMBED_CONTENT_TYPE
+    else                           Failure.raised("NoMethodError: attachable_content_type")
+    end
+  end
+end
+
+# The attachment node's caption, plus its resolved attachable.
+@[OnTape]
+pub struct Attachment
+  getter attachable : Attachable
+  getter caption : Opt
+
+  def initialize(@attachable : Attachable, @caption : Opt)
+  end
+end
+
+private def attr_opt(tree : Html, node : Int32, name : ::String) : Opt
+  tree.has_attr?(node, name) ? Opt.new(tree.attr(node, name), true) : Opt.none
+end
+
+# `Object#presence` of an attribute.
+private def presence(tree : Html, node : Int32, name : ::String) : Opt
+  value = attr_opt(tree, node, name)
+  value.present && !blank?(value.text) ? value : Opt.none
+end
+
+# --- resolution ---------------------------------------------------------------
+
+OPENGRAPH_CONTENT_TYPE_RE = Regex.new("application/vnd.actiontext.opengraph-embed")
+IMAGE_CONTENT_TYPE_RE     = Regex.new("(?m)^image(/.+|$)")
+VIDEO_CONTENT_TYPE_RE     = Regex.new("(?m)^video(/.+|$)")
+
+# Campfire's `ActionText::Attachment.from_node`: an opengraph embed, else
+# a User found through a possibly invalid SGID, else Action Text's own
+# lookup (as extended by Lexxy).
+pub def attachment_from_node(tree : Html, node : Int32, ctx : RenderContext) : Attachment | Failure
+  attachable = attachable_from_node(tree, node, ctx)!
+  Attachment.new(attachable, presence(tree, node, "caption"))
+end
+
+private def attachable_from_node(tree : Html, node : Int32, ctx : RenderContext) : Attachable | Failure
+  embed = opengraph_embed_from_node(tree, node, ctx)!
+  return Attachable.embed(embed) if embed.is_a?(OpengraphEmbed)
+  sgid = attr_opt(tree, node, "sgid")
+  user = attachable_from_possibly_expired_sgid(sgid, ctx)!
+  return Attachable.user(user) if user.is_a?(MentionUser)
+  action_text_attachable_from_node(tree, node, ctx)
+end
+
+# `ActionText::Attachable.from_node`, with Lexxy's RemoteVideo fallback.
+# `Content#attachables` uses this directly, without Campfire's
+# invalid-signature fallback.
+pub def action_text_attachable_from_node(tree : Html, node : Int32, ctx : RenderContext) : Attachable
+  signed = tree.has_attr?(node, "sgid") ? ctx.resolver.locate_signed(tree.attr(node, "sgid").to_heap) : SignedLookup.new
+  if user = signed.user
+    return Attachable.user(user)
+  end
+  content_type = attr_opt(tree, node, "content-type")
+  type_text = content_type.present ? content_type.text.to_heap : ""
+  if tree.has_attr?(node, "content") && content_type.present && type_text.includes?("html") &&
+     !blank?(tree.attr(node, "content"))
+    attachable = Attachable.of(Kind::Content)
+    return Attachable.new(Kind::Content, nil, attachable.embed, tree.attr(node, "content"), attachable.url,
+      attachable.content_type, Opt.none, Opt.none, Opt.none)
+  end
+  if tree.has_attr?(node, "url")
+    url = tree.attr(node, "url")
+    empty = Attachable.of(Kind::Missing)
+    if IMAGE_CONTENT_TYPE_RE === type_text
+      return Attachable.new(Kind::RemoteImage, nil, empty.embed, empty.content, url, empty.content_type,
+        attr_opt(tree, node, "width"), attr_opt(tree, node, "height"), Opt.none)
+    end
+    if VIDEO_CONTENT_TYPE_RE === type_text
+      return Attachable.new(Kind::RemoteVideo, nil, empty.embed, empty.content, url,
+        content_type.present ? content_type.text : empty.content, attr_opt(tree, node, "width"),
+        attr_opt(tree, node, "height"), attr_opt(tree, node, "filename"))
+    end
+  end
+  Attachable.of(Kind::Missing)
+end
+
+# `attachable_from_possibly_expired_sgid`: reads the GlobalID out of an
+# SGID without checking its signature, and only ever finds a User.
+private def attachable_from_possibly_expired_sgid(sgid : Opt, ctx : RenderContext) : MentionUser? | Failure
+  return nil unless sgid.present
+  # `sgid.split("--").first`: Ruby drops trailing empty fields, so ""
+  # and "--" have no first.
+  fields = sgid.text.to_heap.split("--")
+  return nil if fields.all?(&.empty?)
+  decoded = decode_base64(fields[0])!
+  valid_utf8 = valid_utf8?(decoded)
+  json = json_parse(lossy(decoded))
+  unless json
+    return valid_utf8 ? Failure.raised("JSON::ParserError") : Failure.unrenderable("JSON::ParserError")
+  end
+  object = json.as_h?
+  return Failure.raised("NoMethodError: dig") unless object
+  rails = object["_rails"]?
+  rails_object = nil
+  if rails && !rails.raw.nil?
+    rails_object = rails.as_h?
+    return Failure.raised("TypeError: dig") unless rails_object
+  end
+  gid = nil
+  if (r = rails_object) && (data = r["data"]?) && truthy?(data)
+    # GlobalID.find of anything but a string finds nothing
+    gid = data.as_s?
+  elsif (r = rails_object) && (message = r["message"]?) && truthy?(message)
+    # Rails 7 Marshal-dumped the GID. The signature isn't verified, so the
+    # dump can't be safely loaded; the GID is matched out of its bytes.
+    text = message.as_s?
+    return Failure.raised("NoMethodError: unpack1") unless text
+    bytes = decode_base64(text)!
+    gid = marshaled_gid(bytes)
+  end
+  return nil unless gid
+  found = ctx.resolver.find_gid(gid)
+  if user = found.user
+    return user
+  end
+  return Failure.raised("GlobalID.find") if found.outcome == "raises"
+  nil
+end
+
+private def truthy?(value : Any) : Bool
+  raw = value.raw
+  !(raw.nil? || raw == false)
+end
+
+# `Base64.strict_decode64(message) rescue Base64.urlsafe_decode64(message)`
+private def decode_base64(message : String) : String | Failure
+  strict_decode(message) || urlsafe_decode(message) || Failure.raised("ArgumentError: invalid base64")
+end
+
+# `/gid:\/\/campfire\/[^\/]+\/[0-9]+/` over the bytes, as lossy text.
+private def marshaled_gid(text : String) : String?
+  bytes = text.as_tape
+  prefix = "gid://campfire/"
+  start = 0
+  while start + prefix.bytesize <= bytes.bytesize
+    if bytes[start, prefix.bytesize] == prefix
+      i = start + prefix.bytesize
+      model = i
+      while i < bytes.bytesize && bytes[i] != 0x2f_u8
+        i = i + 1
+      end
+      if i > model && i < bytes.bytesize
+        digits = i + 1
+        j = digits
+        while j < bytes.bytesize && bytes[j] >= 0x30_u8 && bytes[j] <= 0x39_u8
+          j = j + 1
+        end
+        return lossy(bytes[start, j - start].to_heap) if j > digits
+      end
+    end
+    start = start + 1
+  end
+  nil
+end
+
+# --- opengraph embeds -----------------------------------------------------------
+
+# `ActionText::Attachment::OpengraphEmbed.from_node`
+pub def opengraph_embed_from_node(tree : Html, node : Int32, ctx : RenderContext) : OpengraphEmbed? | Failure
+  return nil unless tree.has_attr?(node, "content-type")
+  return nil unless OPENGRAPH_CONTENT_TYPE_RE === tree.attr(node, "content-type").to_heap
+  host = ctx.host || ""
+  if presence(tree, node, "filename").present
+    return OpengraphEmbed.new(web_url(attr_opt(tree, node, "href"), host)!, web_url(attr_opt(tree, node, "url"), host)!,
+      attr_opt(tree, node, "filename"), attr_opt(tree, node, "caption"))
+  end
+  embed_from_content(tree.has_attr?(node, "content") ? tree.attr(node, "content") : "".as_tape, host)
+end
+
+# `attributes_from_content`: the details Lexxy serializes as the embed's
+# content markup.
+private def embed_from_content(
+  content : Str,
+  host : String,
+) : OpengraphEmbed | Failure
+  tree = Html.new
+  fragment = tree.parse_fragment(content)!
+  all = tree.descendants(fragment)
+  title = with_class(tree, all, "og-embed__title")
+  link = -1
+  if title >= 0
+    tree.descendants(title).each { |n| link = n if link < 0 && tree.named?(n, "a") }
+  end
+  image = -1
+  all.each do |n|
+    next if image >= 0 || !tree.named?(n, "img")
+    image = n if tree.ancestors(n).any? { |a| has_class?(tree, a, "og-embed__image") }
+  end
+  description = with_class(tree, all, "og-embed__description")
+  href = link >= 0 ? attr_opt(tree, link, "href") : Opt.none
+  src = image >= 0 ? attr_opt(tree, image, "src") : Opt.none
+  named = link >= 0 ? link : title
+  OpengraphEmbed.new(web_url(href, host)!, web_url(src, host)!,
+    named >= 0 ? Opt.new(strip(tree.text_content(named)), true) : Opt.none,
+    description >= 0 ? Opt.new(strip(tree.text_content(description)), true) : Opt.none)
+end
+
+private def with_class(tree : Html, nodes : Ary(Int32), name : ::String) : Int32
+  nodes.each { |n| return n if has_class?(tree, n, name) }
+  -1
+end
+
+private def has_class?(tree : Html, node : Int32, name : ::String) : Bool
+  return false unless tree.has_attr?(node, "class")
+  classes = tree.attr(node, "class")
+  start = 0
+  i = 0
+  while i <= classes.bytesize
+    if i == classes.bytesize || classes[i] == 0x20_u8 || classes[i] == 0x09_u8 || classes[i] == 0x0a_u8 ||
+       classes[i] == 0x0d_u8
+      return true if classes[start, i - start] == name
+      start = i + 1
+    end
+    i = i + 1
+  end
+  false
+end
+
+# `web_url`: an absolute http(s) URL on a named host other than this
+# Campfire's.
+pub def web_url(value : Opt, host : String) : Opt | Failure
+  return Opt.none unless value.present && !blank?(value.text)
+  parsed = parse_uri(value.text.to_heap)
+  case parsed
+  in UriError
+    return Failure.raised("URI::InvalidComponentError") if parsed.component
+    Opt.none
+  in Uri
+    return Opt.none unless parsed.http?
+    elsewhere?(parsed.host, host)! ? value : Opt.none
+  end
+end
+
+private def elsewhere?(host : String?, request_host : String) : Bool | Failure
+  return false unless host
+  return false unless named_host?(host)!
+  canonical_host(host) != canonical_host(request_host)
+end
+
+private def named_host?(host : String) : Bool | Failure
+  return false if blank?(host.as_tape) || host.includes?("%") || !host.includes?(".")
+  # `host.split(".").last`: Ruby drops trailing empty labels, and
+  # nil.match? raises.
+  trimmed = host.rstrip('.')
+  return Failure.raised("NoMethodError: match?") if trimmed.empty?
+  dot = trimmed.rindex('.')
+  label = dot ? trimmed[dot + 1, trimmed.size - dot - 1] : trimmed
+  letters = false
+  label.each_char { |c| letters = true if c.ascii_letter? }
+  letters && !label.downcase.starts_with?("0x")
+end
+
+private def canonical_host(host : String) : String
+  lower = host.downcase
+  lower.ends_with?('.') ? lower[0, lower.size - 1] : lower
+end
+
+# --- partials -------------------------------------------------------------------
+
+# `render_action_text_attachment(attachment)`: the attachable's partial,
+# chomped. *render_content* renders a nested content attachment's own
+# content (`ContentAttachment#to_html`), or nil past the depth limit.
+pub def render_attachment(attachment : Attachment, writer : Str::Builder,
+                          & : Str -> Str | Failure) : Nil | Failure
+  html = Str::Builder.new(256)
+  attachable = attachment.attachable
+  case attachable.kind
+  when Kind::User
+    if user = attachable.user
+      render_mention(user, html)
+    end
+  when Kind::OpengraphEmbed
+    render_opengraph_embed(attachable.embed, html)
+  when Kind::Missing
+    # Rails asks the SGID's model for its missing partial, which User
+    # doesn't have, so a mention of a deleted user raised and blanked the
+    # whole message; every missing attachable is Action Text's ☒ here.
+    html << "☒"
+  when Kind::Content
+    rendered = yield attachable.content
+    return rendered if rendered.is_a?(Failure)
+    html << "<figure class=\"attachment attachment--content\">\n  " << rendered << "\n</figure>\n"
+  when Kind::RemoteImage
+    html << "<figure class=\"attachment attachment--preview\">\n  "
+    image_tag(attachable.url, attachable.width, attachable.height, html)!
+    html << '\n'
+    caption(attachment, html)
+    html << "</figure>\n"
+  else
+    html << "<figure class=\"attachment attachment--preview attachment--video\">\n  <video controls=\"controls\""
+    dimension("width", attachable.width, html)
+    dimension("height", attachable.height, html)
+    html << ">\n    <source src=\"" << html_escape(attachable.url) << "\" type=\"" <<
+      html_escape(attachable.content_type) << "\">\n</video>"
+    caption(attachment, html)
+    html << "</figure>\n"
+  end
+  writer << chomp(html.finish)
+  nil
+end
+
+private def dimension(name : ::String, value : Opt, html : Str::Builder) : Nil
+  return unless value.present
+  html << ' ' << name << "=\"" << html_escape(value.text) << '"'
+end
+
+private def caption(attachment : Attachment, html : Str::Builder) : Nil
+  return unless attachment.caption.present
+  html << "    <figcaption class=\"attachment__caption\">\n      " << html_escape(attachment.caption.text) <<
+    "\n    </figcaption>\n"
+end
+
+# reference/app/views/users/_mention.html.erb, with `avatar_tag`.
+pub def render_mention(user : MentionUser, html : Str::Builder) : Nil
+  html << "<span class=\"mention\" sgid=\"" << html_escape(user.attachable_sgid.as_tape) <<
+    "\"><a title=\"" << html_escape(user.title.as_tape) <<
+    "\" class=\"btn avatar\" data-turbo-frame=\"_top\" href=\"" << html_escape(user.user_path.as_tape) <<
+    "\"><img aria-hidden=\"true\" src=\"" << html_escape(user.avatar_path.as_tape) <<
+    "\" width=\"48\" height=\"48\" /></a> " << html_escape(user.name.as_tape) << "</span>\n"
+end
+
+# reference/app/views/action_text/attachables/_opengraph_embed.html.erb
+pub def render_opengraph_embed(
+  embed : OpengraphEmbed,
+  html : Str::Builder,
+) : Nil
+  html << "<figure class=\"attachment attachment--content attachment--og\">\n  <actiontext-opengraph-embed>\n" <<
+    "    <div class=\"og-embed gap " << (embed.twitter_avatar? ? "og-embed--twitter-avatar" : "") <<
+    "\">\n      <div class=\"og-embed__content\">\n        <div class=\"og-embed__title\">\n          "
+  if embed.href.present
+    html << "<a rel=\"noreferrer\" target=\"_blank\" href=\"" << html_escape(embed.href.text) << "\">"
+    if embed.filename.present
+      html << html_escape(truncate(embed.filename.text, 280, "…"))
+    else
+      html << html_escape(embed.href.text)
+    end
+    html << "</a>"
+  elsif embed.filename.present
+    html << html_escape(truncate(embed.filename.text, 280, "…"))
+  end
+  html << "\n        </div>\n        <div class=\"og-embed__description\">" <<
+    html_escape(truncate(embed.description.text, 560, "…")) << "</div>\n      </div>\n"
+  if embed.url.present
+    html << "        <div class=\"og-embed__image\">\n          <img src=\"" << html_escape(embed.url.text) <<
+      "\" class=\"image center\" alt=\"\">\n        </div>\n"
+  end
+  html << "    </div>\n  </actiontext-opengraph-embed>\n</figure>\n"
+end
+
+ASSET_URI_RE = Regex.new("(?mi)^[-a-z]+://|^(?:cid|data):|^//")
+
+# `image_tag(url, width:, height:)` for a remote image. A source that
+# isn't a URL goes through the asset pipeline, which raises for anything
+# it doesn't know; a rooted path passes through.
+private def image_tag(
+  url : Str,
+  width : Opt,
+  height : Opt,
+  html : Str::Builder,
+) : Nil | Failure
+  src = url
+  if blank?(url)
+    src = url[0, 0]
+  elsif !(ASSET_URI_RE === url.to_heap) && !url.starts_with?("/")
+    return Failure.raised("Propshaft::MissingAssetError")
+  end
+  html << "<img"
+  dimension("width", width, html)
+  dimension("height", height, html)
+  html << " src=\"" << html_escape(src) << "\" />"
+  nil
+end
+
+# `Attachment#to_plain_text`: markup to parse in the node's place, or
+# (*content*) a content attachment's content to load and move in.
+pub def attachment_plain_text(
+  attachment : Attachment,
+  writer : Str::Builder,
+) : Bool
+  caption = attachment.caption
+  attachable = attachment.attachable
+  case attachable.kind
+  when Kind::User
+    if user = attachable.user
+      writer << '@' << user.name
+    end
+  when Kind::OpengraphEmbed
+  when Kind::Content
+    writer << attachable.content
+    return true
+  when Kind::RemoteImage
+    writer << '[' << (caption.present ? caption.text : "Image".as_tape) << ']'
+  when Kind::RemoteVideo
+    text = caption.present ? caption.text : (attachable.filename.present ? attachable.filename.text : "Video".as_tape)
+    writer << '[' << text << ']'
+  else
+    writer << caption.text if caption.present
+  end
+  false
+end

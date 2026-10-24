@@ -1,0 +1,93 @@
+# `reference/app/views/layouts/application.html.erb` around a page: the
+# page renders first, into a buffer of its own, and hands the layout its
+# output and its `content_for` regions, as Rails renders the template
+# before the layout.
+module views/layouts
+
+import std/text
+import rils/template/html::{Html}
+import rils/template/recorded::{RecordedPage}
+import rils/template/template::{Template, Buffer, Yielded}
+import views/context::{ViewContext}
+import views/helpers/tag::*
+import views/helpers/assets::{image_tag}
+import views/helpers/application::{page_title_tag, current_user_meta_tags, script_aware_action_cable_meta_tag, custom_styles_tag, body_classes}
+
+class Application
+  getter ctx : ViewContext
+  getter page_title : String?
+  getter body_class : String?
+  @regions : Hash(String, RecordedPage)
+
+  def initialize(@ctx : ViewContext, @page_title : String?, @body_class : String?, @regions : Hash(String, RecordedPage))
+  end
+
+  # `yield`: the page, which the layout's buffer wraps.
+  def content : Yielded
+    Yielded.new
+  end
+
+  # `yield :name`: what the page gave the region.
+  def yield_region(name : String) : RecordedPage
+    @regions[name]? || RecordedPage.new("")
+  end
+
+  Template.def_render("layouts/application.html.erb")
+end
+
+# turbo-rails' `layouts/turbo_rails/frame`: the page's head and itself.
+class Frame
+  @regions : Hash(String, RecordedPage)
+
+  def initialize(@regions : Hash(String, RecordedPage))
+  end
+
+  def content : Yielded
+    Yielded.new
+  end
+
+  def yield_region(name : String) : RecordedPage
+    @regions[name]? || RecordedPage.new("")
+  end
+
+  Template.def_render("layouts/frame.html.erb")
+end
+
+# The page *render* prints, in the application layout with Rails'
+# `@page_title` and `@body_class`, or in the frame layout for a
+# Turbo-Frame request (*frame*).
+pub def render_in_layout(ctx : ViewContext, page_title : String?, body_class : String?, frame : Bool = false, & : Buffer -> Nil) : RecordedPage
+  result = RecordedPage.new("")
+  tape do
+    page = Buffer.new(8192)
+    yield page
+    layout = Buffer.new(32768)
+    wrap_in_layout(layout, page, ctx, page_title, body_class, frame)
+    result = layout.to_page
+  end
+  result
+end
+
+# The same page written into *io*, a response's writer on the request's
+# tape, its fragments copied in: nothing of it is put on the heap.
+pub def write_in_layout(
+  io : Str::Builder,
+  ctx : ViewContext,
+  page_title : String?,
+  body_class : String?,
+  frame : Bool,
+  render : Buffer -> Nil,
+) : Nil
+  page = Buffer.new(8192)
+  render.call(page)
+  wrap_in_layout(Buffer.new(io), page, ctx, page_title, body_class, frame)
+end
+
+def wrap_in_layout(layout : Buffer, page : Buffer, ctx : ViewContext, page_title : String?, body_class : String?, frame : Bool) : Nil
+  layout.wrap(page)
+  if frame
+    Frame.new(page.regions).render_into(layout)
+  else
+    Application.new(ctx, page_title, body_class, page.regions).render_into(layout)
+  end
+end

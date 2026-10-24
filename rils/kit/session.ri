@@ -1,0 +1,240 @@
+# The Rails cookie-store session (`ActionDispatch::Session::CookieStore`
+# over `Rack::Session::Abstract::PersistedSecure`), as configured in
+# `reference/config/initializers/session_store.rb`: key `_campfire_session`,
+# encrypted, and `expire_after: 20.years`.
+#
+# Loading is lazy. Unlike Rails, the cookie is only written when the session
+# changed during the request, and deleted when that left it empty. Without
+# CSRF tokens the session holds only the flash and a return-to URL, so an
+# unchanged session needs no cookie traffic and an empty one no cookie.
+# Cookies Rails wrote are read the same way.
+module rils/kit/session
+
+import std/time::{Time}
+import std/json::{Any}
+import rils/rails_compat/json::{generate}
+import rils/rails_compat/clock::{add_years}
+import rils/rails_compat/crypto::{random_bytes, hex}
+import rils/kit/cookies::{Cookie, CookieJar}
+import rils/kit/errors::{HttpError}
+
+pub SESSION_KEY        = "_campfire_session"
+pub EXPIRE_AFTER_YEARS = 20
+
+pub class SessionConfig
+  getter key : String
+  getter expire_after_years : Int32?
+  getter httponly : Bool
+
+  def initialize(@key : String = SESSION_KEY, @expire_after_years : Int32? = EXPIRE_AFTER_YEARS, @httponly : Bool = true)
+  end
+end
+
+pub class Session
+  @config : SessionConfig
+  getter loaded : Bool
+  # Whether the data changed during this request, and so the cookie needs
+  # writing.
+  @changed : Bool
+  @data : Hash(String, Any)
+
+  def initialize(@config : SessionConfig)
+    @loaded = false
+    @changed = false
+    @data = {} of String => Any
+  end
+
+  # Load from the cookie if not yet loaded (`load_for_read!`).
+  pub def load(jar : CookieJar) : Session
+    return self if @loaded
+    stored = jar.encrypted(@config.key)
+    map = stored ? stored.as_h? : nil
+    @data = {} of String => Any
+    map.each { |key, value| @data[key] = value } if map
+    @loaded = true
+    self
+  end
+
+  # The session id, made when first asked for or written (Rails makes it
+  # on load; most requests never look, and a fresh one costs a random draw).
+  pub def id : String?
+    ensure_id
+    value = @data["session_id"]?
+    value ? value.as_s? : nil
+  end
+
+  def ensure_id : Nil
+    value = @data["session_id"]?
+    return unless value.nil? || value.raw.nil?
+    data = {"session_id" => Any.new(generate_sid)}
+    @data.each { |key, other| data[key] = other unless key == "session_id" }
+    @data = data
+  end
+
+  pub def [](key : String) : Any?
+    value = @data[key]?
+    value && !value.raw.nil? ? value : nil
+  end
+
+  pub def str(key : String) : String?
+    value = self[key]
+    value ? value.as_s? : nil
+  end
+
+  pub def has_key?(key : String) : Bool
+    @data.has_key?(key)
+  end
+
+  pub def []=(key : String, value : Any) : Any
+    existing = @data[key]?
+    if existing.nil? || generate(existing) != generate(value)
+      @data[key] = value
+      @changed = true
+    end
+    value
+  end
+
+  pub def []=(key : String, value : String) : String
+    self[key] = Any.new(value)
+    value
+  end
+
+  pub def delete(key : String) : Any?
+    removed = @data.delete(key)
+    @changed = true if removed
+    removed
+  end
+
+  # `reset_session`: drop everything and start a new session id.
+  pub def reset : Nil
+    @data = {"session_id" => Any.new(generate_sid)}
+    @loaded = true
+    @changed = true
+  end
+
+  # Writes the cookie into *jar* if the session changed, or deletes it if
+  # that left nothing but the session id.
+  pub def commit(jar : CookieJar, now : Time) : HttpError?
+    return nil unless @changed
+    ensure_id
+    data = {} of String => Any
+    @data.each { |key, value| data[key] = value unless value.raw.nil? }
+    if data.keys.all? { |key| key == "session_id" }
+      jar.delete(@config.key)
+      return nil
+    end
+    cookie = Cookie.new("", httponly: @config.httponly)
+    if years = @config.expire_after_years
+      cookie.expires = add_years(now, years)
+    end
+    jar.set_encrypted(@config.key, Any.new(data), cookie)
+  end
+end
+
+# `ActionDispatch::Session::Compatibility#generate_sid`:
+# `SecureRandom.hex(16)`.
+pub def generate_sid : String
+  hex(random_bytes(16))
+end
+
+# `ActionDispatch::Flash::FlashHash`, stored in the session under `"flash"`
+# as `{ "discard" => [], "flashes" => { ... } }`.
+pub class Flash
+  @flashes : Hash(String, Any)
+  @discard : Array(String)
+
+  def initialize
+    @flashes = {} of String => Any
+    @discard = [] of String
+  end
+
+  # `FlashHash.from_session_value`: everything loaded is marked for discard
+  # at the end of this request, minus what the previous request had already
+  # discarded.
+  pub def self.from_session_value(value : Any?) : Flash
+    flash = Flash.new
+    stored = value ? value.as_h? : nil
+    return flash unless stored
+    discard_value = stored["discard"]?
+    discard_list = discard_value ? discard_value.as_a? : nil
+    discarded = discard_list ? discard_list.compact_map(&.as_s?) : [] of String
+    flashes_value = stored["flashes"]?
+    flashes = flashes_value ? flashes_value.as_h? : nil
+    if flashes
+      flashes.each do |key, item|
+        next if discarded.includes?(key)
+        flash.load(key, item)
+      end
+    end
+    flash
+  end
+
+  def load(key : String, value : Any) : Nil
+    @flashes[key] = value
+    @discard << key
+  end
+
+  # `FlashHash#to_session_value`: nil when nothing survives.
+  pub def to_session_value : Any?
+    keep = {} of String => Any
+    @flashes.each { |key, value| keep[key] = value unless @discard.includes?(key) }
+    return nil if keep.empty?
+    Any.new({"discard" => Any.new([] of Any), "flashes" => Any.new(keep)})
+  end
+
+  pub def [](key : String) : Any?
+    @flashes[key]?
+  end
+
+  pub def str(key : String) : String?
+    value = @flashes[key]?
+    value ? value.as_s? : nil
+  end
+
+  # `flash[key] = value`: shown on the next request.
+  pub def []=(key : String, value : String) : String
+    @discard.delete(key)
+    @flashes[key] = Any.new(value)
+    value
+  end
+
+  # `flash.now[key] = value`: shown on this request only.
+  pub def now(key : String, value : String) : Nil
+    self[key] = value
+    discard(key)
+  end
+
+  pub def keep(key : String? = nil) : Nil
+    if key
+      @discard.delete(key)
+    else
+      @discard = [] of String
+    end
+  end
+
+  pub def discard(key : String? = nil) : Nil
+    keys = key ? [key] : @flashes.keys
+    keys.each { |name| @discard << name unless @discard.includes?(name) }
+  end
+
+  pub def delete(key : String) : Nil
+    @discard.delete(key)
+    @flashes.delete(key)
+  end
+
+  pub def empty? : Bool
+    @flashes.empty?
+  end
+
+  pub def keys : Array(String)
+    @flashes.keys
+  end
+
+  pub def notice : String?
+    str("notice")
+  end
+
+  pub def alert : String?
+    str("alert")
+  end
+end

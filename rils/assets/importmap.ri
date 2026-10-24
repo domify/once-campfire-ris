@@ -1,0 +1,185 @@
+# importmap-rails 2.2.2's `Importmap::Map` (lib/importmap/map.rb) for what
+# config/importmap.rb uses: `pin` and `pin_all_from` with `to:`, `under:`
+# and `preload:`, and `javascript_importmap_tags` for the "application"
+# entry point, with no CSP nonce.
+module rils/assets/importmap
+
+import std/text
+import std/file::{File}
+import std/dir::{Dir}
+import rils/template/html::{escape}
+import rils/assets/pipeline::{LoadPath, PREFIX, extname, json}
+
+pub class Pin
+  getter name : String
+  getter path : String
+  getter preload : Bool
+
+  def initialize(@name : String, @path : String, @preload : Bool)
+  end
+end
+
+class Directory
+  getter dir : String
+  getter under : String?
+  getter to : String?
+  getter preload : Bool
+
+  def initialize(@dir : String, @under : String?, @to : String?, @preload : Bool)
+  end
+end
+
+# `Importmap::Map#expanded_packages_and_directories`: pins in insertion
+# order, then every directory expanded; a later entry for a name already
+# there keeps its place, as a Ruby Hash does.
+pub def expand(importmap_rb : String, rails_root : String) : Array(Pin)
+  packages = [] of Pin
+  directories = [] of Directory
+  File.read(importmap_rb).lines.each do |line|
+    line = line.strip
+    next if line.empty? || line.starts_with?('#')
+    command, _, rest = line.partition(" ")
+    args = Args.new(rest.lstrip)
+    first = args.string || raise "importmap.rb: expected a string in #{line.inspect}"
+    to = nil.as(String?)
+    under = nil.as(String?)
+    preload = true
+    while option = args.option
+      key, value = option
+      case key
+      when "to"      then to = value.as(String)
+      when "under"   then under = value.as(String)
+      when "preload" then preload = value.as(Bool)
+      else                raise "importmap.rb: unsupported option #{key.inspect} in #{line.inspect}"
+      end
+    end
+    case command
+    when "pin"
+      insert(packages, Pin.new(first, to || "#{first}.js", preload))
+    when "pin_all_from"
+      directories = directories.reject { |d| d.dir == first }
+      directories << Directory.new(first, under, to, preload)
+    else
+      raise "importmap.rb: unsupported statement #{command.inspect}"
+    end
+  end
+
+  directories.each do |directory|
+    root = "#{rails_root}/#{directory.dir}"
+    next unless Dir.exists?(root)
+    files = [] of String
+    javascript_files_in_tree(root, files)
+    files.sorted.each do |file|
+      filename = file[root.bytesize + 1, file.bytesize - root.bytesize - 1]
+      name = module_name_from(filename, directory.under)
+      path = [directory.to || directory.under, filename].compact.reject(&.empty?).join("/")
+      insert(packages, Pin.new(name, path, directory.preload))
+    end
+  end
+  packages
+end
+
+def insert(packages : Array(Pin), pin : Pin) : Nil
+  packages.each_with_index do |existing, i|
+    if existing.name == pin.name
+      packages[i] = pin
+      return
+    end
+  end
+  packages << pin
+end
+
+# `[under, filename.chomp(extname).remove(/(?:\/|^)index$/).presence].compact.join("/")`
+def module_name_from(filename : String, under : String?) : String
+  stem = filename.chomp(extname(filename))
+  stem = if stem == "index"
+           ""
+         elsif stem.ends_with?("/index")
+           stem[0, stem.bytesize - 6]
+         else
+           stem
+         end
+  [under, stem.empty? ? nil : stem].compact.join("/")
+end
+
+# `Dir[path.join("**/*.js{,m}")]`: globs skip dotfiles and dot-directories.
+def javascript_files_in_tree(dir : String, files : Array(String)) : Nil
+  Dir.children(dir).each do |name|
+    next if name.starts_with?('.')
+    path = "#{dir}/#{name}"
+    if Dir.exists?(path)
+      javascript_files_in_tree(path, files)
+    elsif name.ends_with?(".js") || name.ends_with?(".jsm")
+      files << path
+    end
+  end
+end
+
+# The arguments of one `pin` line: a quoted string, then `key: value`
+# options, up to a comment.
+class Args
+  def initialize(@rest : String)
+  end
+
+  def string : String?
+    return nil if @rest.empty?
+    quote = @rest[0]
+    return nil unless quote == '"' || quote == '\''
+    stop = @rest.index(quote, 1) || return nil
+    value = @rest[1, stop - 1]
+    @rest = @rest[stop + 1, @rest.bytesize - stop - 1].lstrip
+    value
+  end
+
+  def option : Tuple(String, String | Bool)?
+    return nil if @rest.empty? || @rest.starts_with?('#')
+    raise "importmap.rb: can't parse #{@rest.inspect}" unless @rest.starts_with?(',')
+    key, found, rest = @rest[1, @rest.bytesize - 1].lstrip.partition(":")
+    raise "importmap.rb: expected key: value" if found.empty?
+    @rest = rest.lstrip
+    if value = string
+      {key.strip, value.as(String | Bool)}
+    elsif @rest.starts_with?("true")
+      @rest = @rest[4, @rest.bytesize - 4].lstrip
+      {key.strip, true.as(String | Bool)}
+    elsif @rest.starts_with?("false")
+      @rest = @rest[5, @rest.bytesize - 5].lstrip
+      {key.strip, false.as(String | Bool)}
+    else
+      raise "importmap.rb: unsupported value #{@rest.inspect}"
+    end
+  end
+end
+
+# `javascript_importmap_tags`: the import map, a modulepreload link for
+# each preloaded pin, and the `import "application"` module script. A pin
+# whose asset is missing is left out, as Propshaft's MissingAssetError is
+# rescued there.
+pub def javascript_importmap_tags(load_path : LoadPath, rails_root : String) : String
+  resolve = ->(path : String) do
+    index = load_path.find(path)
+    index ? "#{PREFIX}/#{load_path.digested_path(index)}" : nil
+  end
+  pins = expand("#{rails_root}/config/importmap.rb", rails_root)
+
+  lines = [] of String
+  pins.each do |pin|
+    if path = resolve.call(pin.path)
+      lines << "    #{json(pin.name)}: #{json(path)}"
+    end
+  end
+  map = lines.empty? ? "{\n  \"imports\": {}\n}" : "{\n  \"imports\": {\n#{lines.join(",\n")}\n  }\n}"
+
+  preloads = [] of String
+  pins.each do |pin|
+    next unless pin.preload
+    if path = resolve.call(pin.path)
+      preloads << path unless preloads.includes?(path)
+    end
+  end
+
+  tags = ["<script type=\"importmap\" data-turbo-track=\"reload\">#{map}</script>"]
+  tags << preloads.map { |path| "<link rel=\"modulepreload\" href=\"#{escape(path)}\">" }.join("\n")
+  tags << "<script type=\"module\">import \"application\"</script>"
+  tags.join("\n")
+end

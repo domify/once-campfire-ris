@@ -1,0 +1,93 @@
+<%# reference/app/views/users/profiles/show.html.erb %>
+<% content_for "nav" do %>  <div class="flex-item-justify-start">
+    <%= link_back(ctx) %>
+  </div>
+
+  <div class="flex-item-justify-end">
+<% form = form_with(session_path).method("delete").data("controller", "sessions") %>    <%= form.wrap do %>
+      <%= hidden_field_tag("push_subscription_endpoint", nil, attrs.data("sessions_target", "pushSubscriptionEndpoint")) %>
+
+      <button class="btn" data-action="sessions#logout:prevent">
+        <%= image_tag(ctx, "logout.svg", attrs.aria_hidden) %>
+        <span class="for-screen-reader">Log out</span>
+      </button>
+<% end %>  </div>
+<% end %>
+<section class="panel flex flex-column gap" style="view-transition-name: avatar-<%= user.id %>">
+  <%= InstallInstructions.new(ctx).render %>
+
+  <div class="align-center center avatar__form gap" data-controller="upload-preview">
+<% form = profile_form.class("txt-medium") %>    <%= form.wrap do %>
+      <label class="btn input--file">
+        <%= image_tag(ctx, "camera.svg", attrs.aria_hidden.size(20)) %>
+        <%= form.file_field("avatar", attrs.id("file").class("input").accept("image/*").data("upload_preview_target", "input").data("action", "upload-preview#previewImage change->form#submit")) %>
+        <span class="for-screen-reader">Upload avatar</span>
+      </label>
+<% end %>
+<% form = profile_form %>    <%= form.wrap do %>
+      <label class="btn avatar input--file txt-xx-large">
+        <%= image_tag(ctx, user.avatar_path, attrs.aria_hidden.size(300).data("upload_preview_target", "image")) %>
+        <%= form.file_field("avatar", attrs.id("file").class("input").accept("image/*").data("upload_preview_target", "input").data("action", "upload-preview#previewImage change->form#submit")) %>
+        <span class="for-screen-reader">Avatar</span>
+      </label>
+<% end %>
+<% if avatar_attached %>      <%= button_to(user_avatar_path(user.id), attrs.method("delete").class("btn btn--negative txt-small avatar__delete-btn")) do %>
+        <%= image_tag(ctx, "minus.svg", attrs.aria_hidden.size(20)) %>
+        <span class="for-screen-reader">Delete avatar</span>
+<% end %><% end %>  </div>
+
+<% form = profile_form %>  <%= form.wrap do %>
+    <div class="flex flex-column gap">
+      <div class="flex align-center gap">
+        <%= translation_button(ctx, "user_name") %>
+
+        <label class="flex align-center gap flex-item-grow input input--actor">
+          <%= form.text_field("name", user.name, attrs.class("input txt-large ").autocomplete("name").placeholder("Enter your name").autofocus.required(true).data("1p-ignore", true)) %>
+          <%= image_tag(ctx, "person.svg", attrs.aria_hidden.size(24).class("colorize--black")) %>
+        </label>
+      </div>
+
+      <div class="flex align-center gap">
+        <%= translation_button(ctx, "email_address") %>
+
+        <label class="flex align-center gap flex-item-grow input input--actor">
+          <%= form.email_field("email_address", nil, email_options.autocomplete("username").placeholder("Enter your email address").required(false)) %>
+          <%= image_tag(ctx, "email.svg", attrs.aria_hidden.size(24).class("colorize--black")) %>
+        </label>
+      </div>
+
+      <div class="flex align-center gap">
+        <%= translation_button(ctx, "update_password") %>
+
+        <label class="flex align-center gap flex-item-grow input input--actor">
+          <%= form.password_field("password", attrs.class("input txt-large").autocomplete("new-password").placeholder("Change password").required(false).maxlength(72)) %>
+          <%= image_tag(ctx, "password.svg", attrs.aria_hidden.size(24).class("colorize--black")) %>
+        </label>
+      </div>
+
+      <div class="flex align-start gap">
+        <%= translation_button(ctx, "bio") %>
+
+        <label class="flex align--center gap flex-item--grow input input--actor">
+          <%= form.text_area("bio", user.bio, attrs.class("input txt-large").placeholder("A few words about yourself…").maxlength(200).rows(3).required(false)) %>
+          <%= image_tag(ctx, "bio.svg", attrs.aria_hidden.size(24).class("colorize--black")) %>
+        </label>
+      </div>
+
+      <%= profile_form_submit_button(ctx) %>
+    </div>
+<% end %>
+  <div class="margin-block pad-inline pad-block fill-shade border-radius">
+    <menu class="flex flex-column gap margin-none pad">
+      <% shared_memberships.each do |membership| %><% include "users/profiles/_membership.html.erb" %><% end %>
+
+<% if !direct_memberships.empty? && !shared_memberships.empty? %>        <hr class="separator full-width" style="--border-style: solid">
+<% end %>
+      <% direct_memberships.each do |membership| %><% include "users/profiles/_membership.html.erb" %><% end %>
+    </menu>
+  </div>
+
+  <% include "users/profiles/_transfer.html.erb" %>
+
+</section>
+

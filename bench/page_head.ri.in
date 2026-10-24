@@ -1,0 +1,140 @@
+# The renderer's support code; gen_markup.py appends the generated markup.
+module bench/page
+
+import rils/record/timestamp::{Timestamp}
+
+pub class MsgView
+  getter id : Int64
+  getter room_id : Int64
+  getter user_id : Int64
+  getter client_id : String
+  getter created_s : Int64
+  getter created_ms : Int64
+  getter updated_ms : Int64
+  getter name : String
+  getter avatar : String
+  getter room_name : String
+  getter body : String
+
+  def initialize(@id, @room_id, @user_id, @client_id, @created_s, @created_ms, @updated_ms, @name, @avatar, @room_name, @body)
+  end
+end
+
+pub class HeapBuf
+  getter io : String::Builder
+
+  def initialize(capacity : Int32)
+    @io = String::Builder.new(capacity)
+  end
+
+  def append(text : String) : Nil
+    @io << text
+  end
+
+  def push(byte : UInt8) : Nil
+    @io.write_byte(byte)
+  end
+
+  # TapeWriter's own, so the renderer writes either buffer the same way.
+  def append_int(value : Int64) : Nil
+    emit_int(self, value)
+  end
+
+  def append_html_escaped(text : String) : Nil
+    emit_escaped(self, text)
+  end
+end
+
+def emit_int(buf, v : Int64) : Nil
+  if v == 0_i64
+    buf.push(48_u8)
+    return
+  end
+  div = 1_i64
+  while div <= v // 10_i64
+    div = div * 10_i64
+  end
+  while div > 0_i64
+    buf.push((48_i64 + (v // div) % 10_i64).to_u8)
+    div = div // 10_i64
+  end
+end
+
+def emit_2(buf, v : Int64) : Nil
+  buf.push((48_i64 + v // 10_i64).to_u8)
+  buf.push((48_i64 + v % 10_i64).to_u8)
+end
+
+# Days since 1970-01-01 to {year, month, day} (Howard Hinnant's civil_from_days).
+def civil(days : Int64) : Tuple(Int64, Int64, Int64)
+  z = days + 719468_i64
+  era = (z >= 0 ? z : z - 146096_i64) // 146097_i64
+  doe = z - era * 146097_i64
+  yoe = (doe - doe // 1460_i64 + doe // 36524_i64 - doe // 146096_i64) // 365_i64
+  doy = doe - (365_i64 * yoe + yoe // 4_i64 - yoe // 100_i64)
+  mp = (5_i64 * doy + 2_i64) // 153_i64
+  d = doy - (153_i64 * mp + 2_i64) // 5_i64 + 1_i64
+  m = mp < 10_i64 ? mp + 3_i64 : mp - 9_i64
+  {yoe + era * 400_i64 + (m <= 2_i64 ? 1_i64 : 0_i64), m, d}
+end
+
+# `2026-10-01T09:20:00Z`
+def emit_iso(buf, s : Int64) : Nil
+  ymd = civil(s // 86400_i64)
+  t = s % 86400_i64
+  emit_int(buf, ymd[0])
+  buf.push(45_u8)
+  emit_2(buf, ymd[1])
+  buf.push(45_u8)
+  emit_2(buf, ymd[2])
+  buf.push(84_u8)
+  emit_2(buf, t // 3600_i64)
+  buf.push(58_u8)
+  emit_2(buf, t % 3600_i64 // 60_i64)
+  buf.push(58_u8)
+  emit_2(buf, t % 60_i64)
+  buf.push(90_u8)
+end
+
+# ERB::Util.html_escape, a byte at a time so nothing is allocated.
+def emit_escaped(buf, s : String) : Nil
+  p = s.as_tape
+  n = s.bytesize
+  i = 0
+  while i < n
+    c = p[i]
+    if c == 38_u8
+      buf.append("&amp;")
+    elsif c == 60_u8
+      buf.append("&lt;")
+    elsif c == 62_u8
+      buf.append("&gt;")
+    elsif c == 34_u8
+      buf.append("&quot;")
+    elsif c == 39_u8
+      buf.append("&#39;")
+    else
+      buf.push(c)
+    end
+    i += 1
+  end
+end
+
+pub def ms(t : Timestamp) : Int64
+  t.as_second * 1000_i64 + t.subsec_microsecond // 1000_i64
+end
+
+# `updated_at.to_fs(:number)`: 20261015175310
+pub def number(s : Int64) : String
+  b = HeapBuf.new(16)
+  ymd = civil(s // 86400_i64)
+  t = s % 86400_i64
+  emit_int(b, ymd[0])
+  emit_2(b, ymd[1])
+  emit_2(b, ymd[2])
+  emit_2(b, t // 3600_i64)
+  emit_2(b, t % 3600_i64 // 60_i64)
+  emit_2(b, t % 60_i64)
+  b.io.to_s
+end
+

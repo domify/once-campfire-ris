@@ -1,0 +1,47 @@
+# `SecureRandom`'s alphabets, as Rails' models draw tokens from them.
+module rils/record/random
+
+import std/text
+import rils/rails_compat/crypto::{random_bytes, hex}
+import rils/rails_compat/crypto
+
+ALPHANUMERIC = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+BASE58       = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+# *count* characters drawn uniformly from *alphabet*: random bytes past the
+# largest multiple of its size are drawn again, so no character is likelier.
+def random_from(alphabet : String, count : Int32) : String
+  size = alphabet.bytesize
+  limit = 256 - 256 % size
+  String.build(count) do |io|
+    written = 0
+    while written < count
+      random_bytes(count).each_byte do |byte|
+        if written < count && byte.to_i32 < limit
+          io.write_byte(alphabet.as_tape[byte.to_i32 % size])
+          written += 1
+        end
+      end
+    end
+  end
+end
+
+# `SecureRandom.alphanumeric(n)`
+pub def alphanumeric(count : Int32) : String
+  random_from(ALPHANUMERIC, count)
+end
+
+# `SecureRandom.base58(n)`, as `has_secure_token` uses it.
+pub def base58(count : Int32) : String
+  random_from(BASE58, count)
+end
+
+# `SecureRandom.uuid`
+pub def uuid : String
+  Rils::RailsCompat::Crypto.uuid
+end
+
+# `SecureRandom.hex(n)`
+pub def random_hex(count : Int32) : String
+  hex(random_bytes(count))
+end

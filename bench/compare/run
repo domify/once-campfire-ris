@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Serves the verification fixture from the Rust port (4401) and ris (4402),
+# each on its own copy, and compares their responses.
+#
+#   bench/compare/run [WORK_DIR]
+set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+repo=$(cd "$here/../.." && pwd)
+fixture=${VERIFICATION_ROOT:-$repo/../once-campfire-verification}/fixtures/default
+rust=${RUST_ROOT:-$repo/../once-campfire-rust}/target/release/campfire
+export WORK=${1:-$(mktemp -d)}
+rm -rf "$WORK/rust" "$WORK/ris"
+for app in rust ris; do
+  mkdir -p "$WORK/$app/storage/db"
+  cp "$fixture/db/production.sqlite3" "$WORK/$app/storage/db/"
+  cp -r "$fixture/storage" "$WORK/$app/storage/files"
+done
+ln -s ../files "$WORK/ris/storage/db/files"
+set -a; . "$fixture/reference.env"; set +a
+for port in 4401 4402; do ! curl -s -o /dev/null "localhost:$port/up" || { echo "port $port is taken" >&2; exit 1; }; done
+(cd "$repo" && ris build config/main.ri -o "$WORK/ris-bin" --release)
+(cd "$WORK/rust" && HTTP_PORT=4401 TARGET_PORT=4411 exec "$rust" server > "$WORK/rust.log" 2>&1) & rust_pid=$!
+(cd "$WORK/ris" && exec "$WORK/ris-bin" storage/db/production.sqlite3 "$SECRET_KEY_BASE" 4402 > "$WORK/ris.log" 2>&1) & ris_pid=$!
+trap 'kill $rust_pid $ris_pid 2>/dev/null' EXIT
+sleep 3
+for port in 4401 4402; do curl -sf -o /dev/null "localhost:$port/up" || { echo "nothing on $port" >&2; exit 1; }; done
+for script in compare compare2 blobs writes; do
+  echo "== $script"
+  python3 "$here/$script.py"
+done

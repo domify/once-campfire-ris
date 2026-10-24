@@ -1,0 +1,199 @@
+# Frame sequences recorded from the reference app's channels
+# (vectors/cable/reference.json, the Rust port's channels golden), replayed
+# against ours: the reference's rows in an empty database, its session
+# cookies and signed stream names, and every step of the same script.
+# Frames one socket gets in one step are compared as a sorted list, pings
+# dropped.
+module test/channels/channels_test
+
+import std/text
+import std/indexable
+import rils/record/timestamp::{Timestamp}
+import std/file::{File}
+import std/json::{JSON, Any}
+import rils/record/sqlite::{SqlValue}
+import models/message::{Message}
+import models/room::{Room}
+import models/user::{User}
+import rils/record/events::{DisconnectUser}
+import rils/rails_compat/json::{encode}
+import rils/cable/cable::{Connection, CableServer}
+import channels/channels::{cable_server, authenticate, user_identifier}
+import jobs/jobs::{Job}
+import test/testing::*
+import web/web/spec::*
+
+# `SECRET_KEY_BASE` from the Rust port's `parity/.env.reference`, which
+# signed the recording's cookies and stream names.
+REFERENCE_SECRET_KEY_BASE = "5335c3b1ad35b4ad170c3413bd651ef3b6ed64e257261871a6de3f978cf3868ee417a927040935fb30b0f7debdedb34a2a403e9f34b16cf594c917c2ecd4a995"
+
+class Socket
+  getter frames : Array(String)
+  getter connection : Connection
+
+  def initialize(server : CableServer)
+    @frames = [] of String
+    frames = @frames
+    @connection = Connection.new(server, ->(frame : String) { frames << frame; true }, -> { frames << %(close Some((1000, ""))); nil })
+  end
+
+  def take : Array(String)
+    taken = @frames.reject(&.starts_with?(%({"type":"ping"))).sorted
+    @frames.clear
+    taken
+  end
+end
+
+def sql_value(value : Any) : SqlValue
+  raw = value.raw
+  case raw
+  when Nil     then nil
+  when Bool    then raw ? 1_i64 : 0_i64
+  when Int64   then raw
+  when Float64 then raw
+  when String  then raw
+  else              value.to_json
+  end
+end
+
+def subscribe(identifier : Hash(String, Any)) : String
+  encode(Any.new({"command" => Any.new("subscribe"), "identifier" => Any.new(encode(Any.new(identifier)))}))
+end
+
+def perform(identifier : Hash(String, Any), data : Hash(String, Any)) : String
+  encode(Any.new({"command" => Any.new("message"), "identifier" => Any.new(encode(Any.new(identifier))), "data" => Any.new(encode(Any.new(data)))}))
+end
+
+def h(pairs : Array(Tuple(String, Any))) : Hash(String, Any)
+  hash = {} of String => Any
+  pairs.each { |key, value| hash[key] = value }
+  hash
+end
+
+def s(text : String) : Any
+  Any.new(text)
+end
+
+describe "the channels" do
+  it "send the frames the reference sent" do
+    recording = JSON.parse(File.read("#{__DIR__}/../../vectors/cable/reference.json"))
+    fixtures = recording["fixtures"]
+    client = Client.new(REFERENCE_SECRET_KEY_BASE)
+    empty_database(client)
+    client.t.write do |tx|
+      ["users", "rooms", "memberships", "sessions", "messages"].each do |table|
+        fixtures["rows"][table].as_a.each do |row|
+          columns = row.as_h.keys
+          tx.conn.execute(%(INSERT INTO #{table} (#{columns.map { |c| %("#{c}") }.join(", ")}) VALUES (#{columns.map { "?" }.join(", ")})), columns.map { |c| sql_value(row[c]) })
+        end
+      end
+    end
+    app = client.app
+    server = cable_server(app)
+    app.jobs.disconnect = ->(user_id : Int64, reconnect : Bool) { server.disconnect(user_identifier(user_id), reconnect); nil }
+    t = ->(name : String) { fixtures["tokens"][name].as_s }
+    room_id = s(t.call("ROOM_ID")).as_s.to_i64
+    closed_id = t.call("CLOSED_ID").to_i64
+    reads = h([{"channel", s("ReadRoomsChannel")}])
+    unreads = h([{"channel", s("UnreadRoomsChannel")}])
+    presence = h([{"channel", s("PresenceChannel")}, {"room_id", Any.new(room_id)}])
+    room = h([{"channel", s("RoomChannel")}, {"room_id", Any.new(room_id)}])
+    typing = h([{"channel", s("TypingNotificationsChannel")}, {"room_id", Any.new(room_id)}])
+    messages = h([{"channel", s("RoomMessagesChannel")}, {"signed_stream_name", s(t.call("ROOM_MESSAGES_SIGNED"))}])
+    turbo = ->(signed : String) { h([{"channel", s("Turbo::StreamsChannel")}, {"signed_stream_name", s(signed)}]) }
+    guarded = turbo.call(t.call("ROOM_MESSAGES_SIGNED"))
+    rooms = turbo.call(t.call("ROOMS_SIGNED"))
+    forged = "InJvb21zIg==--0000"
+    sockets = {} of String => Socket
+    connect = ->(name : String, cookie : String?) do
+      socket = Socket.new(server)
+      sockets[name] = socket
+      headers = cookie ? [fixtures["cookies"][cookie].as_s] : [] of String
+      socket.connection.open(authenticate(app, headers))
+      nil
+    end
+    send = ->(name : String, text : String) { sockets[name].connection.receive(text); nil }
+    trigger = ->(event : String, args : Array(Int64)) do
+      case event
+      when "unread"
+        client.t.read do |conn|
+          message = Message.find_by_id(conn, args[0]) || raise "no message"
+          app.broadcasts.unread_room(conn, Room.find_by_id(conn, message.room_id) || raise("no room"))
+        end
+      when "remove_message"
+        client.t.read do |conn|
+          message = Message.find_by_id(conn, args[0]) || raise "no message"
+          app.broadcasts.message_remove(Room.find_by_id(conn, message.room_id) || raise("no room"), message)
+        end
+      when "revoke"
+        client.t.write { |tx| (Room.find_by_id(tx.conn, args[0]) || raise "no room").revoke_from(tx, [args[1]]) }
+      when "deactivate"
+        client.t.write { |tx| (User.find_by_id(tx.conn, args[0]) || raise "no user").deactivate(tx) }
+      end
+      app.jobs.perform_all
+      nil
+    end
+    tok = ->(name : String) { t.call(name).to_i64 }
+    script = [
+      {"connect A", -> { connect.call("A", "A") }},
+      {"connect B", -> { connect.call("B", "B") }},
+      {"connect without a cookie", -> { connect.call("X", nil) }},
+      {"A heartbeat", -> { send.call("A", subscribe(h([{"channel", s("HeartbeatChannel")}]))) }},
+      {"A base channel", -> { send.call("A", subscribe(h([{"channel", s("ApplicationCable::Channel")}]))) }},
+      {"A reads", -> { send.call("A", subscribe(reads)) }},
+      {"A unreads", -> { send.call("A", subscribe(unreads)) }},
+      {"A presence", -> { send.call("A", subscribe(presence)) }},
+      {"A presence in a room A isn't in", -> { send.call("A", subscribe(h([{"channel", s("PresenceChannel")}, {"room_id", Any.new(closed_id)}]))) }},
+      {"A presence with a non-numeric room", -> { send.call("A", subscribe(h([{"channel", s("PresenceChannel")}, {"room_id", s("abc")}]))) }},
+      {"A presence with a numeric string room", -> { send.call("A", subscribe(h([{"channel", s("PresenceChannel")}, {"room_id", s(room_id.to_s)}]))) }},
+      {"A room", -> { send.call("A", subscribe(room)) }},
+      {"A room A isn't in", -> { send.call("A", subscribe(h([{"channel", s("RoomChannel")}, {"room_id", Any.new(closed_id)}]))) }},
+      {"A room without an id", -> { send.call("A", subscribe(h([{"channel", s("RoomChannel")}]))) }},
+      {"A typing", -> { send.call("A", subscribe(typing)) }},
+      {"B typing", -> { send.call("B", subscribe(typing)) }},
+      {"A starts typing", -> { send.call("A", perform(typing, h([{"action", s("start")}]))) }},
+      {"B stops typing", -> { send.call("B", perform(typing, h([{"action", s("stop")}, {"extra", Any.new(1_i64)}]))) }},
+      {"A performs an unknown typing action", -> { send.call("A", perform(typing, h([{"action", s("dance")}]))) }},
+      {"A room messages", -> { send.call("A", subscribe(messages)) }},
+      {"A room messages for a room A isn't in", -> { send.call("A", subscribe(h([{"channel", s("RoomMessagesChannel")}, {"signed_stream_name", s(t.call("CLOSED_MESSAGES_SIGNED"))}]))) }},
+      {"A room messages without a name", -> { send.call("A", subscribe(h([{"channel", s("RoomMessagesChannel")}]))) }},
+      {"A room messages with a forged name", -> { send.call("A", subscribe(h([{"channel", s("RoomMessagesChannel")}, {"signed_stream_name", s(forged)}]))) }},
+      {"A room messages with the rooms name", -> { send.call("A", subscribe(h([{"channel", s("RoomMessagesChannel")}, {"signed_stream_name", s(t.call("ROOMS_SIGNED"))}]))) }},
+      {"A turbo rooms", -> { send.call("A", subscribe(rooms)) }},
+      {"A turbo own rooms", -> { send.call("A", subscribe(turbo.call(t.call("A_ROOMS_SIGNED")))) }},
+      {"A turbo guarded room messages", -> { send.call("A", subscribe(guarded)) }},
+      {"A turbo forged", -> { send.call("A", subscribe(turbo.call(forged))) }},
+      {"A presence present", -> { send.call("A", perform(presence, h([{"action", s("present")}]))) }},
+      {"A presence refresh", -> { send.call("A", perform(presence, h([{"action", s("refresh")}]))) }},
+      {"A unreads subscribed again", -> { send.call("A", perform(unreads, h([{"action", s("subscribed")}]))) }},
+      {"unread fanout", -> { trigger.call("unread", [tok.call("MESSAGE_ID")]) }},
+      {"message removed", -> { trigger.call("remove_message", [tok.call("MESSAGE_ID")]) }},
+      {"B presence", -> { send.call("B", subscribe(presence)) }},
+      {"A typing again", -> { send.call("A", perform(typing, h([{"action", s("start")}]))) }},
+      {"revoke A", -> { trigger.call("revoke", [tok.call("ROOM_ID"), tok.call("A_ID")]) }},
+      {"reconnect A", -> { connect.call("A2", "A") }},
+      {"A2 presence", -> { send.call("A2", subscribe(presence)) }},
+      {"A2 room", -> { send.call("A2", subscribe(room)) }},
+      {"A2 typing", -> { send.call("A2", subscribe(typing)) }},
+      {"A2 room messages", -> { send.call("A2", subscribe(messages)) }},
+      {"A2 turbo guarded room messages", -> { send.call("A2", subscribe(guarded)) }},
+      {"A2 turbo rooms", -> { send.call("A2", subscribe(rooms)) }},
+      {"A2 unreads", -> { send.call("A2", subscribe(unreads)) }},
+      {"B typing after A left", -> { send.call("B", perform(typing, h([{"action", s("start")}]))) }},
+      {"deactivate B", -> { trigger.call("deactivate", [tok.call("B_ID")]) }},
+      {"reconnect B", -> { connect.call("B2", "B") }},
+    ]
+    failures = [] of String
+    recording["steps"].as_a.each_with_index do |step, i|
+      name, action = script[i]
+      raise "step #{i} is #{step["step"].as_s}, not #{name}" unless step["step"].as_s == name
+      action.call
+      got = {} of String => Array(String)
+      sockets.each { |socket_name, socket| (frames = socket.take; got[socket_name] = frames unless frames.empty?) }
+      wanted = {} of String => Array(String)
+      step["frames"].as_h.each { |socket_name, frames| wanted[socket_name] = frames.as_a.map(&.as_s).sorted }
+      failures << "#{name}:\n  expected #{wanted}\n  actual   #{got}" unless got.to_a.sorted_by(&.[0]).to_s == wanted.to_a.sorted_by(&.[0]).to_s
+    end
+    raise "#{failures.size} steps differ:\n#{failures.join("\n")}" unless failures.empty?
+  end
+end

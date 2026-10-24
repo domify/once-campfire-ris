@@ -1,0 +1,27 @@
+<%# reference/app/views/accounts/bots/index.html.erb %>
+<% content_for "nav" do %>  <div class="flex-item-justify-start">
+    <%= link_back_to(ctx, edit_account_path) %>
+  </div>
+<% end %>
+<section class="panel panel--wide txt-align-center flex flex-column position-relative" style="view-transition-name: chat-bots">
+  <div class="flex align-center gap">
+    <div class="panel__button">
+      <%= translation_button(ctx, "chat_bots") %>
+    </div>
+    <div class="pad-inline-double center">
+      <h1 class="margin-none">Chat bots</h1>
+      <p class="margin-none-block-start">With Chat bots, other sites and services can post updates directly to Campfire.</p>
+
+      <%= link_to(new_account_bot_path, attrs.class("btn btn--reversed txt-large").aria("label", "Add a chat bot")) do %>
+        <%= image_tag(ctx, "bot.svg", attrs.aria_hidden.size(20)) %>
+        <%= image_tag(ctx, "add.svg", attrs.aria_hidden.size(20)) %>
+<% end %>    </div>
+  </div>
+
+  <div class="pad-inline pad-block-start ">
+    <menu class="flex flex-column gap margin-none pad">
+      <% bots.each do |bot| %><% include "accounts/bots/_bot.html.erb" %><% end %>
+    </menu>
+  </div>
+</section>
+

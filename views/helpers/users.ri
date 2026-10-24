@@ -1,0 +1,139 @@
+# `UsersHelper`, `Users::AvatarsHelper`, `Users::FilterHelper`,
+# `Users::ProfilesHelper`, `Users::SidebarHelper` and `AccountsHelper`.
+module views/helpers/users
+
+import std/text
+import std/int
+import std/digest::{CRC32}
+import std/unicode::{Unicode}
+import rils/routes/paths::{user_path}
+import rils/template/html::{Html}
+import views/context::{ViewContext}
+import views/helpers/tag::*
+import views/helpers/assets::{image_tag}
+import views/helpers/links::{link_to}
+import views/helpers/forms::{button_to}
+import views/helpers/turbo::{turbo_frame_options}
+import views/helpers/url::{rooms_directs_with_users}
+
+# `Users::AvatarsHelper::AVATAR_COLORS`.
+pub AVATAR_COLORS = [
+  "#AF2E1B", "#CC6324", "#3B4B59", "#BFA07A", "#ED8008", "#ED3F1C", "#BF1B1B", "#736B1E", "#D07B53", "#736356", "#AD1D1D", "#BF7C2A",
+  "#C09C6F", "#698F9C", "#7C956B", "#5D618F", "#3B3633", "#67695E",
+]
+
+# `avatar_background_color(user)`: `Zlib.crc32(user.to_param)` picks the
+# color.
+pub def avatar_background_color(user_id : Int64) : String
+  AVATAR_COLORS[(CRC32.checksum(user_id.to_s) % AVATAR_COLORS.size.to_u32).to_i32]
+end
+
+# `User#initials`: `name.scan(/\b\w/).join`. Ruby's `\w` is ASCII-only
+# while `\b` sees Unicode word characters, so "Élodie" contributes nothing.
+pub def initials(name : String) : String
+  previous_word = false
+  String.build do |io|
+    name.each_char do |c|
+      io << c if (c.ascii_alphanumeric? || c == '_') && !previous_word
+      previous_word = Unicode.letter?(c) || Unicode.number?(c) || c == '_'
+    end
+  end
+end
+
+# `User#title`: `[ name, bio ].compact_blank.join(" – ")`.
+pub def user_title(name : String, bio : String?) : String
+  parts = [] of String
+  parts << name unless name.strip.empty?
+  if bio
+    parts << bio unless bio.strip.empty?
+  end
+  parts.join(" – ")
+end
+
+# What `avatar_tag` needs to know about a user.
+pub class AvatarUser
+  getter id : Int64
+  # `User#title`.
+  getter title : String
+  # `fresh_user_avatar_path(user)`.
+  getter avatar_path : String
+
+  def initialize(@id : Int64, @title : String, @avatar_path : String)
+  end
+end
+
+# `avatar_tag(user, **options)`: the options go to the image.
+pub def avatar_tag(ctx : ViewContext, user : AvatarUser, options : Attrs = Attrs.new) : Html
+  image = image_tag(ctx, user.avatar_path, attrs.aria_hidden.size(48).merge(options))
+  link_to(user_path(user.id), attrs.title(user.title).class("btn avatar").data("turbo_frame", "_top"), image)
+end
+
+# `button_to_direct_room_with(user)`.
+pub def button_to_direct_room_with(ctx : ViewContext, user_id : Int64) : Html
+  button_to(rooms_directs_with_users([user_id]), attrs.class("btn btn--primary full-width txt--large"), image_tag(ctx, "messages.svg"))
+end
+
+# The bot curl commands in `accounts/bots/_bot`.
+pub def curl_text_line(url : String) : String
+  "curl -d 'Hello!' #{url}"
+end
+
+pub def curl_upload_line(url : String) : String
+  "curl -F \"attachment=@/path/to/file\" #{url}"
+end
+
+# `account_logo_tag(style:)`. A nil style leaves a trailing space in the
+# class.
+pub def account_logo_tag(ctx : ViewContext, style : String? = nil) : Html
+  image = image_tag(ctx, ctx.account.logo_url, attrs.alt("Account logo").size(300))
+  content_tag("figure", attrs.class("account-logo avatar #{style || ""}"), image)
+end
+
+# `profile_form_submit_button`.
+pub def profile_form_submit_button(ctx : ViewContext) : Html
+  content = image_tag(ctx, "check.svg", attrs.aria_hidden.size(20)) +
+            content_tag_text("span", attrs.class("for-screen-reader"), "Save changes")
+  content_tag("button", attrs.class("btn btn--reversed center txt-large").type("submit"), content)
+end
+
+# `sidebar_turbo_frame_tag(src:) { content }`.
+pub def sidebar_turbo_frame_tag(src : String?, content : Html) : Html
+  content_tag("turbo-frame", sidebar_turbo_frame_options(src), content)
+end
+
+# `sidebar_turbo_frame_tag do ... end` (the block form never passes `src:`).
+pub def sidebar_turbo_frame_tag(& : -> Html) : Html
+  sidebar_turbo_frame_tag(nil, yield)
+end
+
+# `sidebar_turbo_frame_tag`'s attributes: `data: { turbo_permanent: true,
+# controller: ..., rooms_list_unread_class: ..., action: ... }` for
+# `turbo_frame_tag`.
+pub def sidebar_turbo_frame_options(src : String?) : Attrs
+  data = attrs.attr("data-turbo-permanent", true)
+    .attr("data-controller", "rooms-list read-rooms turbo-frame")
+    .attr("data-rooms-list-unread-class", "unread")
+    # html_safe in the reference so "->" isn't escaped
+    .attr("data-action", Html.new("presence:present@window->rooms-list#read read-rooms:read->rooms-list#read turbo:frame-load->rooms-list#loaded refresh-room:visible@window->turbo-frame#reload"))
+  turbo_frame_options("user_sidebar", src, "_top", data)
+end
+
+# `user_filter_menu_tag { content }`.
+pub def user_filter_menu_tag(content : Html) : Html
+  options = attrs.class("flex flex-column gap margin-none pad overflow-y constrain-height")
+    .data("controller", "filter")
+    .data("filter_active_class", "filter--active")
+    .data("filter_selected_class", "selected")
+  content_tag("menu", options, content)
+end
+
+pub def user_filter_menu_tag(& : -> Html) : Html
+  user_filter_menu_tag(yield)
+end
+
+# `user_filter_search_tag`.
+pub def user_filter_search_tag : Html
+  builder_tag("input", attrs.type("search").id("search").attr("autocorrect", "off").autocomplete("off")
+    .attr("data-1p-ignore", "true").class("input input--transparent full-width").placeholder("Filter…")
+    .data("action", "input->filter#filter"))
+end
