@@ -43,10 +43,10 @@ server below sends the same bytes, checked with `cmp` against the Rust
 port's page before each run. Measured one after the other on 2026-10-24
 with ris `6ae8a8e6c`, on a Ryzen 7 PRO 6850U (8 cores, 16 threads): the
 server on core 0, or on CPUs 0-7 (four cores, two threads each),
-`bench/loadgen` on the other four cores. Requests/s is three 10 s runs
-with 64 connections; median and fastest with one connection; slowest is
-p99 at 64 connections; memory is peak RSS. Details and how to run it in
-[bench/README.md](bench/README.md).
+`bench/loadgen` on the other four cores. Requests/s is the median of three
+10 s runs with 64 connections; median and fastest with one connection;
+slowest is p99 at 64 connections; memory is peak RSS. Details and how to
+run it in [bench/README.md](bench/README.md).
 
 ### The whole app
 
@@ -59,7 +59,7 @@ One core:
 
 | | ris | Rust | Rails¹ |
 |---|---|---|---|
-| Requests/s | 8,271-8,599 | 7,054-7,224 | 444 |
+| Requests/s | 8,343 | 7,054 | 444 |
 | Median | 0.164 ms | 0.221 ms | 5.5 ms |
 | Fastest | 0.142 ms | 0.203 ms | - |
 | Slowest (p99) | 9 ms | 16 ms | 226 ms |
@@ -70,7 +70,7 @@ one process):
 
 | | ris, 8 processes | ris, 8 threads | Rust |
 |---|---|---|---|
-| Requests/s | 32,755-33,191 | 27,074-30,210 | 23,232-23,603 |
+| Requests/s | 33,000 | 29,786 | 23,406 |
 | Median | 0.165 ms | 0.168 ms | 0.239 ms |
 | Fastest | 0.142 ms | 0.147 ms | 0.208 ms |
 | Slowest (p99) | 6-8 ms | 7-9 ms | 6 ms |
@@ -87,7 +87,7 @@ page sent from the tape) and `bench/go` (`net/http`).
 
 | | ris, 1 core | Go, 1 core | ris, 8 threads | Go, `GOMAXPROCS=8` |
 |---|---|---|---|---|
-| Requests/s | 8,165-8,485 | 4,429-4,656 | 30,032-30,447 | 10,910-11,221 |
+| Requests/s | 8,443 | 4,612 | 30,153 | 10,949 |
 | Median | 0.171 ms | 0.379 ms | 0.180 ms | 0.466 ms |
 | Fastest | 0.150 ms | 0.204 ms | 0.151 ms | 0.233 ms |
 | Slowest (p99) | 9-11 ms | 193-332 ms | 7-9 ms | 26-28 ms |
